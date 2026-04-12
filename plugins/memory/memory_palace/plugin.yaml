@@ -1,0 +1,3 @@
+name: memory_palace
+version: 1.0.0
+description: "Memory Palace durable recall bridge for Hermes preferences, strategies, failure lessons, and session summaries."
