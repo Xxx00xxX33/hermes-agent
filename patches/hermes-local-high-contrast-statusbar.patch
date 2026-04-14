@@ -1,0 +1,160 @@
+diff --git a/cli.py b/cli.py
+index 84adbb4d60c1603f88f782640d8a6b104493568e..b1fb93b7010222ed5333520cf791c9af6eeddc75 100644
+--- a/cli.py
++++ b/cli.py
+@@ -2888,6 +2888,67 @@ class HermesCLI:
+             fragments.append(("class:status-bar-strong", f"[>] {content}"))
+         return fragments
+ 
++    @staticmethod
++    def _select_status_bar_fallback_todo_item(todo_items: List[Dict[str, str]] | None) -> Dict[str, str] | None:
++        if not todo_items:
++            return None
++
++        for status in ("pending", "completed", "cancelled"):
++            matching = [item for item in todo_items if item.get("status") == status]
++            if not matching:
++                continue
++            if status == "pending":
++                return matching[0]
++            return matching[-1]
++
++        return todo_items[0]
++
++    @staticmethod
++    def _get_status_bar_named_task_fragments(todo_item: Dict[str, str] | None):
++        if not todo_item:
++            return [("class:status-bar-dim", "active --")]
++
++        marker_map = {
++            "completed": ("[x]", "class:status-bar-good"),
++            "in_progress": ("[>]", "class:status-bar-strong"),
++            "pending": ("[ ]", "class:status-bar-dim"),
++            "cancelled": ("[~]", "class:status-bar-dim"),
++        }
++        marker, style = marker_map.get(todo_item.get("status"), ("[?]", "class:status-bar-dim"))
++        content = " ".join(str(todo_item.get("content") or "(no description)").split())
++        return [(style, f"{marker} {content}")]
++
++    def _get_status_bar_saved_task_title(self) -> str:
++        for candidate in (
++            getattr(self, "_tmux_session_task_title", None),
++            getattr(self, "_pending_title", None),
++        ):
++            title = self._summarize_prompt_task(candidate, max_len=96)
++            if title and not self._is_low_signal_prompt_task(title):
++                return title
++
++        session_db = getattr(self, "_session_db", None)
++        session_id = getattr(self, "session_id", None)
++        if session_db and session_id:
++            try:
++                session_title = self._summarize_prompt_task(
++                    session_db.get_session_title(session_id) or "",
++                    max_len=96,
++                )
++                if session_title and not self._is_low_signal_prompt_task(session_title):
++                    return session_title
++            except Exception:
++                pass
++
++        for msg in getattr(self, "conversation_history", None) or []:
++            if not isinstance(msg, dict) or msg.get("role") != "user":
++                continue
++            title = self._summarize_prompt_task(msg.get("content"), max_len=96)
++            if title and not self._is_low_signal_prompt_task(title):
++                return title
++
++        return ""
++
+     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
+         # Prefer the agent's model name — it updates on fallback.
+         # self.model reflects the originally configured model and never
+@@ -3224,16 +3285,20 @@ class HermesCLI:
+             percent_label = f"{percent}%" if percent is not None else "--"
+             context_label = self._get_status_bar_context_label(snapshot)
+             bar_style = self._status_bar_context_style(percent)
+-            todo_snapshot = self._get_status_bar_todo_snapshot()
++            todo_items = self._get_status_bar_todo_items()
+             active_todo_items = self._get_status_bar_active_todo_items()
++            saved_task_title = self._get_status_bar_saved_task_title()
+             if active_todo_items:
+                 task_fragments = self._get_status_bar_active_task_fragments(
+                     active_todo_items,
+                     compact=width < 76,
+                 )
+-            elif todo_snapshot:
+-                todo_label, todo_style = self._get_status_bar_todo_label(todo_snapshot, compact=width < 76)
+-                task_fragments = [(todo_style, todo_label)]
++            elif saved_task_title:
++                task_fragments = [("class:status-bar-strong", saved_task_title)]
++            elif todo_items:
++                task_fragments = self._get_status_bar_named_task_fragments(
++                    self._select_status_bar_fallback_todo_item(todo_items)
++                )
+             else:
+                 task_fragments = self._get_status_bar_active_task_fragments(
+                     None,
+diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
+index b2cac1210ad88348498290f38c0144c164cd1d4c..ead2dc05276af2a2e26589ce0a5bb06b4bce1aa7 100644
+--- a/tests/cli/test_cli_status_bar.py
++++ b/tests/cli/test_cli_status_bar.py
+@@ -717,7 +717,7 @@ class TestCLIStatusBar:
+         assert "claude-sonnet-4-20250514" in text
+         assert "(2/3)" in text
+ 
+-    def test_status_bar_secondary_line_falls_back_to_todo_progress_when_no_active_task(self):
++    def test_status_bar_secondary_line_shows_task_name_instead_of_todo_summary_when_no_active_task(self):
+         cli_obj = _attach_todo_items(
+             _attach_agent(
+                 _make_cli(),
+@@ -732,15 +732,47 @@ class TestCLIStatusBar:
+             ("deploy", "pending"),
+             ("docs", "pending"),
+         )
++        cli_obj._tmux_session_task_title = "调查状态栏任务进度显示问题"
+         cli_obj._status_bar_visible = True
+ 
+         mock_app = MagicMock()
+-        mock_app.output.get_size.return_value = MagicMock(columns=120)
++        mock_app.output.get_size.return_value = MagicMock(columns=71)
++        with patch("prompt_toolkit.application.get_app", return_value=mock_app):
++            fragments = cli_obj._get_status_bar_secondary_fragments()
++
++        text = "".join(text for _, text in fragments)
++        assert "调查状态栏任务进度显示问题" in text
++        assert "todo 1/3" not in text
++        assert "td 1/3" not in text
++        assert "active --" not in text
++
++    def test_status_bar_secondary_line_falls_back_to_specific_todo_name_when_no_saved_title(self):
++        cli_obj = _attach_todo_items(
++            _attach_agent(
++                _make_cli(),
++                prompt_tokens=10_230,
++                completion_tokens=2_220,
++                total_tokens=12_450,
++                api_calls=7,
++                context_tokens=12_450,
++                context_length=200_000,
++            ),
++            ("build", "completed"),
++            ("deploy", "pending"),
++            ("docs", "pending"),
++        )
++        cli_obj._status_bar_visible = True
++
++        mock_app = MagicMock()
++        mock_app.output.get_size.return_value = MagicMock(columns=71)
+         with patch("prompt_toolkit.application.get_app", return_value=mock_app):
+             fragments = cli_obj._get_status_bar_secondary_fragments()
+ 
+         text = "".join(text for _, text in fragments)
+-        assert "todo 1/3" in text
++        assert "[ ] deploy" in text
++        assert "Hermes" not in text
++        assert "todo 1/3" not in text
++        assert "td 1/3" not in text
+         assert "active --" not in text
+ 
+ 

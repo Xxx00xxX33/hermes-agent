@@ -1,0 +1,333 @@
+diff --git a/cli.py b/cli.py
+index b3d51b12..2d49ad88 100644
+--- a/cli.py
++++ b/cli.py
+@@ -1739,9 +1799,8 @@ class HermesCLI:
+         )
+         
+         # Reasoning config (OpenRouter reasoning effort level)
+-        self.reasoning_config = _parse_reasoning_config(
+-            CLI_CONFIG["agent"].get("reasoning_effort", "")
+-        )
++        self._default_reasoning_effort = CLI_CONFIG["agent"].get("reasoning_effort", "")
++        self.reasoning_config = _parse_reasoning_config(self._default_reasoning_effort)
+         self.service_tier = _parse_service_tier_config(
+             CLI_CONFIG["agent"].get("service_tier", "")
+         )
+@@ -1794,7 +1853,9 @@ class HermesCLI:
+             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
+             short_uuid = uuid.uuid4().hex[:6]
+             self.session_id = f"{timestamp_str}_{short_uuid}"
+-        
++
++        self._restore_session_reasoning_config()
++
+         # History file for persistent input recall across sessions
+         self._history_file = _hermes_home / ".hermes_history"
+         self._last_invalidate: float = 0.0  # throttle UI repaints
+@@ -3961,6 +4908,72 @@ class HermesCLI:
+         except Exception:
+             pass
+ 
++    def _get_default_reasoning_config(self) -> Dict[str, Any] | None:
++        """Return the configured default reasoning_config for new sessions."""
++        return _parse_reasoning_config(self._default_reasoning_effort)
++
++    @staticmethod
++    def _session_model_config_dict(session_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
++        """Return a session row's model_config as a dict."""
++        if not session_meta:
++            return {}
++        raw = session_meta.get("model_config")
++        if isinstance(raw, dict):
++            return dict(raw)
++        if isinstance(raw, str) and raw.strip():
++            try:
++                parsed = json.loads(raw)
++                if isinstance(parsed, dict):
++                    return parsed
++            except Exception:
++                return {}
++        return {}
++
++    def _restore_session_reasoning_config(self, session_meta: Optional[Dict[str, Any]] = None) -> None:
++        """Load reasoning_config from the current session row, else fall back to config defaults."""
++        config = self._get_default_reasoning_config()
++        if session_meta is None and self._session_db and self.session_id:
++            try:
++                session_meta = self._session_db.get_session(self.session_id)
++            except Exception:
++                session_meta = None
++
++        model_config = self._session_model_config_dict(session_meta)
++        if "reasoning_config" in model_config:
++            stored = model_config.get("reasoning_config")
++            if stored is None:
++                config = None
++            elif isinstance(stored, dict):
++                config = dict(stored)
++
++        self.reasoning_config = config
++        if self.agent:
++            self.agent.reasoning_config = dict(config) if isinstance(config, dict) else None
++
++    def _persist_session_reasoning_config(self) -> None:
++        """Persist the current reasoning_config into the current session's model_config."""
++        if not self._session_db or not self.session_id:
++            return
++        try:
++            session_meta = self._session_db.get_session(self.session_id)
++        except Exception:
++            return
++        if not session_meta:
++            return
++
++        model_config = self._session_model_config_dict(session_meta)
++        model_config["reasoning_config"] = (
++            dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
++        )
++        try:
++            self._session_db.update_session_model_config(
++                self.session_id,
++                model_config=model_config,
++                model=self.model,
++            )
++        except Exception:
++            pass
++
+     def new_session(self, silent=False):
+         """Start a fresh session with a new session ID and cleared agent state."""
+         if self.agent and self.conversation_history:
+@@ -3987,10 +5000,14 @@ class HermesCLI:
+         self.conversation_history = []
+         self._pending_title = None
+         self._resumed = False
++        self.reasoning_config = self._get_default_reasoning_config()
+ 
+         if self.agent:
+             self.agent.session_id = self.session_id
+             self.agent.session_start = self.session_start
++            self.agent.reasoning_config = (
++                dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
++            )
+             self.agent.reset_session_state()
+             if hasattr(self.agent, "_last_flushed_db_idx"):
+                 self.agent._last_flushed_db_idx = 0
+@@ -4012,6 +5029,7 @@ class HermesCLI:
+                         model_config={
+                             "max_iterations": self.max_turns,
+                             "reasoning_config": self.reasoning_config,
++                            "cwd": os.getenv("TERMINAL_CWD", os.getcwd()),
+                         },
+                     )
+                 except Exception:
+@@ -4062,10 +5088,12 @@ class HermesCLI:
+         self.session_id = target_id
+         self._resumed = True
+         self._pending_title = None
++        self._restore_session_reasoning_config(session_meta)
+ 
+-        # Load conversation history (strip transcript-only metadata entries)
++        # Load conversation history (strip transcript-only metadata entries and
++        # sanitize historical terminal control sequences before display/model use)
+         restored = self._session_db.get_messages_as_conversation(target_id)
+-        restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
++        restored = _sanitize_resumed_messages(restored)
+         self.conversation_history = restored
+ 
+         # Re-open the target session so it's not marked as ended
+@@ -4153,6 +5185,7 @@ class HermesCLI:
+                 model_config={
+                     "max_iterations": self.max_turns,
+                     "reasoning_config": self.reasoning_config,
++                    "cwd": os.getenv("TERMINAL_CWD", os.getcwd()),
+                 },
+                 parent_session_id=parent_session_id,
+             )
+@@ -6144,12 +7177,10 @@ class HermesCLI:
+             return
+ 
+         self.reasoning_config = parsed
++        self._persist_session_reasoning_config()
+         self.agent = None  # Force agent re-init with new reasoning config
+ 
+-        if save_config_value("agent.reasoning_effort", arg):
+-            _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (saved to config){_RST}")
+-        else:
+-            _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only){_RST}")
++        _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only){_RST}")
+ 
+     def _handle_fast_command(self, cmd: str):
+         """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""
+diff --git a/hermes_state.py b/hermes_state.py
+index 5e563666..aa1ae8b7 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -409,6 +409,22 @@ class SessionDB:
+             )
+         self._execute_write(_do)
+ 
++    def update_session_model_config(
++        self,
++        session_id: str,
++        model_config: Optional[Dict[str, Any]],
++        model: str = None,
++    ) -> None:
++        """Replace a session's stored model_config JSON, optionally backfilling model."""
++
++        def _do(conn):
++            conn.execute(
++                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
++                (json.dumps(model_config) if model_config is not None else None, model, session_id),
++            )
++
++        self._execute_write(_do)
++
+     def update_token_counts(
+         self,
+         session_id: str,
+diff --git a/tests/cli/test_cli_new_session.py b/tests/cli/test_cli_new_session.py
+index 0490aad9..27d78ae6 100644
+--- a/tests/cli/test_cli_new_session.py
++++ b/tests/cli/test_cli_new_session.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import importlib
++import json
+ import os
+ import sys
+ from datetime import timedelta
+@@ -133,6 +138,11 @@ def _prepare_cli_with_active_session(tmp_path):
+     return cli
+ 
+ 
++def _session_reasoning_config(session_row):
++    model_config = json.loads(session_row["model_config"] or "{}")
++    return model_config.get("reasoning_config")
++
++
+ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path):
+     cli = _prepare_cli_with_active_session(tmp_path)
+     old_session_id = cli.session_id
+@@ -220,3 +230,120 @@ def test_new_session_resets_token_counters(tmp_path):
+     assert comp.last_total_tokens == 0
+     assert comp.compression_count == 0
+     assert comp._context_probed is False
++
++
++def test_new_session_uses_default_reasoning_effort_not_previous_session_override(tmp_path):
++    cli = _make_cli(config_overrides={"agent": {"reasoning_effort": "high"}})
++    cli._session_db = SessionDB(db_path=tmp_path / "state.db")
++    cli._session_db.create_session(
++        session_id=cli.session_id,
++        source="cli",
++        model=cli.model,
++        model_config={"reasoning_config": cli.reasoning_config},
++    )
++    cli.agent = _FakeAgent(cli.session_id, cli.session_start)
++    cli.conversation_history = [{"role": "user", "content": "hello"}]
++
++    cli.process_command("/reasoning low")
++
++    first_session_id = cli.session_id
++    first_session = cli._session_db.get_session(first_session_id)
++    assert _session_reasoning_config(first_session) == {"enabled": True, "effort": "low"}
++
++    cli.agent = _FakeAgent(cli.session_id, cli.session_start)
++    cli.process_command("/new")
++
++    assert cli.session_id != first_session_id
++    assert cli.reasoning_config == {"enabled": True, "effort": "high"}
++
++    new_session = cli._session_db.get_session(cli.session_id)
++    assert new_session is not None
++    assert _session_reasoning_config(new_session) == {"enabled": True, "effort": "high"}
++
++
++def test_resume_restores_session_specific_reasoning_effort(tmp_path):
++    cli = _make_cli(config_overrides={"agent": {"reasoning_effort": "high"}})
++    cli._session_db = SessionDB(db_path=tmp_path / "state.db")
++    cli._session_db.create_session(
++        session_id=cli.session_id,
++        source="cli",
++        model=cli.model,
++        model_config={"reasoning_config": cli.reasoning_config},
++    )
++    cli.agent = _FakeAgent(cli.session_id, cli.session_start)
++    cli.conversation_history = [{"role": "user", "content": "hello"}]
++
++    cli.process_command("/reasoning low")
++
++    original_session_id = cli.session_id
++    cli.agent = _FakeAgent(cli.session_id, cli.session_start)
++    cli.process_command("/new")
++    second_session_id = cli.session_id
++
++    assert cli.reasoning_config == {"enabled": True, "effort": "high"}
++
++    with patch.dict(
++        sys.modules,
++        {"hermes_cli.main": MagicMock(_resolve_session_by_name_or_id=lambda target: target)},
++    ):
++        cli.process_command(f"/resume {original_session_id}")
++
++    assert cli.session_id == original_session_id
++    assert cli.reasoning_config == {"enabled": True, "effort": "low"}
++    assert cli._session_db.get_session(second_session_id)["end_reason"] == "resumed_other"
++    assert cli._session_db.get_session(original_session_id)["end_reason"] is None
++
++
++def test_single_query_main_closes_session_before_exit_summary():
++    _clean_config = {
++        "model": {
++            "default": "anthropic/claude-opus-4.6",
++            "base_url": "https://openrouter.ai/api/v1",
++            "provider": "auto",
++        },
++        "display": {"compact": False, "tool_progress": "all"},
++        "agent": {},
++        "terminal": {"env_type": "local"},
++    }
++    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
++    prompt_toolkit_stubs = {
++        "prompt_toolkit": MagicMock(),
++        "prompt_toolkit.history": MagicMock(),
++        "prompt_toolkit.styles": MagicMock(),
++        "prompt_toolkit.patch_stdout": MagicMock(),
++        "prompt_toolkit.application": MagicMock(),
++        "prompt_toolkit.layout": MagicMock(),
++        "prompt_toolkit.layout.processors": MagicMock(),
++        "prompt_toolkit.filters": MagicMock(),
++        "prompt_toolkit.layout.dimension": MagicMock(),
++        "prompt_toolkit.layout.menus": MagicMock(),
++        "prompt_toolkit.widgets": MagicMock(),
++        "prompt_toolkit.key_binding": MagicMock(),
++        "prompt_toolkit.completion": MagicMock(),
++        "prompt_toolkit.formatted_text": MagicMock(),
++        "prompt_toolkit.auto_suggest": MagicMock(),
++        "dotenv": MagicMock(),
++        "fire": MagicMock(),
++        "run_agent": MagicMock(AIAgent=MagicMock()),
++        "tools.browser_tool": MagicMock(_emergency_cleanup_all_sessions=MagicMock()),
++    }
++
++    with patch.dict(sys.modules, prompt_toolkit_stubs), patch.dict(
++        "os.environ", clean_env, clear=False
++    ):
++        import cli as _cli_mod
++
++        _cli_mod = importlib.reload(_cli_mod)
++        fake_cli = MagicMock()
++        fake_cli.console = MagicMock()
++        fake_cli.chat = MagicMock(return_value="done")
++        fake_cli._close_session_in_db = MagicMock()
++        fake_cli._print_exit_summary = MagicMock()
++        fake_cli.show_banner = MagicMock()
++
++        with patch.object(_cli_mod, "HermesCLI", return_value=fake_cli),              patch.object(_cli_mod, "_run_cleanup", return_value=None),              patch.object(_cli_mod.atexit, "register", return_value=None),              patch("hermes_cli.tools_config._get_platform_tools", return_value=[]),              patch.dict(_cli_mod.__dict__, {"CLI_CONFIG": _clean_config}):
++            _cli_mod.main(query="hello")
++
++    fake_cli.chat.assert_called_once_with("hello", images=None)
++    fake_cli._close_session_in_db.assert_called_once_with("cli_close")
++    fake_cli._print_exit_summary.assert_called_once()

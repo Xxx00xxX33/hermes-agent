@@ -1,0 +1,56 @@
+--- a/etc/nginx/sites-enabled/gpt.lucienfc.eu.org.conf
++++ b/etc/nginx/sites-enabled/gpt.lucienfc.eu.org.conf
+@@ -52,6 +52,53 @@
+     return 200 "OK\\n";
+   }
+ 
++  # Patch OpenAI-compatible model metadata so clients can see the real context length.
++  # CLIProxyAPI currently omits context_length in /models responses, which makes Hermes
++  # fall back to 128k for gpt-5.4. With compression.threshold=0.75 that becomes 96k.
++  location = /v1/models {
++    proxy_pass http://127.0.0.1:8317/v1/models;
++    proxy_set_header Host $host;
++    proxy_set_header X-Real-IP $remote_addr;
++    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
++    proxy_set_header X-Forwarded-Proto $scheme;
++    proxy_set_header X-Forwarded-Host $host;
++    proxy_set_header X-Forwarded-Port $server_port;
++    proxy_set_header Accept-Encoding "";
++    proxy_http_version 1.1;
++    proxy_set_header Connection "";
++    proxy_connect_timeout 60s;
++    proxy_send_timeout 300s;
++    proxy_read_timeout 300s;
++    proxy_buffering on;
++    proxy_cache off;
++    sub_filter_types application/json;
++    sub_filter_once on;
++    sub_filter '"id":"gpt-5.4","object":"model","owned_by":"openai"' '"id":"gpt-5.4","object":"model","owned_by":"openai","context_length":200000';
++  }
++
++  # Some OpenAI-compatible clients probe /models even when the base URL already
++  # includes /v1, so serve the same patched upstream list here too.
++  location = /models {
++    proxy_pass http://127.0.0.1:8317/v1/models;
++    proxy_set_header Host $host;
++    proxy_set_header X-Real-IP $remote_addr;
++    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
++    proxy_set_header X-Forwarded-Proto $scheme;
++    proxy_set_header X-Forwarded-Host $host;
++    proxy_set_header X-Forwarded-Port $server_port;
++    proxy_set_header Accept-Encoding "";
++    proxy_http_version 1.1;
++    proxy_set_header Connection "";
++    proxy_connect_timeout 60s;
++    proxy_send_timeout 300s;
++    proxy_read_timeout 300s;
++    proxy_buffering on;
++    proxy_cache off;
++    sub_filter_types application/json;
++    sub_filter_once on;
++    sub_filter '"id":"gpt-5.4","object":"model","owned_by":"openai"' '"id":"gpt-5.4","object":"model","owned_by":"openai","context_length":200000';
++  }
++
+   # Reverse proxy to CLIProxyAPI
+   location / {
+     # Proxy to CLIProxyAPI service

@@ -1,0 +1,167 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -234,6 +234,14 @@
+     "- Do not skip prerequisite steps just because the final action seems obvious.\n"
+     "- If a task depends on output from a prior step, resolve that dependency first.\n"
+     "</prerequisite_checks>\n"
++    "\n"
++    "<background_task_strategy>\n"
++    "- When a shell command is independent and likely to be long-running or take more than a minute, prefer terminal(background=true, notify_on_complete=true) instead of blocking in foreground.\n"
++    "- Use this especially for tests, builds, deployments, downloads, servers, watchers, and deliberate waits like sleep when there is other work you can continue.\n"
++    "- After starting a background task, continue other work immediately. Use process(action=\"poll\") or process(action=\"wait\") only when you need progress, need the result, or before you finalize.\n"
++    "- Keep short commands or dependency-blocking steps in the foreground when their result is needed right away.\n"
++    "- On RAM-constrained machines, do not stack multiple memory-heavy or resource-heavy jobs in the background just to be proactive.\n"
++    "</background_task_strategy>\n"
+     "\n"
+     "<verification>\n"
+     "Before finalizing your response:\n"
+diff --git a/tests/agent/test_prompt_builder.py b/tests/agent/test_prompt_builder.py
+--- a/tests/agent/test_prompt_builder.py
++++ b/tests/agent/test_prompt_builder.py
+@@ -993,6 +993,29 @@
+         assert "missing_context" in text or "missing context" in text
+         assert "hallucinate" in text or "guess" in text
+ 
++    def test_guidance_covers_background_task_strategy(self):
++        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
++        assert "background" in text
++        assert "notify_on_complete" in text
++        assert "long-running" in text or "takes more than a minute" in text
++        assert "continue" in text and "other work" in text
++
++    def test_background_strategy_decision_matrix_covers_when_to_background(self):
++        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
++        assert "independent" in text
++        assert any(term in text for term in ("tests", "test suites"))
++        assert "build" in text
++        assert "deployment" in text or "deployments" in text
++        assert "downloads" in text
++        assert "sleep" in text
++
++    def test_background_strategy_decision_matrix_covers_when_not_to_background(self):
++        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
++        assert "short commands" in text
++        assert "needed right away" in text
++        assert "dependency-blocking" in text
++        assert any(term in text for term in ("ram-constrained", "memory-heavy", "resource-heavy"))
++
+     def test_guidance_uses_xml_tags(self):
+         assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
+         assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
+diff --git a/tests/tools/test_notify_on_complete.py b/tests/tools/test_notify_on_complete.py
+--- a/tests/tools/test_notify_on_complete.py
++++ b/tests/tools/test_notify_on_complete.py
+@@ -269,6 +269,25 @@
+         assert props["notify_on_complete"]["type"] == "boolean"
+         assert props["notify_on_complete"]["default"] is False
+ 
++    def test_tool_description_encodes_background_judgment(self):
++        from tools.terminal_tool import TERMINAL_TOOL_DESCRIPTION
++
++        text = TERMINAL_TOOL_DESCRIPTION.lower()
++        assert "independent" in text
++        assert "short commands" in text and "foreground" in text
++        assert "ram" in text or "memory-heavy" in text or "resource-heavy" in text
++
++    def test_background_param_description_encodes_when_not_to_background(self):
++        from tools.terminal_tool import TERMINAL_SCHEMA
++
++        text = TERMINAL_SCHEMA["parameters"]["properties"]["background"]["description"].lower()
++        assert "independent" in text
++        assert "notify_on_complete=true" in text
++        assert "short commands" in text
++        assert "dependency-blocking" in text
++        assert "needed right away" in text
++        assert "ram-constrained" in text or "memory-heavy" in text or "resource-heavy" in text
++
+     def test_handler_passes_notify(self):
+         """_handle_terminal passes notify_on_complete to terminal_tool."""
+         from tools.terminal_tool import _handle_terminal
+diff --git a/tests/tools/test_terminal_tool_requirements.py b/tests/tools/test_terminal_tool_requirements.py
+--- a/tests/tools/test_terminal_tool_requirements.py
++++ b/tests/tools/test_terminal_tool_requirements.py
+@@ -27,6 +27,28 @@
+         assert "terminal" in names
+         assert {"read_file", "write_file", "patch", "search_files"}.issubset(names)
+ 
++    def test_terminal_tool_definition_exposes_background_guidance_for_local_backend(self, monkeypatch):
++        monkeypatch.setattr(
++            terminal_tool_module,
++            "_get_env_config",
++            lambda: {"env_type": "local"},
++        )
++
++        tools = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
++        terminal_def = next(tool["function"] for tool in tools if tool["function"]["name"] == "terminal")
++        combined = (
++            terminal_def["description"]
++            + "\n"
++            + terminal_def["parameters"]["properties"]["background"]["description"]
++        ).lower()
++
++        assert "independent" in combined
++        assert "notify_on_complete=true" in combined
++        assert "short commands" in combined
++        assert "dependency-blocking" in combined
++        assert "needed right away" in combined
++        assert any(term in combined for term in ("ram-constrained", "memory-heavy", "resource-heavy"))
++
+     def test_terminal_and_execute_code_tools_resolve_for_managed_modal(self, monkeypatch, tmp_path):
+         monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
+         monkeypatch.setenv("HOME", str(tmp_path))
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -525,7 +525,9 @@
+ Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
+ Background: Set background=true to get a session_id. Two patterns:
+   (1) Long-lived processes that never exit (servers, watchers).
+-  (2) Long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
++  (2) Independent long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
++Use backgrounding with judgment: prefer it when the command is independent and there is other useful work to do, but keep dependency-blocking or short commands in the foreground.
++On RAM-constrained machines, do not stack multiple memory-heavy or resource-heavy jobs in the background just to be proactive.
+ Use process(action="poll") for progress checks, process(action="wait") to block until done.
+ Working directory: Use 'workdir' for per-command cwd.
+ PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
+@@ -1720,7 +1722,7 @@
+             },
+             "background": {
+                 "type": "boolean",
+-                "description": "Run the command in the background. Two patterns: (1) Long-lived processes that never exit (servers, watchers). (2) Long-running tasks paired with notify_on_complete=true — you can keep working and get notified when the task finishes. For short commands, prefer foreground with a generous timeout instead.",
++                "description": "Run the command in the background. Two patterns: (1) Long-lived processes that never exit (servers, watchers). (2) Independent long-running tasks paired with notify_on_complete=true — you can keep working and get notified when the task finishes. Prefer foreground for short commands, dependency-blocking steps, or when the result is needed right away. On RAM-constrained machines, avoid piling up multiple memory-heavy background jobs just to be proactive.",
+                 "default": False
+             },
+             "timeout": {
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -728,6 +728,28 @@
+         prompt = agent._build_system_prompt()
+         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
+ 
++    def test_gpt_system_prompt_includes_background_task_strategy(self):
++        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
++        prompt = agent._build_system_prompt()
++        assert "<background_task_strategy>" in prompt
++        assert "notify_on_complete=true" in prompt
++        assert "dependency-blocking" in prompt
++        assert "ram-constrained" in prompt.lower()
++
++    def test_gpt5_api_kwargs_carry_background_task_strategy_in_instructions(self):
++        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
++        prompt = agent._build_system_prompt()
++        kwargs = agent._build_api_kwargs([
++            {"role": "system", "content": prompt},
++            {"role": "user", "content": "run the test suite"},
++        ])
++        assert "instructions" in kwargs
++        assert "<background_task_strategy>" in kwargs["instructions"]
++        assert "notify_on_complete=true" in kwargs["instructions"]
++        assert "dependency-blocking" in kwargs["instructions"]
++        assert "ram-constrained" in kwargs["instructions"].lower()
++        assert kwargs["input"] == [{"role": "user", "content": "run the test suite"}]
++
+     def test_auto_injects_for_codex(self):
+         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
+         agent = self._make_agent(model="openai/codex-mini", tool_use_enforcement="auto")

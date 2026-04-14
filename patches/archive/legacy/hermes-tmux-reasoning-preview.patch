@@ -1,0 +1,189 @@
+diff --git a/cli.py b/cli.py
+index b3d51b12..83d89da1 100644
+--- a/cli.py
++++ b/cli.py
+@@ -2238,14 +3032,65 @@ class HermesCLI:
+ 
+     # ── Streaming display ────────────────────────────────────────────────
+ 
++    def _should_use_compact_reasoning_preview(self) -> bool:
++        """Return True when reasoning should avoid persistent transcript boxes.
++
++        Inside tmux, transcript-persisted reasoning panels are noisy and can be
++        mistaken for post-response output appended after the last assistant
++        message. Prefer compact `[thinking]` preview lines there instead.
++        """
++        return bool(str(os.environ.get("TMUX", "")).strip())
++
++    def _should_render_final_reasoning_box(self) -> bool:
++        """Return True when a persistent final reasoning box should be rendered."""
++        if not getattr(self, "show_reasoning", False):
++            return False
++        if self._should_use_compact_reasoning_preview():
++            return False
++        return not bool(getattr(self, "_reasoning_shown_this_turn", False))
++
+     def _current_reasoning_callback(self):
+         """Return the active reasoning display callback for the current mode."""
+         if self.show_reasoning and self.streaming_enabled:
++            if self._should_use_compact_reasoning_preview():
++                return self._on_reasoning
+             return self._stream_reasoning_delta
+         if self.verbose and not self.show_reasoning:
+             return self._on_reasoning
+         return None
+ 
++    def _reasoning_debug_enabled(self) -> bool:
++        """Return True when temporary reasoning/stream instrumentation is enabled."""
++        flag = str(os.getenv("HERMES_REASONING_DEBUG", "")).strip().lower()
++        return flag in {"1", "true", "yes", "on"}
++
++    def _reasoning_debug_event(self, event: str, **fields) -> None:
++        """Append a compact JSONL debug event for reasoning/stream state transitions."""
++        if not self._reasoning_debug_enabled():
++            return
++        try:
++            payload = {
++                "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
++                "pid": os.getpid(),
++                "session_id": getattr(self, "session_id", None),
++                "event": event,
++                "stream_box_opened": bool(getattr(self, "_stream_box_opened", False)),
++                "reasoning_box_opened": bool(getattr(self, "_reasoning_box_opened", False)),
++                "stream_started": bool(getattr(self, "_stream_started", False)),
++                "deferred_len": len(getattr(self, "_deferred_content", "") or ""),
++            }
++            for key, value in fields.items():
++                if isinstance(value, str):
++                    payload[key] = value.replace("\n", "\\n")[:200]
++                else:
++                    payload[key] = value
++            log_path = _hermes_home / "logs" / "reasoning-debug.log"
++            log_path.parent.mkdir(parents=True, exist_ok=True)
++            with log_path.open("a", encoding="utf-8") as fh:
++                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
++        except Exception:
++            logger.debug("Failed to write reasoning debug event", exc_info=True)
++
+     def _emit_reasoning_preview(self, reasoning_text: str) -> None:
+         """Render a buffered reasoning preview as a single [thinking] block."""
+         import re
+@@ -2347,6 +3192,11 @@ class HermesCLI:
+         if not text:
+             return
+         self._reasoning_shown_this_turn = True
++        self._reasoning_debug_event(
++            "stream_reasoning_delta",
++            text_len=len(text),
++            preview=text[:120],
++        )
+         if getattr(self, "_stream_box_opened", False):
+             return
+ 
+@@ -6198,6 +7706,7 @@ class HermesCLI:
+         """Callback for intermediate reasoning display during tool-call loops."""
+         if not reasoning_text:
+             return
++        self._reasoning_shown_this_turn = True
+         self._reasoning_preview_buf = getattr(self, "_reasoning_preview_buf", "") + reasoning_text
+         self._flush_reasoning_preview(force=False)
+ 
+@@ -7673,9 +9192,23 @@ class HermesCLI:
+             # intermediate turn boundaries (tool-calling loops), which caused
+             # the reasoning box to re-render after the final response.
+             _reasoning_already_shown = getattr(self, '_reasoning_shown_this_turn', False)
+-            if self.show_reasoning and result and not _reasoning_already_shown:
++            _render_final_reasoning_box = self._should_render_final_reasoning_box()
++            self._reasoning_debug_event(
++                "final_display_decision",
++                reasoning_already_shown=_reasoning_already_shown,
++                render_final_reasoning_box=_render_final_reasoning_box,
++                response_len=len(response or ""),
++                response_previewed=bool(response_previewed),
++                result_failed=bool(result.get("failed")) if result else False,
++                result_partial=bool(result.get("partial")) if result else False,
++            )
++            if _render_final_reasoning_box and result:
+                 reasoning = result.get("last_reasoning")
+                 if reasoning:
++                    self._reasoning_debug_event(
++                        "final_reasoning_box_rendered",
++                        reasoning_len=len(reasoning),
++                    )
+                     w = shutil.get_terminal_size().columns
+                     r_label = " Reasoning "
+                     r_fill = w - 2 - len(r_label)
+diff --git a/tests/cli/test_reasoning_command.py b/tests/cli/test_reasoning_command.py
+index 554cb6f9..3209133a 100644
+--- a/tests/cli/test_reasoning_command.py
++++ b/tests/cli/test_reasoning_command.py
+@@ -386,10 +386,21 @@ class TestReasoningDisplayModeSelection(unittest.TestCase):
+     def test_show_reasoning_streaming_uses_live_reasoning_box(self):
+         cli = self._make_cli(show_reasoning=True, streaming_enabled=True, verbose=False)
+ 
+-        callback = cli._current_reasoning_callback()
++        with patch.dict("os.environ", {"TMUX": ""}, clear=False):
++            callback = cli._current_reasoning_callback()
++
+         self.assertIsNotNone(callback)
+         self.assertEqual(callback("x"), ("stream", "x"))
+ 
++    def test_show_reasoning_streaming_uses_preview_callback_inside_tmux(self):
++        cli = self._make_cli(show_reasoning=True, streaming_enabled=True, verbose=False)
++
++        with patch.dict("os.environ", {"TMUX": "/tmp/tmux-1000/default,1,0"}, clear=False):
++            callback = cli._current_reasoning_callback()
++
++        self.assertIsNotNone(callback)
++        self.assertEqual(callback("x"), ("preview", "x"))
++
+     def test_verbose_without_show_reasoning_uses_preview_callback(self):
+         cli = self._make_cli(show_reasoning=False, streaming_enabled=False, verbose=True)
+ 
+@@ -398,6 +409,46 @@ class TestReasoningDisplayModeSelection(unittest.TestCase):
+         self.assertEqual(callback("x"), ("preview", "x"))
+ 
+ 
++class TestTmuxReasoningPreviewPolicy(unittest.TestCase):
++    def _make_cli(self, *, show_reasoning=True):
++        from cli import HermesCLI
++
++        cli = HermesCLI.__new__(HermesCLI)
++        cli.show_reasoning = show_reasoning
++        cli.streaming_enabled = True
++        cli.verbose = False
++        cli._reasoning_preview_buf = ""
++        cli._reasoning_shown_this_turn = False
++        cli._flush_reasoning_preview = lambda force=False: None
++        return cli
++
++    def test_on_reasoning_marks_turn_as_already_shown(self):
++        cli = self._make_cli()
++
++        cli._on_reasoning("Thinking in preview mode")
++
++        self.assertTrue(cli._reasoning_shown_this_turn)
++
++    def test_final_reasoning_box_suppressed_inside_tmux(self):
++        cli = self._make_cli()
++
++        with patch.dict("os.environ", {"TMUX": "/tmp/tmux-1000/default,1,0"}, clear=False):
++            self.assertFalse(cli._should_render_final_reasoning_box())
++
++    def test_final_reasoning_box_allowed_outside_tmux_when_not_already_shown(self):
++        cli = self._make_cli()
++
++        with patch.dict("os.environ", {"TMUX": ""}, clear=False):
++            self.assertTrue(cli._should_render_final_reasoning_box())
++
++    def test_final_reasoning_box_suppressed_after_preview_already_rendered(self):
++        cli = self._make_cli()
++        cli._reasoning_shown_this_turn = True
++
++        with patch.dict("os.environ", {"TMUX": ""}, clear=False):
++            self.assertFalse(cli._should_render_final_reasoning_box())
++
++
+ # ---------------------------------------------------------------------------
+ # Real provider format extraction
+ # ---------------------------------------------------------------------------

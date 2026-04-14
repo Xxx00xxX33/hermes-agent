@@ -1,0 +1,210 @@
+diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
+index eabcd0f9..b2cac121 100644
+--- a/tests/cli/test_cli_status_bar.py
++++ b/tests/cli/test_cli_status_bar.py
+@@ -2,15 +2,30 @@ from datetime import datetime, timedelta
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+-from cli import HermesCLI
++import pytest
++
++from cli import HermesCLI, _ACCENT, _RST
+ 
+ 
+ def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
+     cli_obj = HermesCLI.__new__(HermesCLI)
+     cli_obj.model = model
++    cli_obj.provider = "anthropic" if model.startswith("anthropic/") else None
++    cli_obj.requested_provider = cli_obj.provider
++    cli_obj._provider_source = ""
+     cli_obj.session_start = datetime.now() - timedelta(minutes=14, seconds=32)
+     cli_obj.conversation_history = [{"role": "user", "content": "hi"}]
+     cli_obj.agent = None
++    cli_obj.reasoning_config = None
++    cli_obj._status_bar_visible = False
++    cli_obj._background_tasks = {}
++    cli_obj._background_task_counter = 0
++    cli_obj._pending_title = None
++    cli_obj._session_db = None
++    cli_obj.session_id = "session-1"
++    cli_obj._tmux_pane_title = ""
++    cli_obj._tmux_session_task_title = ""
++    cli_obj._tmux_task_title_locked = False
+     return cli_obj
+ 
+ 
+diff --git a/agent/title_generator.py b/agent/title_generator.py
+index 741fe8b0..80b5386a 100644
+--- a/agent/title_generator.py
++++ b/agent/title_generator.py
+@@ -17,13 +17,62 @@ _TITLE_PROMPT = (
+     "following exchange. The title should capture the main topic or intent. "
+     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+ )
++_TITLE_TASK = "title"
++_REASONING_UNSUPPORTED_NEEDLES = (
++    "reasoning",
++    "unsupported_parameter",
++    "unknown parameter",
++    "unexpected keyword",
++    "extra_body",
++    "extra fields not permitted",
++)
++
++
++def _get_title_reasoning_extra_body() -> Optional[dict]:
++    """Return optional extra_body for title generation reasoning overrides.
++
++    Reads auxiliary.title.reasoning_effort from config.yaml. When unset,
++    returns None so title generation uses the provider default. Unknown values
++    are ignored with a warning.
++    """
++    try:
++        from hermes_cli.config import load_config
++        from hermes_constants import parse_reasoning_effort
++
++        config = load_config() or {}
++        auxiliary = config.get("auxiliary", {}) if isinstance(config, dict) else {}
++        title_cfg = auxiliary.get(_TITLE_TASK, {}) if isinstance(auxiliary, dict) else {}
++        if not isinstance(title_cfg, dict):
++            return None
++
++        effort = str(title_cfg.get("reasoning_effort", "") or "").strip()
++        if not effort:
++            return None
++
++        parsed = parse_reasoning_effort(effort)
++        if parsed is None:
++            logger.warning(
++                "Title generation: unknown auxiliary.%s.reasoning_effort '%s'; ignoring",
++                _TITLE_TASK,
++                effort,
++            )
++            return None
++        return {"reasoning": parsed}
++    except Exception as exc:
++        logger.debug("Title generation: could not load reasoning override: %s", exc)
++        return None
++
++
++def _is_reasoning_unsupported_error(err: Exception) -> bool:
++    err_str = str(err).lower()
++    return any(needle in err_str for needle in _REASONING_UNSUPPORTED_NEEDLES)
+ 
+ 
+ def generate_title(user_message: str, assistant_response: str, timeout: float = 30.0) -> Optional[str]:
+     """Generate a session title from the first exchange.
+ 
+-    Uses the auxiliary LLM client (cheapest/fastest available model).
+-    Returns the title string or None on failure.
++    Uses the auxiliary title task config (auxiliary.title.*). Returns the title
++    string or None on failure.
+     """
+     # Truncate long messages to keep the request small
+     user_snippet = user_message[:500] if user_message else ""
+@@ -34,14 +83,30 @@ def generate_title(user_message: str, assistant_response: str, timeout: float =
+         {"role": "user", "content": f"User: {user_snippet}\n\nAssistant: {assistant_snippet}"},
+     ]
+ 
++    call_kwargs = {
++        "task": _TITLE_TASK,
++        "messages": messages,
++        "max_tokens": 30,
++        "temperature": 0.3,
++        "timeout": timeout,
++    }
++    extra_body = _get_title_reasoning_extra_body()
++    if extra_body:
++        call_kwargs["extra_body"] = extra_body
++
+     try:
+-        response = call_llm(
+-            task="compression",  # reuse compression task config (cheap/fast model)
+-            messages=messages,
+-            max_tokens=30,
+-            temperature=0.3,
+-            timeout=timeout,
+-        )
++        try:
++            response = call_llm(**call_kwargs)
++        except Exception as reasoning_err:
++            if extra_body and _is_reasoning_unsupported_error(reasoning_err):
++                logger.info(
++                    "Title generation: reasoning override unsupported on configured title model (%s); retrying without reasoning",
++                    reasoning_err,
++                )
++                call_kwargs.pop("extra_body", None)
++                response = call_llm(**call_kwargs)
++            else:
++                raise
+         title = (response.choices[0].message.content or "").strip()
+         # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
+         title = title.strip('"\'')
+diff --git a/tests/agent/test_title_generator.py b/tests/agent/test_title_generator.py
+index 98fb8fb2..4497c20f 100644
+--- a/tests/agent/test_title_generator.py
++++ b/tests/agent/test_title_generator.py
+@@ -24,6 +24,62 @@ class TestGenerateTitle:
+             title = generate_title("help me fix this import", "Sure, let me check...")
+             assert title == "Debugging Python Import Errors"
+ 
++    def test_uses_title_task_instead_of_compression(self):
++        captured_kwargs = {}
++
++        def mock_call_llm(**kwargs):
++            captured_kwargs.update(kwargs)
++            resp = MagicMock()
++            resp.choices = [MagicMock()]
++            resp.choices[0].message.content = "Short Title"
++            return resp
++
++        with patch("agent.title_generator._get_title_reasoning_extra_body", return_value=None):
++            with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
++                title = generate_title("help me fix this import", "Sure, let me check...")
++
++        assert title == "Short Title"
++        assert captured_kwargs["task"] == "title"
++        assert "extra_body" not in captured_kwargs
++
++    def test_passes_title_reasoning_override(self):
++        captured_kwargs = {}
++
++        def mock_call_llm(**kwargs):
++            captured_kwargs.update(kwargs)
++            resp = MagicMock()
++            resp.choices = [MagicMock()]
++            resp.choices[0].message.content = "Short Title"
++            return resp
++
++        reasoning = {"reasoning": {"enabled": True, "effort": "low"}}
++        with patch("agent.title_generator._get_title_reasoning_extra_body", return_value=reasoning):
++            with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
++                generate_title("help me fix this import", "Sure, let me check...")
++
++        assert captured_kwargs["extra_body"] == reasoning
++
++    def test_retries_without_reasoning_when_unsupported(self):
++        mock_response = MagicMock()
++        mock_response.choices = [MagicMock()]
++        mock_response.choices[0].message.content = "Short Title"
++
++        reasoning = {"reasoning": {"enabled": True, "effort": "low"}}
++        with patch("agent.title_generator._get_title_reasoning_extra_body", return_value=reasoning):
++            with patch(
++                "agent.title_generator.call_llm",
++                side_effect=[RuntimeError("unsupported_parameter: reasoning"), mock_response],
++            ) as mock_call:
++                title = generate_title("question", "answer")
++
++        assert title == "Short Title"
++        first_kwargs = mock_call.call_args_list[0].kwargs
++        second_kwargs = mock_call.call_args_list[1].kwargs
++        assert first_kwargs["task"] == "title"
++        assert first_kwargs["extra_body"] == reasoning
++        assert second_kwargs["task"] == "title"
++        assert "extra_body" not in second_kwargs
++
+     def test_strips_quotes(self):
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]

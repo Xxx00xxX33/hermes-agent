@@ -1,0 +1,124 @@
+diff --git a/cli.py b/cli.py
+index 24a56218ff76a8e14a141eaa4d73354d743998fc..337bb5db2325f2f7f092c7c0ae1f0dcb30244cad 100644
+--- a/cli.py
++++ b/cli.py
+@@ -67,6 +67,7 @@ from hermes_cli.banner import _format_context_length, format_banner_version_labe
+ 
+ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+ _AGENT_WORKING_FRAMES = ("·", "•", "●", "•")
++_FAST_TOOL_TRANSCRIPT_NAMES = frozenset({"todo", "memory", "session_search"})
+ 
+ 
+ # Load .env from ~/.hermes/.env first, then project root as dev fallback.
+@@ -3163,6 +3164,41 @@ class HermesCLI:
+         frame_idx = int(now * 8) % len(_AGENT_WORKING_FRAMES)
+         return _AGENT_WORKING_FRAMES[frame_idx]
+ 
++    def _should_persist_tool_progress_line(self, function_name: Optional[str]) -> bool:
++        """Return True when tool progress should also be written into transcript history."""
++        return bool(function_name) and not function_name.startswith("_") and function_name in _FAST_TOOL_TRANSCRIPT_NAMES
++
++    def _flush_live_boxes_for_tool_progress_line(self) -> None:
++        """Close any live reasoning/response boxes before printing transcript tool progress."""
++        if (
++            getattr(self, "_stream_box_opened", False)
++            or getattr(self, "_reasoning_box_opened", False)
++            or getattr(self, "_stream_started", False)
++        ):
++            self._flush_stream()
++            self._reset_stream_state()
++        else:
++            self._close_reasoning_box()
++
++    def _emit_persistent_tool_progress_line(
++        self,
++        function_name: Optional[str],
++        label: str,
++        *,
++        emoji: Optional[str] = None,
++    ) -> None:
++        """Print a one-line transcript entry for quick tools that otherwise vanish in the footer."""
++        if not label or not self._should_persist_tool_progress_line(function_name):
++            return
++        self._flush_live_boxes_for_tool_progress_line()
++        if function_name == "todo":
++            _cprint(f"  ┊ {_ACCENT}📋 {label}{_RST}")
++            return
++        if emoji is None:
++            from agent.display import get_tool_emoji
++
++            emoji = get_tool_emoji(function_name)
++        _cprint(f"  ┊ {emoji} {label}")
+ 
+     @contextmanager
+     def _busy_command(self, status: str):
+@@ -7676,6 +7712,7 @@ class HermesCLI:
+             if _pl > 0 and len(label) > _pl:
+                 label = label[:_pl - 3] + "..."
+             self._spinner_text = f"{emoji} {label}"
++            self._emit_persistent_tool_progress_line(function_name, label, emoji=emoji)
+             self._tool_start_time = _time.monotonic()
+             self._invalidate()
+ 
+diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
+index 73eefde8220da89ff8c5f58d1e3dc9d884252f8b..37b4e8cc9e830caa04ec6dba6219820357c2220d 100644
+--- a/tests/cli/test_cli_status_bar.py
++++ b/tests/cli/test_cli_status_bar.py
+@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ 
+-from cli import HermesCLI
++from cli import HermesCLI, _ACCENT, _RST
+ 
+ 
+ def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
+@@ -456,15 +456,36 @@ class TestCLIStatusBar:
+         assert cli_obj._agent_working_frame(now=0.26) == "●"
+         assert cli_obj._agent_working_frame(now=0.39) == "•"
+ 
++    def test_on_tool_progress_styles_todo_transcript_with_accent_prefix(self):
++        cli_obj = _make_cli()
++        cli_obj._spinner_text = ""
++        cli_obj._tool_start_time = 0.0
++        cli_obj._voice_mode = False
++        cli_obj._invalidate = MagicMock()
++        cli_obj._stream_box_opened = False
++        cli_obj._reasoning_box_opened = False
++
++        with patch("cli._cprint") as mock_cprint:
++            cli_obj._on_tool_progress(
++                "tool.started",
++                "todo",
++                "planning 3 task(s)",
++                {"todos": [{"id": "t1"}, {"id": "t2"}, {"id": "t3"}]},
++            )
++
++        assert mock_cprint.call_count == 1
++        assert mock_cprint.call_args.args[0] == f"  ┊ {_ACCENT}📋 planning 3 task(s){_RST}"
++        assert cli_obj._spinner_text.endswith("planning 3 task(s)")
++        cli_obj._invalidate.assert_called_once()
++
+     @pytest.mark.parametrize(
+         ("function_name", "preview", "function_args"),
+         [
+-            ("todo", "planning 3 task(s)", {"todos": [{"id": "t1"}, {"id": "t2"}, {"id": "t3"}]}),
+-            ("memory", '+user: "prefers dark mode"', {"action": "add", "target": "user"}),
+-            ("session_search", 'recall: "tmux hang"', {"query": "tmux hang"}),
++            ("memory", '+user: \"prefers dark mode\"', {"action": "add", "target": "user"}),
++            ("session_search", 'recall: \"tmux hang\"', {"query": "tmux hang"}),
+         ],
+     )
+-    def test_on_tool_progress_persists_transcript_for_fast_tools(self, function_name, preview, function_args):
++    def test_on_tool_progress_persists_transcript_for_other_fast_tools(self, function_name, preview, function_args):
+         cli_obj = _make_cli()
+         cli_obj._spinner_text = ""
+         cli_obj._tool_start_time = 0.0
+@@ -478,6 +499,7 @@ class TestCLIStatusBar:
+ 
+         assert mock_cprint.call_count == 1
+         assert preview in mock_cprint.call_args.args[0]
++        assert str(_ACCENT) not in mock_cprint.call_args.args[0]
+         assert cli_obj._spinner_text.endswith(preview)
+         cli_obj._invalidate.assert_called_once()
+ 

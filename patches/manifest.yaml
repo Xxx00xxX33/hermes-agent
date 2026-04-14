@@ -1,0 +1,68 @@
+version: 1
+bundle:
+  - id: high-contrast-statusbar
+    patch: patches/hermes-local-high-contrast-statusbar.patch
+    purpose: Restore the high-contrast black/gold CLI status bar and skin styles.
+    verifies:
+      - tests/cli/test_cli_status_bar.py
+      - tests/hermes_cli/test_skin_engine.py
+      - tests/cli/test_cli_skin_integration.py
+      - tests/test_cli_skin_integration.py
+
+  - id: tmux-task-title
+    patch: patches/hermes-cli-tmux-task-title.patch
+    purpose: Keep tmux pane titles aligned to the first meaningful task title.
+    verifies:
+      - tests/cli/test_cli_status_bar.py
+      - tests/agent/test_title_generator.py
+
+  - id: working-indicator
+    patch: patches/hermes-cli-working-indicator.patch
+    purpose: Restore a visible foreground working indicator after prompt submission.
+    verifies:
+      - tests/cli/test_cli_skin_integration.py
+      - tests/cli/test_cli_status_bar.py
+      - tests/test_cli_skin_integration.py
+
+  - id: resume-ux
+    patch: patches/hermes-resume-ux-improvements.patch
+    purpose: Preserve local /resume behavior, session browsing, and related CLI state fixes.
+    verifies:
+      - tests/cli/test_resume_display.py
+      - tests/hermes_cli/test_session_browse.py
+      - tests/tools/test_session_search.py
+      - tests/tools/test_terminal_tool_requirements.py
+
+  - id: branch-provider-routing-regression
+    patch: patches/hermes-branch-provider-routing-regression.patch
+    purpose: Keep /branch sessions inheriting the active provider/base_url/api_mode routing metadata.
+    verifies:
+      - tests/cli/test_branch_command.py
+
+  - id: tmux-scrollback-gap
+    patch: patches/hermes-tmux-scrollback-gap.patch
+    purpose: Keep tmux scrollback behavior compatible with the local Hermes layout.
+    verifies:
+      - tests/cli/test_cli_init.py
+
+  - id: context-compression
+    patch: patches/hermes-context-compression-opencode-style.patch
+    purpose: Keep local long-context compression thresholds and provider-aware behavior.
+    verifies:
+      - tests/agent/test_context_compressor.py
+      - tests/agent/test_auxiliary_client.py
+      - tests/run_agent/test_compression_feasibility.py
+      - tests/run_agent/test_context_pressure.py
+      - tests/run_agent/test_long_context_tier_429.py
+
+  - id: model-context-config-override
+    patch: patches/hermes-model-context-config-override.patch
+    purpose: Honour configured model.context_length for the matching main OpenAI-compatible endpoint/model.
+    verifies:
+      - tests/agent/test_model_metadata.py
+
+  - id: quick-tool-transcript
+    patch: patches/hermes-quick-tool-transcript.patch
+    purpose: Persist quick-tool transcript context across the local Hermes CLI flow.
+    verifies:
+      - tests/cli/test_cli_status_bar.py
