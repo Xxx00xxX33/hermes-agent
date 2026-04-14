@@ -1,6 +1,7 @@
 """Tests for HermesCLI initialization -- catches configuration bugs
 that only manifest at runtime (not in mocked unit tests)."""
 
+import builtins
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -24,7 +25,7 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
     }
     if config_overrides:
         _clean_config.update(config_overrides)
-    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": "", "TMUX": ""}
     if env_overrides:
         clean_env.update(env_overrides)
     prompt_toolkit_stubs = {
@@ -219,10 +220,12 @@ class TestHistoryDisplay:
         assert "/resume" in output
         assert "Current preview" not in output
 
-    def test_resume_without_target_lists_recent_sessions(self, capsys):
+    def test_resume_without_target_opens_picker_and_shows_resumed_history(self):
         cli = _make_cli()
         cli.session_id = "current"
         cli._session_db = MagicMock()
+
+        target_id = "20260401_201329_d85961"
         cli._session_db.list_sessions_rich.return_value = [
             {
                 "id": "current",
@@ -231,19 +234,91 @@ class TestHistoryDisplay:
                 "last_active": 0,
             },
             {
-                "id": "20260401_201329_d85961",
+                "id": target_id,
+                "title": "Checking Running Hermes Agent",
+                "preview": "check running gateways for hermes agent",
+                "last_active": 0,
+            },
+        ]
+        cli._session_db.get_session.side_effect = lambda session_id: {
+            "id": target_id,
+            "title": "Checking Running Hermes Agent",
+        } if session_id == target_id else None
+        cli._session_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "Where did we leave off?"},
+            {"role": "assistant", "content": "We were debugging resume UX."},
+        ]
+
+        with patch("hermes_cli.main._session_browse_picker", return_value=target_id) as picker, \
+             patch.object(cli, "_display_resumed_history") as display:
+            cli._handle_resume_command("/resume")
+
+        picker.assert_called_once()
+        display.assert_called_once()
+        assert cli.session_id == target_id
+        assert cli._session_db.end_session.called
+
+    def test_resume_missing_exact_match_opens_picker_with_initial_query(self):
+        cli = _make_cli()
+        cli.session_id = "current"
+        cli._session_db = MagicMock()
+
+        target_id = "20260401_201329_d85961"
+        cli._session_db.list_sessions_rich.return_value = [
+            {
+                "id": "current",
+                "title": "Current",
+                "preview": "Current preview",
+                "last_active": 0,
+            },
+            {
+                "id": target_id,
+                "title": "Checking Running Hermes Agent",
+                "preview": "check running gateways for hermes agent",
+                "last_active": 0,
+            },
+        ]
+        cli._session_db.get_session.side_effect = lambda session_id: {
+            "id": target_id,
+            "title": "Checking Running Hermes Agent",
+        } if session_id == target_id else None
+        cli._session_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "Where did we leave off?"},
+            {"role": "assistant", "content": "We were debugging resume UX."},
+        ]
+
+        with patch("hermes_cli.main._resolve_session_by_name_or_id", return_value=None), \
+             patch("hermes_cli.main._session_browse_picker", return_value=target_id) as picker, \
+             patch.object(cli, "_display_resumed_history") as display:
+            cli._handle_resume_command("/resume running hermes")
+
+        picker.assert_called_once()
+        _, kwargs = picker.call_args
+        assert kwargs["initial_query"] == "running hermes"
+        display.assert_called_once()
+        assert cli.session_id == target_id
+
+    def test_browse_resume_sessions_passes_current_cwd_to_picker(self):
+        cli = _make_cli()
+        cli.session_id = "current"
+        cli._session_db = MagicMock()
+        cli._session_db.list_sessions_rich.return_value = [
+            {
+                "id": "other",
                 "title": "Checking Running Hermes Agent",
                 "preview": "check running gateways for hermes agent",
                 "last_active": 0,
             },
         ]
 
-        cli._handle_resume_command("/resume")
-        output = capsys.readouterr().out
+        with patch.dict(os.environ, {"TERMINAL_CWD": "/work/hermes-agent"}, clear=False), \
+             patch("hermes_cli.main._session_browse_picker", return_value="other") as picker:
+            result = cli._browse_resume_sessions(initial_query="hermes")
 
-        assert "Recent sessions" in output
-        assert "Checking Running Hermes Agent" in output
-        assert "Use /resume <session id or title> to continue" in output
+        assert result == "other"
+        _, kwargs = picker.call_args
+        assert kwargs["initial_query"] == "hermes"
+        assert kwargs["current_cwd"] == "/work/hermes-agent"
 
 
 class TestRootLevelProviderOverride:
@@ -345,3 +420,183 @@ class TestProviderResolution:
         cli = _make_cli()
         assert isinstance(cli.model, str)
         assert isinstance(cli.model, str) and '/' in cli.model
+
+
+class TestBottomDockedTuiLayout:
+    def test_layout_starts_with_flexible_spacer_above_prompt_cluster(self):
+        cli = _make_cli()
+        cli.conversation_history = []
+
+        class _FakeDimension:
+            def __init__(self, **kwargs):
+                self.weight = kwargs.get("weight")
+                self.min = kwargs.get("min")
+                self.preferred = kwargs.get("preferred")
+
+        class _FakeWindow:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.height = kwargs.get("height")
+
+        class _FakeCondition:
+            def __init__(self, func):
+                self.func = func
+
+            def __call__(self):
+                return self.func()
+
+        class _FakeConditionalContainer:
+            def __init__(self, content, filter=None):
+                self.content = content
+                self.filter = filter
+
+        with patch.dict(
+            cli._build_tui_layout_children.__func__.__globals__,
+            {
+                "Dimension": _FakeDimension,
+                "Window": _FakeWindow,
+                "Condition": _FakeCondition,
+                "ConditionalContainer": _FakeConditionalContainer,
+            },
+        ):
+            children = cli._build_tui_layout_children(
+                sudo_widget="sudo",
+                secret_widget="secret",
+                approval_widget="approval",
+                clarify_widget="clarify",
+                model_picker_widget=None,
+                spinner_widget="spinner",
+                spacer="hint",
+                status_bar="status",
+                input_rule_top="rule-top",
+                image_bar="image-bar",
+                input_area="input",
+                input_rule_bot="rule-bot",
+                voice_status_bar="voice-status",
+                completions_menu="menu",
+            )
+
+        assert isinstance(children[0], _FakeConditionalContainer)
+        assert isinstance(children[0].content, _FakeWindow)
+        assert isinstance(children[0].content.height, _FakeDimension)
+        assert children[0].content.height.weight == 1
+        with patch.dict(os.environ, {"TMUX": ""}, clear=False):
+            assert children[0].filter() is True
+        assert children[1:] == [
+            "sudo",
+            "secret",
+            "approval",
+            "clarify",
+            "spinner",
+            "hint",
+            "status",
+            "rule-top",
+            "image-bar",
+            "input",
+            "rule-bot",
+            "voice-status",
+            "menu",
+        ]
+
+    def test_layout_hides_bottom_dock_spacer_after_conversation_history_exists(self):
+        cli = _make_cli()
+        cli.conversation_history = []
+
+        class _FakeDimension:
+            def __init__(self, **kwargs):
+                self.weight = kwargs.get("weight")
+                self.min = kwargs.get("min")
+                self.preferred = kwargs.get("preferred")
+
+        class _FakeWindow:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.height = kwargs.get("height")
+
+        class _FakeCondition:
+            def __init__(self, func):
+                self.func = func
+
+            def __call__(self):
+                return self.func()
+
+        class _FakeConditionalContainer:
+            def __init__(self, content, filter=None):
+                self.content = content
+                self.filter = filter
+
+        with patch.dict(
+            cli._build_tui_layout_children.__func__.__globals__,
+            {
+                "Dimension": _FakeDimension,
+                "Window": _FakeWindow,
+                "Condition": _FakeCondition,
+                "ConditionalContainer": _FakeConditionalContainer,
+            },
+        ):
+            children = cli._build_tui_layout_children(
+                sudo_widget="sudo",
+                secret_widget="secret",
+                approval_widget="approval",
+                clarify_widget="clarify",
+                model_picker_widget=None,
+                spinner_widget="spinner",
+                spacer="hint",
+                status_bar="status",
+                input_rule_top="rule-top",
+                image_bar="image-bar",
+                input_area="input",
+                input_rule_bot="rule-bot",
+                voice_status_bar="voice-status",
+                completions_menu="menu",
+            )
+
+        spacer_container = children[0]
+        assert isinstance(spacer_container, _FakeConditionalContainer)
+        with patch.dict(os.environ, {"TMUX": ""}, clear=False):
+            assert spacer_container.filter() is True
+
+        cli.conversation_history.append({"role": "user", "content": "hello"})
+        with patch.dict(os.environ, {"TMUX": ""}, clear=False):
+            assert spacer_container.filter() is False
+
+    def test_bottom_dock_spacer_disabled_inside_tmux_even_without_history(self):
+        cli = _make_cli()
+        cli.conversation_history = []
+        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-1000/default,1234,0"}, clear=False):
+            assert cli._should_show_bottom_dock_spacer() is False
+
+    def test_bottom_dock_spacer_still_shows_modal_prompts_inside_tmux(self):
+        cli = _make_cli()
+        cli.conversation_history = []
+        cli._approval_state = {"command": "rm -rf /tmp/demo"}
+        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-1000/default,1234,0"}, clear=False):
+            assert cli._should_show_bottom_dock_spacer() is True
+
+    def test_run_does_not_print_terminal_height_blank_lines_before_banner(self):
+        cli = _make_cli()
+        printed = []
+
+        def _fake_print(*args, **kwargs):
+            printed.append((args, kwargs))
+
+        def _stop_at_banner():
+            raise RuntimeError("stop-at-banner")
+
+        cli.show_banner = _stop_at_banner
+
+        import cli as _cli_mod
+
+        with patch.object(_cli_mod.shutil, "get_terminal_size", return_value=os.terminal_size((100, 40))), \
+             patch.object(builtins, "print", side_effect=_fake_print):
+            try:
+                cli.run()
+            except RuntimeError as exc:
+                assert str(exc) == "stop-at-banner"
+            else:
+                raise AssertionError("run() should stop at the banner hook in this test")
+
+        assert printed == []
+

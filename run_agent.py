@@ -518,6 +518,7 @@ class AIAgent:
         base_url: str = None,
         api_key: str = None,
         provider: str = None,
+        requested_provider: str = None,
         api_mode: str = None,
         acp_command: str = None,
         acp_args: list[str] | None = None,
@@ -640,6 +641,8 @@ class AIAgent:
         self.base_url = base_url or ""
         provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
         self.provider = provider_name or ""
+        requested_provider_name = requested_provider.strip().lower() if isinstance(requested_provider, str) and requested_provider.strip() else None
+        self.requested_provider = requested_provider_name or self.provider
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
         if api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
@@ -1060,6 +1063,13 @@ class AIAgent:
                         "max_iterations": self.max_iterations,
                         "reasoning_config": reasoning_config,
                         "max_tokens": max_tokens,
+                        "requested_provider": getattr(self, "requested_provider", self.provider),
+                        "provider": self.provider,
+                        "base_url": self.base_url,
+                        "api_mode": self.api_mode,
+                        "acp_command": self.acp_command,
+                        "acp_args": list(self.acp_args or []),
+                        "cwd": os.getenv("TERMINAL_CWD", os.getcwd()),
                     },
                     user_id=None,
                     parent_session_id=self._parent_session_id,
@@ -1304,9 +1314,19 @@ class AIAgent:
                 summary_model_override=compression_summary_model,
                 quiet_mode=self.quiet_mode,
                 base_url=self.base_url,
-                api_key=getattr(self, "api_key", ""),
+                # IMPORTANT: pass the __init__ api_key argument, not self.api_key.
+                # self.api_key is only populated AFTER the runtime provider/client is built.
+                # If we pass self.api_key here, context-length detection can query /models
+                # without credentials (401) and incorrectly fall back to 128k.
+                api_key=(api_key or getattr(self, "api_key", "")),
                 config_context_length=_config_context_length,
                 provider=self.provider,
+                runtime_route_getter=lambda: {
+                    "model": self.model,
+                    "provider": self.provider,
+                    "base_url": self.base_url,
+                    "api_key": getattr(self, "api_key", ""),
+                },
             )
         self.compression_enabled = compression_enabled
 
@@ -1412,6 +1432,7 @@ class AIAgent:
         _cc = self.context_compressor
         self._primary_runtime = {
             "model": self.model,
+            "requested_provider": getattr(self, "requested_provider", self.provider),
             "provider": self.provider,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
@@ -1474,7 +1495,7 @@ class AIAgent:
         if hasattr(self, "context_compressor") and self.context_compressor:
             self.context_compressor.on_session_reset()
     
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode='', requested_provider=None, acp_command=None, acp_args=None):
         """Switch the model/provider in-place for a live agent.
 
         Called by the /model command handlers (CLI and gateway) after
@@ -1501,8 +1522,11 @@ class AIAgent:
         # ── Swap core runtime fields ──
         self.model = new_model
         self.provider = new_provider
+        self.requested_provider = requested_provider or new_provider
         self.base_url = base_url or self.base_url
         self.api_mode = api_mode
+        self.acp_command = acp_command if acp_command is not None else self.acp_command
+        self.acp_args = list(acp_args) if acp_args is not None else list(self.acp_args or [])
         if api_key:
             self.api_key = api_key
 
@@ -1572,10 +1596,13 @@ class AIAgent:
         _cc = self.context_compressor if hasattr(self, "context_compressor") and self.context_compressor else None
         self._primary_runtime = {
             "model": self.model,
+            "requested_provider": getattr(self, "requested_provider", self.provider),
             "provider": self.provider,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
             "api_key": getattr(self, "api_key", ""),
+            "acp_command": self.acp_command,
+            "acp_args": list(self.acp_args or []),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
             "compressor_model": getattr(_cc, "model", self.model) if _cc else self.model,
@@ -1733,10 +1760,27 @@ class AIAgent:
 
             aux_base_url = str(getattr(client, "base_url", ""))
             aux_api_key = str(getattr(client, "api_key", ""))
+            # Use the main model's known context length as an override when the
+            # auxiliary "compression" backend resolves to the same model + endpoint.
+            # Without this, custom endpoints that do not expose context metadata
+            # in /models can cause a false 128k fallback here, triggering a noisy
+            # warning even though the session is configured for 200k and summaries
+            # will work.
+            config_ctx_override = None
+            try:
+                if (
+                    aux_model == getattr(self, "model", None)
+                    and (aux_base_url or "").rstrip("/") == (getattr(self, "base_url", "") or "").rstrip("/")
+                ):
+                    config_ctx_override = int(getattr(self.context_compressor, "context_length", 0) or 0) or None
+            except Exception:
+                config_ctx_override = None
+
             aux_context = get_model_context_length(
                 aux_model,
                 base_url=aux_base_url,
                 api_key=aux_api_key,
+                config_context_length=config_ctx_override,
             )
 
             threshold = self.context_compressor.threshold_tokens
@@ -4918,7 +4962,41 @@ class AIAgent:
             usage_obj = None
             _first_chunk_seen = False
             for chunk in stream:
-                last_chunk_time["t"] = time.time()
+                # NOTE: Some proxies (and some OpenAI-compatible backends) send
+                # SSE keep-alive frames that the OpenAI SDK surfaces as chunks
+                # with no choices/content. Those can arrive forever and prevent
+                # both httpx read timeouts and our stale-stream detector from
+                # firing.
+                #
+                # Treat only "meaningful" chunks (real deltas, tool calls,
+                # reasoning deltas, finish_reason, or final usage) as progress.
+                _now = time.time()
+                _meaningful = False
+                try:
+                    _choices = getattr(chunk, "choices", None)
+                    if _choices:
+                        try:
+                            _choice0 = _choices[0]
+                            _delta0 = getattr(_choice0, "delta", None)
+                            if _delta0 is not None:
+                                if getattr(_delta0, "content", None):
+                                    _meaningful = True
+                                if getattr(_delta0, "tool_calls", None):
+                                    _meaningful = True
+                                if getattr(_delta0, "reasoning_content", None) or getattr(_delta0, "reasoning", None):
+                                    _meaningful = True
+                            if getattr(_choice0, "finish_reason", None):
+                                _meaningful = True
+                        except Exception:
+                            # If we can't introspect, conservatively treat as progress.
+                            _meaningful = True
+                    if not _meaningful and getattr(chunk, "usage", None):
+                        _meaningful = True
+                except Exception:
+                    _meaningful = True
+                if _meaningful:
+                    last_chunk_time["t"] = _now
+
                 if not _first_chunk_seen:
                     _first_chunk_seen = True
                     self._touch_activity("receiving stream response")
@@ -5091,12 +5169,15 @@ class AIAgent:
             with self._anthropic_client.messages.stream(**api_kwargs) as stream:
                 for event in stream:
                     # Update stale-stream timer on every event so the
-                    # outer poll loop knows data is flowing.  Without
-                    # this, the detector kills healthy long-running
-                    # Opus streams after 180 s even when events are
-                    # actively arriving (the chat_completions path
-                    # already does this at the top of its chunk loop).
-                    last_chunk_time["t"] = time.time()
+                    # outer poll loop knows data is flowing.
+                    #
+                    # IMPORTANT: treat only meaningful events as "progress".
+                    # Some transports can emit long runs of keep-alives that
+                    # shouldn't postpone the stale-stream detector forever.
+                    event_type = getattr(event, "type", None)
+                    _meaningful = event_type not in ("ping", "keepalive")
+                    if _meaningful:
+                        last_chunk_time["t"] = time.time()
 
                     if self._interrupt_requested:
                         break
@@ -5539,10 +5620,13 @@ class AIAgent:
         try:
             # ── Core runtime state ──
             self.model = rt["model"]
+            self.requested_provider = rt.get("requested_provider", rt["provider"])
             self.provider = rt["provider"]
             self.base_url = rt["base_url"]           # setter updates _base_url_lower
             self.api_mode = rt["api_mode"]
             self.api_key = rt["api_key"]
+            self.acp_command = rt.get("acp_command")
+            self.acp_args = list(rt.get("acp_args") or [])
             self._client_kwargs = dict(rt["client_kwargs"])
             self._use_prompt_caching = rt["use_prompt_caching"]
 
@@ -6599,6 +6683,17 @@ class AIAgent:
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
+                    model_config={
+                        "max_iterations": self.max_iterations,
+                        "reasoning_config": self.reasoning_config,
+                        "requested_provider": getattr(self, "requested_provider", self.provider),
+                        "provider": self.provider,
+                        "base_url": self.base_url,
+                        "api_mode": self.api_mode,
+                        "acp_command": self.acp_command,
+                        "acp_args": list(self.acp_args or []),
+                        "cwd": os.getenv("TERMINAL_CWD", os.getcwd()),
+                    },
                     parent_session_id=old_session_id,
                 )
                 # Auto-number the title for the continuation session
@@ -9795,7 +9890,31 @@ class AIAgent:
                     # Save session log incrementally (so progress is visible even if interrupted)
                     self._session_messages = messages
                     self._save_session_log(messages)
-                    
+
+                    if final_response is None and (
+                        api_call_count >= self.max_iterations
+                        or self.iteration_budget.remaining <= 0
+                    ) and not self._budget_exhausted_injected:
+                        # Tool execution used the last allowed iteration. Inject the
+                        # grace summary request here, before the tool-call branch
+                        # continues, so the next loop iteration actually runs.
+                        self._budget_exhausted_injected = True
+                        self._budget_grace_call = True
+                        _grace_msg = (
+                            "Your tool budget ran out. Please give me the information "
+                            "or actions you've completed so far."
+                        )
+                        messages.append({"role": "user", "content": _grace_msg})
+                        self._emit_status(
+                            f"⚠️ Iteration budget exhausted ({api_call_count}/{self.max_iterations}) "
+                            "— asking model to summarise"
+                        )
+                        if not self.quiet_mode:
+                            self._safe_print(
+                                f"\n⚠️  Iteration budget exhausted ({api_call_count}/{self.max_iterations}) "
+                                "— requesting summary..."
+                            )
+
                     # Continue loop for next response
                     continue
                 
@@ -10061,30 +10180,6 @@ class AIAgent:
                     # session resume (avoids consecutive user messages).
                     messages.append({"role": "assistant", "content": final_response})
                     break
-        
-        if final_response is None and (
-            api_call_count >= self.max_iterations
-            or self.iteration_budget.remaining <= 0
-        ) and not self._budget_exhausted_injected:
-            # Budget exhausted but we haven't tried asking the model to
-            # summarise yet.  Inject a user message and give it one grace
-            # API call to produce a text response.
-            self._budget_exhausted_injected = True
-            self._budget_grace_call = True
-            _grace_msg = (
-                "Your tool budget ran out. Please give me the information "
-                "or actions you've completed so far."
-            )
-            messages.append({"role": "user", "content": _grace_msg})
-            self._emit_status(
-                f"⚠️ Iteration budget exhausted ({api_call_count}/{self.max_iterations}) "
-                "— asking model to summarise"
-            )
-            if not self.quiet_mode:
-                self._safe_print(
-                    f"\n⚠️  Iteration budget exhausted ({api_call_count}/{self.max_iterations}) "
-                    "— requesting summary..."
-                )
 
         if final_response is None and (
             api_call_count >= self.max_iterations

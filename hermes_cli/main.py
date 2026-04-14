@@ -44,9 +44,11 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from typing import Optional
 
@@ -280,54 +282,236 @@ def _has_any_provider_configured() -> bool:
     return False
 
 
-def _session_browse_picker(sessions: list) -> Optional[str]:
+def _normalize_session_path(path: str) -> str:
+    """Normalize a session cwd for matching/sorting."""
+    if not path:
+        return ""
+    try:
+        normalized = os.path.expanduser(str(path).strip())
+        normalized = os.path.abspath(normalized)
+        normalized = os.path.realpath(normalized)
+        normalized = os.path.normpath(normalized)
+        normalized = os.path.normcase(normalized)
+        return normalized
+    except Exception:
+        return str(path).strip().lower()
+
+
+def _session_model_config(session: dict) -> dict:
+    """Return a session's model_config as a dict, parsing JSON strings if needed."""
+    raw = session.get("model_config")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _session_cwd(session: dict) -> str:
+    """Extract the stored cwd for a session, if available."""
+    model_config = _session_model_config(session)
+    cwd = model_config.get("cwd") or session.get("cwd") or ""
+    return str(cwd).strip()
+
+
+def _session_cwd_score(session: dict, current_cwd: str = "") -> int:
+    """Score how closely a session matches the current working directory."""
+    session_cwd = _normalize_session_path(_session_cwd(session))
+    current_cwd = _normalize_session_path(current_cwd)
+    if not session_cwd or not current_cwd:
+        return 0
+    if session_cwd == current_cwd:
+        return 3000
+
+    sep = os.sep
+    if current_cwd.startswith(session_cwd + sep) or session_cwd.startswith(current_cwd + sep):
+        return 2200
+
+    session_base = os.path.basename(session_cwd)
+    current_base = os.path.basename(current_cwd)
+    if session_base and current_base and session_base == current_base:
+        return 900
+
+    return 0
+
+
+def _session_search_blob(session: dict) -> str:
+    """Build a lowercase search blob for fuzzy filtering/ranking."""
+    return " ".join([
+        (session.get("title") or "").strip().lower(),
+        (session.get("preview") or "").strip().lower(),
+        (session.get("id") or "").strip().lower(),
+        (session.get("source") or "").strip().lower(),
+        _session_cwd(session).lower(),
+    ]).strip()
+
+
+def _session_text_score(session: dict, query: str = "") -> int:
+    """Score a session against the live search query."""
+    q = " ".join((query or "").lower().split())
+    if not q:
+        return 0
+
+    title = (session.get("title") or "").strip().lower()
+    preview = (session.get("preview") or "").strip().lower()
+    sid = (session.get("id") or "").strip().lower()
+    source = (session.get("source") or "").strip().lower()
+    blob = _session_search_blob(session)
+    terms = [term for term in q.split() if term]
+
+    score = 0
+    if title == q:
+        score += 7000
+    elif title.startswith(q):
+        score += 5500
+    elif q in title:
+        score += 4200
+
+    if q in preview:
+        score += 2200
+    if q in sid:
+        score += 1600
+    if q in source:
+        score += 600
+    if q in _session_cwd(session).lower():
+        score += 1200
+
+    if terms:
+        if title and all(term in title for term in terms):
+            score += 1400
+        if all(term in blob for term in terms):
+            score += 900
+        score += 250 * sum(1 for term in terms if term in title)
+        score += 100 * sum(1 for term in terms if term in preview)
+        score += 80 * sum(1 for term in terms if term in sid)
+        score += 40 * sum(1 for term in terms if term in source)
+        score += 80 * sum(1 for term in terms if term in _session_cwd(session).lower())
+
+    return score
+
+
+def _session_sort_key(session: dict, query: str = "", current_cwd: str = "") -> tuple:
+    """Sort key for /resume browsing.
+
+    Empty-query browsing should feel like a true "recent sessions" list, so it
+    sorts purely by recency. When a query is present, prefer textual relevance,
+    then cwd affinity, then recency.
+    """
+    q = " ".join((query or "").split())
+    if not q:
+        return (
+            -(session.get("last_active") or 0),
+            -(session.get("started_at") or 0),
+            session.get("id") or "",
+        )
+
+    text_score = _session_text_score(session, q)
+    cwd_score = _session_cwd_score(session, current_cwd)
+    total = text_score + cwd_score
+    return (
+        -total,
+        -text_score,
+        -cwd_score,
+        -(session.get("last_active") or 0),
+        -(session.get("started_at") or 0),
+        session.get("id") or "",
+    )
+
+
+
+def _session_browse_picker(
+    sessions: list,
+    initial_query: str = "",
+    current_cwd: str = "",
+) -> Optional[str]:
     """Interactive curses-based session browser with live search filtering.
 
     Returns the selected session ID, or None if cancelled.
     Uses curses (not simple_term_menu) to avoid the ghost-duplication rendering
     bug in tmux/iTerm when arrow keys are used.
+
+    ``initial_query`` pre-seeds the live filter so callers like ``/resume foo``
+    can jump straight into a narrowed session list. ``current_cwd`` lets the
+    picker rank sessions from the current project ahead of unrelated work.
     """
     if not sessions:
         print("No sessions found.")
         return None
+
+    initial_query = (initial_query or "").strip()
+    current_cwd = (current_cwd or os.getenv("TERMINAL_CWD") or os.getcwd() or "").strip()
+
+    def _combined_session_label(s: dict) -> str:
+        title = (s.get("title") or "").strip()
+        preview = (s.get("preview") or "").strip()
+        sid = s.get("id", "")
+        if title and preview:
+            return f"{title} — {preview}"
+        if title:
+            return title
+        if preview:
+            return preview
+        return sid
+
+    def _query_terms(query: str) -> list[str]:
+        return [term for term in query.lower().split() if term]
+
+    def _format_row(s, max_x):
+        """Format a session row for display."""
+        source = s.get("source", "")[:6]
+        last_active = _relative_time(s.get("last_active"))
+        sid = s["id"][:18]
+
+        # Adaptive column widths based on terminal width
+        # Layout: [arrow 3] [title/preview flexible] [active 12] [src 6] [id 18]
+        fixed_cols = 3 + 12 + 6 + 18 + 6  # arrow + active + src + id + padding
+        name_width = max(20, max_x - fixed_cols)
+        name = _combined_session_label(s)[:name_width]
+
+        return f"{name:<{name_width}}  {last_active:<10}  {source:<5} {sid}"
+
+    def _match(s, query):
+        """Check if a session matches the search query (case-insensitive)."""
+        q = " ".join((query or "").lower().split())
+        if not q:
+            return True
+        haystack = _session_search_blob(s)
+        if q in haystack:
+            return True
+        terms = _query_terms(q)
+        return bool(terms) and all(term in haystack for term in terms)
+
+    def _apply_filter(query: str):
+        matched = [s for s in sessions if _match(s, query)]
+        return sorted(matched, key=lambda s: _session_sort_key(s, query, current_cwd))
+
+    def _detail_lines(s: dict, width: int) -> list[str]:
+        width = max(20, width)
+        preview = (s.get("preview") or "").strip() or "(no preview)"
+        title = (s.get("title") or "").strip() or "(untitled)"
+        session_cwd = _session_cwd(s) or "(unknown cwd)"
+        meta = (
+            f"id: {s.get('id', '')}   "
+            f"active: {_relative_time(s.get('last_active'))}   "
+            f"source: {(s.get('source') or 'unknown')}"
+        )
+        lines = [f"Title: {title}", f"CWD: {session_cwd}", meta, "Preview:"]
+        wrapped = textwrap.wrap(preview, width=width) or ["(no preview)"]
+        lines.extend(wrapped[:4])
+        if len(wrapped) > 4:
+            lines[-1] = lines[-1][: max(0, width - 4)] + "..."
+        return lines
 
     # Try curses-based picker first
     try:
         import curses
 
         result_holder = [None]
-
-        def _format_row(s, max_x):
-            """Format a session row for display."""
-            title = (s.get("title") or "").strip()
-            preview = (s.get("preview") or "").strip()
-            source = s.get("source", "")[:6]
-            last_active = _relative_time(s.get("last_active"))
-            sid = s["id"][:18]
-
-            # Adaptive column widths based on terminal width
-            # Layout: [arrow 3] [title/preview flexible] [active 12] [src 6] [id 18]
-            fixed_cols = 3 + 12 + 6 + 18 + 6  # arrow + active + src + id + padding
-            name_width = max(20, max_x - fixed_cols)
-
-            if title:
-                name = title[:name_width]
-            elif preview:
-                name = preview[:name_width]
-            else:
-                name = sid
-
-            return f"{name:<{name_width}}  {last_active:<10}  {source:<5} {sid}"
-
-        def _match(s, query):
-            """Check if a session matches the search query (case-insensitive)."""
-            q = query.lower()
-            return (
-                q in (s.get("title") or "").lower()
-                or q in (s.get("preview") or "").lower()
-                or q in s.get("id", "").lower()
-                or q in (s.get("source") or "").lower()
-            )
 
         def _curses_browse(stdscr):
             curses.curs_set(0)
@@ -341,8 +525,8 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
 
             cursor = 0
             scroll_offset = 0
-            search_text = ""
-            filtered = list(sessions)
+            search_text = initial_query
+            filtered = _apply_filter(search_text)
 
             while True:
                 stdscr.clear()
@@ -383,10 +567,14 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                 except curses.error:
                     pass
 
-                # Compute visible area
-                visible_rows = max_y - 4  # header + col header + blank + footer
+                # Compute visible area (leave room for preview pane + footer)
+                detail_height = 7
+                footer_height = 1
+                visible_rows = max_y - (3 + detail_height + footer_height)
                 if visible_rows < 1:
                     visible_rows = 1
+
+                detail_start_y = min(max_y - (detail_height + footer_height), 3 + visible_rows)
 
                 # Clamp cursor and scroll
                 if not filtered:
@@ -410,7 +598,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                         min(len(filtered), scroll_offset + visible_rows)
                     )):
                         y = draw_i + 3
-                        if y >= max_y - 1:
+                        if y >= detail_start_y:
                             break
                         s = filtered[i]
                         arrow = " → " if i == cursor else "   "
@@ -422,6 +610,22 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                                 attr |= curses.color_pair(1)
                         try:
                             stdscr.addnstr(y, 0, row, max_x - 1, attr)
+                        except curses.error:
+                            pass
+
+                    # Detail preview for the highlighted session.
+                    detail_attr = curses.color_pair(4) if curses.has_colors() else curses.A_DIM
+                    hline_char = getattr(curses, "ACS_HLINE", ord("-"))
+                    try:
+                        stdscr.hline(detail_start_y, 0, hline_char, max_x - 1)
+                    except curses.error:
+                        pass
+                    for idx, line in enumerate(_detail_lines(filtered[cursor], max_x - 4)):
+                        y = detail_start_y + 1 + idx
+                        if y >= max_y - footer_height:
+                            break
+                        try:
+                            stdscr.addnstr(y, 2, line, max_x - 3, detail_attr)
                         except curses.error:
                             pass
 
@@ -456,7 +660,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                     if search_text:
                         # First Esc clears the search
                         search_text = ""
-                        filtered = list(sessions)
+                        filtered = _apply_filter(search_text)
                         cursor = 0
                         scroll_offset = 0
                     else:
@@ -465,10 +669,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                 elif key in (curses.KEY_BACKSPACE, 127, 8):
                     if search_text:
                         search_text = search_text[:-1]
-                        if search_text:
-                            filtered = [s for s in sessions if _match(s, search_text)]
-                        else:
-                            filtered = list(sessions)
+                        filtered = _apply_filter(search_text)
                         cursor = 0
                         scroll_offset = 0
                 elif key == ord('q') and not search_text:
@@ -476,7 +677,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                 elif 32 <= key <= 126:
                     # Printable character → add to search filter
                     search_text += chr(key)
-                    filtered = [s for s in sessions if _match(s, search_text)]
+                    filtered = _apply_filter(search_text)
                     cursor = 0
                     scroll_offset = 0
 
@@ -487,11 +688,17 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
         pass
 
     # Fallback: numbered list (Windows without curses, etc.)
-    print("\n  Browse sessions  (enter number to resume, q to cancel)\n")
-    for i, s in enumerate(sessions):
-        title = (s.get("title") or "").strip()
-        preview = (s.get("preview") or "").strip()
-        label = title or preview or s["id"]
+    filtered_sessions = _apply_filter(initial_query)
+    if not filtered_sessions:
+        print(f"\n  No sessions match: {initial_query}\n")
+        return None
+
+    print("\n  Browse sessions  (enter number to resume, q to cancel)")
+    if initial_query:
+        print(f"  Filter: {initial_query}")
+    print()
+    for i, s in enumerate(filtered_sessions):
+        label = _combined_session_label(s)
         if len(label) > 50:
             label = label[:47] + "..."
         last_active = _relative_time(s.get("last_active"))
@@ -500,13 +707,13 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
 
     while True:
         try:
-            val = input(f"\n  Select [1-{len(sessions)}]: ").strip()
+            val = input(f"\n  Select [1-{len(filtered_sessions)}]: ").strip()
             if not val or val.lower() in ("q", "quit", "exit"):
                 return None
             idx = int(val) - 1
-            if 0 <= idx < len(sessions):
-                return sessions[idx]["id"]
-            print(f"  Invalid selection. Enter 1-{len(sessions)} or q to cancel.")
+            if 0 <= idx < len(filtered_sessions):
+                return filtered_sessions[idx]["id"]
+            print(f"  Invalid selection. Enter 1-{len(filtered_sessions)} or q to cancel.")
         except ValueError:
             print("  Invalid input. Enter a number or q to cancel.")
         except (KeyboardInterrupt, EOFError):
@@ -636,26 +843,82 @@ def _exec_in_container(container_info: dict, cli_args: list):
 
 
 def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
-    """Resolve a session name (title) or ID to a session ID.
+    """Resolve a session query to a session ID.
 
-    - If it looks like a session ID (contains underscore + hex), try direct lookup first.
-    - Otherwise, treat it as a title and use resolve_session_by_title (auto-latest).
-    - Falls back to the other method if the first doesn't match.
+    Resolution order:
+    - exact session ID
+    - unique session ID prefix
+    - exact title / lineage title resolution
+    - unique fuzzy match across recent CLI sessions (title or preview)
+
+    Ambiguous fuzzy matches intentionally return ``None`` so interactive callers
+    can open the session picker instead of guessing wrong.
     """
     try:
         from hermes_state import SessionDB
         db = SessionDB()
 
-        # Try as exact session ID first
-        session = db.get_session(name_or_id)
-        if session:
+        query = (name_or_id or "").strip()
+        if not query:
             db.close()
-            return session["id"]
+            return None
+
+        # Try as exact session ID first, then as a unique ID prefix.
+        resolved_id = db.resolve_session_id(query)
+        if resolved_id:
+            db.close()
+            return resolved_id
 
         # Try as title (with auto-latest for lineage)
-        session_id = db.resolve_session_by_title(name_or_id)
+        session_id = db.resolve_session_by_title(query)
+        if session_id:
+            db.close()
+            return session_id
+
+        # Fuzzy fallback for shell ergonomics: accept a unique recent title or
+        # preview match, but never guess if multiple sessions match.
+        sessions = db.list_sessions_rich(source="cli", exclude_sources=["tool"], limit=200)
+        q = " ".join(query.lower().split())
+        terms = [term for term in q.split() if term]
+
+        def _title(session: dict) -> str:
+            return (session.get("title") or "").strip().lower()
+
+        def _preview(session: dict) -> str:
+            return (session.get("preview") or "").strip().lower()
+
+        def _blob(session: dict) -> str:
+            return " ".join([
+                _title(session),
+                _preview(session),
+                (session.get("id") or "").strip().lower(),
+                (session.get("source") or "").strip().lower(),
+            ]).strip()
+
+        ranked_groups = [
+            [s for s in sessions if _title(s) == q],
+            [s for s in sessions if _title(s).startswith(q)],
+            [s for s in sessions if q in _title(s)],
+            [s for s in sessions if q in _preview(s)],
+            [s for s in sessions if terms and all(term in _title(s) for term in terms)],
+            [s for s in sessions if terms and all(term in _blob(s) for term in terms)],
+        ]
+        for matches in ranked_groups:
+            unique = []
+            seen_ids = set()
+            for session in matches:
+                sid = session.get("id")
+                if sid and sid not in seen_ids:
+                    unique.append(session)
+                    seen_ids.add(sid)
+            if len(unique) == 1:
+                db.close()
+                return unique[0]["id"]
+            if len(unique) > 1:
+                db.close()
+                return None
+
         db.close()
-        return session_id
     except Exception:
         pass
     return None

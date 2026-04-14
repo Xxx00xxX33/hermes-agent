@@ -373,6 +373,72 @@ class TestGetModelContextLength:
 
         assert result == 200000
 
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    @patch("agent.model_metadata.get_cached_context_length")
+    def test_main_config_context_length_used_for_matching_endpoint(
+        self,
+        mock_cached,
+        mock_endpoint_fetch,
+        mock_fetch,
+    ):
+        """Matching configured main endpoint+model should honour config model.context_length."""
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+        mock_cached.return_value = None
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "model": {
+                    "default": "gpt-5.4",
+                    "base_url": "https://chatgpt.com/backend-api/codex/",
+                    "context_length": 200000,
+                }
+            },
+        ):
+            result = get_model_context_length(
+                "openai-codex:gpt-5.4",
+                base_url="https://chatgpt.com/backend-api/codex",
+            )
+
+        assert result == 200000
+        mock_cached.assert_not_called()
+        mock_endpoint_fetch.assert_not_called()
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    @patch("agent.model_metadata.get_cached_context_length")
+    def test_main_config_context_length_ignored_when_endpoint_differs(
+        self,
+        mock_cached,
+        mock_endpoint_fetch,
+        mock_fetch,
+    ):
+        """Config model.context_length should not leak to other endpoints."""
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+        mock_cached.return_value = None
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "model": {
+                    "default": "gpt-5.4",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "context_length": 200000,
+                }
+            },
+        ):
+            result = get_model_context_length(
+                "openai-codex:gpt-5.4",
+                base_url="https://different.example/v1",
+            )
+
+        assert result == CONTEXT_PROBE_TIERS[0]
+        mock_cached.assert_called_once_with("gpt-5.4", "https://different.example/v1")
+        mock_endpoint_fetch.assert_called_once_with("https://different.example/v1", api_key="")
+
 
 # =========================================================================
 # _strip_provider_prefix — Ollama model:tag vs provider:model

@@ -508,6 +508,7 @@ DEFAULT_CONFIG = {
         "compact": False,
         "personality": "kawaii",
         "resume_display": "full",
+        "resume_history_exchanges": 20,
         "busy_input_mode": "interrupt",
         "bell_on_complete": False,
         "show_reasoning": False,

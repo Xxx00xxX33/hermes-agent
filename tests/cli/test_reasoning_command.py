@@ -386,9 +386,20 @@ class TestReasoningDisplayModeSelection(unittest.TestCase):
     def test_show_reasoning_streaming_uses_live_reasoning_box(self):
         cli = self._make_cli(show_reasoning=True, streaming_enabled=True, verbose=False)
 
-        callback = cli._current_reasoning_callback()
+        with patch.dict("os.environ", {"TMUX": ""}, clear=False):
+            callback = cli._current_reasoning_callback()
+
         self.assertIsNotNone(callback)
         self.assertEqual(callback("x"), ("stream", "x"))
+
+    def test_show_reasoning_streaming_uses_preview_callback_inside_tmux(self):
+        cli = self._make_cli(show_reasoning=True, streaming_enabled=True, verbose=False)
+
+        with patch.dict("os.environ", {"TMUX": "/tmp/tmux-1000/default,1,0"}, clear=False):
+            callback = cli._current_reasoning_callback()
+
+        self.assertIsNotNone(callback)
+        self.assertEqual(callback("x"), ("preview", "x"))
 
     def test_verbose_without_show_reasoning_uses_preview_callback(self):
         cli = self._make_cli(show_reasoning=False, streaming_enabled=False, verbose=True)
@@ -396,6 +407,46 @@ class TestReasoningDisplayModeSelection(unittest.TestCase):
         callback = cli._current_reasoning_callback()
         self.assertIsNotNone(callback)
         self.assertEqual(callback("x"), ("preview", "x"))
+
+
+class TestTmuxReasoningPreviewPolicy(unittest.TestCase):
+    def _make_cli(self, *, show_reasoning=True):
+        from cli import HermesCLI
+
+        cli = HermesCLI.__new__(HermesCLI)
+        cli.show_reasoning = show_reasoning
+        cli.streaming_enabled = True
+        cli.verbose = False
+        cli._reasoning_preview_buf = ""
+        cli._reasoning_shown_this_turn = False
+        cli._flush_reasoning_preview = lambda force=False: None
+        return cli
+
+    def test_on_reasoning_marks_turn_as_already_shown(self):
+        cli = self._make_cli()
+
+        cli._on_reasoning("Thinking in preview mode")
+
+        self.assertTrue(cli._reasoning_shown_this_turn)
+
+    def test_final_reasoning_box_suppressed_inside_tmux(self):
+        cli = self._make_cli()
+
+        with patch.dict("os.environ", {"TMUX": "/tmp/tmux-1000/default,1,0"}, clear=False):
+            self.assertFalse(cli._should_render_final_reasoning_box())
+
+    def test_final_reasoning_box_allowed_outside_tmux_when_not_already_shown(self):
+        cli = self._make_cli()
+
+        with patch.dict("os.environ", {"TMUX": ""}, clear=False):
+            self.assertTrue(cli._should_render_final_reasoning_box())
+
+    def test_final_reasoning_box_suppressed_after_preview_already_rendered(self):
+        cli = self._make_cli()
+        cli._reasoning_shown_this_turn = True
+
+        with patch.dict("os.environ", {"TMUX": ""}, clear=False):
+            self.assertFalse(cli._should_render_final_reasoning_box())
 
 
 # ---------------------------------------------------------------------------

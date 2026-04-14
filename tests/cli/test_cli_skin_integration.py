@@ -75,6 +75,13 @@ class TestCliSkinPromptIntegration:
         with patch("hermes_cli.skin_engine.get_active_prompt_symbol", return_value="⚔ "):
             assert cli._get_tui_prompt_fragments() == [("class:sudo-prompt", "🔑 ⚔ ")]
 
+    def test_agent_running_prompt_fragments_show_pulse_frame(self):
+        cli = _make_cli_stub()
+        cli._agent_running = True
+
+        with patch.object(HermesCLI, "_agent_working_frame", return_value="●"):
+            assert cli._get_tui_prompt_fragments() == [("class:prompt-working", "⚕ ● ❯ ")]
+
     def test_build_tui_style_dict_uses_skin_overrides(self):
         cli = _make_cli_stub()
 

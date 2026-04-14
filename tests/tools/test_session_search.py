@@ -1,13 +1,18 @@
 """Tests for tools/session_search_tool.py — helper functions and search dispatcher."""
 
+import asyncio
 import json
 import time
+import types
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from tools.session_search_tool import (
     _format_timestamp,
     _format_conversation,
     _truncate_around_matches,
+    _summarize_session,
     _HIDDEN_SESSION_SOURCES,
     MAX_SESSION_CHARS,
     SESSION_SEARCH_SCHEMA,
@@ -284,3 +289,78 @@ class TestSessionSearch:
         assert result["count"] == 0
         assert result["results"] == []
         assert result["sessions_searched"] == 0
+
+
+# =========================================================================
+# _summarize_session
+# =========================================================================
+
+class TestSummarizeSession:
+    def test_empty_content_returns_none_without_retrying(self):
+        response = types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=None, tool_calls=None))]
+        )
+
+        async def _run():
+            with patch("tools.session_search_tool.async_call_llm", new_callable=AsyncMock) as mock_call:
+                mock_call.return_value = response
+                result = await _summarize_session(
+                    "[USER]: remember the gold status bar",
+                    "status bar",
+                    {"source": "cli", "started_at": 1700000000},
+                )
+            return result, mock_call.await_count
+
+        result, await_count = asyncio.run(_run())
+
+        assert result is None
+        assert await_count == 1
+
+    def test_timeout_returns_none_without_retrying(self):
+        async def _slow_call(**_kwargs):
+            await asyncio.sleep(0.05)
+
+        async def _run():
+            with patch("tools.session_search_tool.async_call_llm", side_effect=_slow_call) as mock_call, \
+                 patch("tools.session_search_tool.SESSION_SUMMARIZATION_TIMEOUT_SECONDS", 0.01):
+                result = await _summarize_session(
+                    "[USER]: summarize the last fix",
+                    "last fix",
+                    {"source": "cli", "started_at": 1700000000},
+                )
+            return result, mock_call.await_count
+
+        result, await_count = asyncio.run(_run())
+
+        assert result is None
+        assert await_count == 1
+
+
+class TestSessionSearchFallbackPreview:
+    def test_raw_preview_is_used_when_summarizer_returns_none(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "sid-1",
+                "content": "Hermes hang",
+                "source": "cli",
+                "session_started": 1709500000,
+                "model": "gpt-5.4",
+            }
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None}
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "Please fix Hermes hanging during initialization."},
+            {"role": "assistant", "content": "I traced it to session_search retries."},
+        ]
+
+        with patch("tools.session_search_tool._summarize_session", new_callable=AsyncMock) as mock_summarize:
+            mock_summarize.return_value = None
+            result = json.loads(session_search(query="Hermes", db=mock_db))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["results"][0]["summary"].startswith("[Raw preview — summarization unavailable]")

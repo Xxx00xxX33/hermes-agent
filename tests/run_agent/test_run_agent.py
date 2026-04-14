@@ -728,6 +728,28 @@ class TestToolUseEnforcementConfig:
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
 
+    def test_gpt_system_prompt_includes_background_task_strategy(self):
+        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
+        prompt = agent._build_system_prompt()
+        assert "<background_task_strategy>" in prompt
+        assert "notify_on_complete=true" in prompt
+        assert "dependency-blocking" in prompt
+        assert "ram-constrained" in prompt.lower()
+
+    def test_gpt5_api_kwargs_carry_background_task_strategy_in_instructions(self):
+        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
+        prompt = agent._build_system_prompt()
+        kwargs = agent._build_api_kwargs([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "run the test suite"},
+        ])
+        assert "instructions" in kwargs
+        assert "<background_task_strategy>" in kwargs["instructions"]
+        assert "notify_on_complete=true" in kwargs["instructions"]
+        assert "dependency-blocking" in kwargs["instructions"]
+        assert "ram-constrained" in kwargs["instructions"].lower()
+        assert kwargs["input"] == [{"role": "user", "content": "run the test suite"}]
+
     def test_auto_injects_for_codex(self):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
         agent = self._make_agent(model="openai/codex-mini", tool_use_enforcement="auto")
@@ -2748,6 +2770,70 @@ class TestBudgetPressure:
         """Agent should have budget grace call flags."""
         assert agent._budget_exhausted_injected is False
         assert agent._budget_grace_call is False
+
+    def test_budget_exhaustion_triggers_one_grace_summary_call(self, agent):
+        """When tool budget runs out after a tool turn, run one extra summary API call."""
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        agent.max_iterations = 1
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Budget summary", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_handle_max_iterations") as mock_handle_max_iterations,
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == "Budget summary"
+        assert result["api_calls"] == 2
+        assert agent.client.chat.completions.create.call_count == 2
+        second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        assert second_call_messages[-1]["role"] == "user"
+        assert "tool budget ran out" in second_call_messages[-1]["content"]
+        mock_handle_max_iterations.assert_not_called()
+
+    def test_budget_exhaustion_persists_assistant_tool_user_assistant_tail_order(self, agent):
+        """Final persisted transcript should keep the grace-summary tail ordering."""
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        agent.max_iterations = 1
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Budget summary", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session") as mock_persist_session,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        persisted_messages = mock_persist_session.call_args.args[0]
+        tail = persisted_messages[-4:]
+
+        assert [msg["role"] for msg in tail] == ["assistant", "tool", "user", "assistant"]
+        assert tail[0]["tool_calls"][0]["function"]["name"] == "web_search"
+        assert tail[1]["tool_call_id"] == "c1"
+        assert tail[1]["content"] == "search result"
+        assert "tool budget ran out" in tail[2]["content"]
+        assert tail[3]["content"] == "Budget summary"
+        assert result["messages"][-4:] == tail
 
 
 class TestSafeWriter:

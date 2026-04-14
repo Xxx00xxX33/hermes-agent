@@ -409,6 +409,22 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def update_session_model_config(
+        self,
+        session_id: str,
+        model_config: Optional[Dict[str, Any]],
+        model: str = None,
+    ) -> None:
+        """Replace a session's stored model_config JSON, optionally backfilling model."""
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
+                (json.dumps(model_config) if model_config is not None else None, model, session_id),
+            )
+
+        self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,
@@ -555,6 +571,70 @@ class SessionDB:
         if len(matches) == 1:
             return matches[0]
         return None
+
+    def resolve_latest_descendant_session(
+        self,
+        session_id: str,
+        *,
+        require_messages: bool = True,
+    ) -> Optional[str]:
+        """Return the newest descendant (including itself) in a session lineage.
+
+        Hermes can split sessions during context compression by creating a new
+        session with ``parent_session_id`` pointing to the previous session.
+
+        The CLI session browser often lists only root sessions
+        (parent_session_id is NULL). If the first real content happened after a
+        compression split, that root session can legitimately have zero messages.
+        Resuming it should land on the latest continuation that actually has
+        messages, otherwise the user sees "no messages, starting fresh".
+
+        Args:
+            session_id: The session ID the user selected.
+            require_messages: If True, only consider sessions that have at least
+                one row in the messages table.
+
+        Returns:
+            The selected session ID (possibly the same as input), or None if the
+            input ID doesn't exist.
+        """
+        if not session_id:
+            return None
+
+        if not self.get_session(session_id):
+            return None
+
+        msg_filter = ""
+        if require_messages:
+            msg_filter = (
+                "AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id LIMIT 1)"
+            )
+
+        sql = f"""
+            WITH RECURSIVE lineage(id) AS (
+                SELECT id FROM sessions WHERE id = ?
+                UNION ALL
+                SELECT s2.id FROM sessions s2
+                    JOIN lineage l ON s2.parent_session_id = l.id
+            )
+            SELECT s.id
+            FROM lineage l
+            JOIN sessions s ON s.id = l.id
+            WHERE 1=1
+            {msg_filter}
+            ORDER BY s.started_at DESC
+            LIMIT 1
+        """
+
+        with self._lock:
+            cursor = self._conn.execute(sql, (session_id,))
+            row = cursor.fetchone()
+        if row:
+            return row["id"]
+
+        # No descendant has messages. Fall back to the original ID so callers
+        # can resume the empty session (useful for metadata-only sessions).
+        return session_id
 
     # Maximum length for session titles
     MAX_TITLE_LENGTH = 100

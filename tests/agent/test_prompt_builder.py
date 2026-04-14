@@ -993,6 +993,29 @@ class TestOpenAIModelExecutionGuidance:
         assert "missing_context" in text or "missing context" in text
         assert "hallucinate" in text or "guess" in text
 
+    def test_guidance_covers_background_task_strategy(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "background" in text
+        assert "notify_on_complete" in text
+        assert "long-running" in text or "takes more than a minute" in text
+        assert "continue" in text and "other work" in text
+
+    def test_background_strategy_decision_matrix_covers_when_to_background(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "independent" in text
+        assert any(term in text for term in ("tests", "test suites"))
+        assert "build" in text
+        assert "deployment" in text or "deployments" in text
+        assert "downloads" in text
+        assert "sleep" in text
+
+    def test_background_strategy_decision_matrix_covers_when_not_to_background(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "short commands" in text
+        assert "needed right away" in text
+        assert "dependency-blocking" in text
+        assert any(term in text for term in ("ram-constrained", "memory-heavy", "resource-heavy"))
+
     def test_guidance_uses_xml_tags(self):
         assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
         assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE

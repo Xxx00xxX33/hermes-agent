@@ -296,6 +296,16 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
             "response_border": "#7eb8f6",
             "session_label": "#7eb8f6",
             "session_border": "#4b5563",
+            "status_bar_bg": "#000000",
+            "status_bar_text": "#FFD700",
+            "status_bar_strong": "#FFD700",
+            "status_bar_dim": "#FFD700",
+            "status_bar_warn": "#FFD700",
+            "status_bar_good": "#FFD700",
+            "status_bar_bad": "#FFD700",
+            "status_bar_critical": "#FFD700",
+            "status_bar_voice": "#FFD700",
+            "status_bar_selected_bg": "#2A2110",
         },
         "spinner": {},
         "branding": {
@@ -675,6 +685,9 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
 
     These are layered on top of the CLI's base TUI style so /skin can refresh
     the live prompt_toolkit UI immediately without rebuilding the app.
+
+    Status/footer colors intentionally default to a pure black background so the
+    active skin only needs to provide high-contrast foreground colors.
     """
     try:
         skin = get_active_skin()
@@ -685,10 +698,20 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
     input_rule = skin.get_color("input_rule", "#CD7F32")
     title = skin.get_color("banner_title", "#FFD700")
     text = skin.get_color("banner_text", prompt)
-    dim = skin.get_color("banner_dim", "#555555")
+    dim = skin.get_color("banner_dim", "#7C8AA5")
     label = skin.get_color("ui_label", title)
-    warn = skin.get_color("ui_warn", "#FF8C00")
-    error = skin.get_color("ui_error", "#FF6B6B")
+    ui_warn = skin.get_color("ui_warn", "#FFD166")
+    ui_error = skin.get_color("ui_error", "#FF6B88")
+    status_bg = skin.get_color("status_bar_bg", "#000000")
+    status_text = skin.get_color("status_bar_text", title)
+    status_strong = skin.get_color("status_bar_strong", status_text)
+    status_dim = skin.get_color("status_bar_dim", status_text)
+    status_warn = skin.get_color("status_bar_warn", status_strong)
+    status_error = skin.get_color("status_bar_critical", status_strong)
+    status_ok = skin.get_color("status_bar_good", status_strong)
+    status_bad = skin.get_color("status_bar_bad", status_strong)
+    voice_text = skin.get_color("status_bar_voice", status_strong)
+    status_selected_bg = skin.get_color("status_bar_selected_bg", "#1E293B")
 
     return {
         "input-area": prompt,
@@ -696,13 +719,20 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
         "prompt": prompt,
         "prompt-working": f"{dim} italic",
         "hint": f"{dim} italic",
+        "status-bar": f"bg:{status_bg} {status_text}",
+        "status-bar-strong": f"bg:{status_bg} {status_strong} bold",
+        "status-bar-dim": f"bg:{status_bg} {status_dim}",
+        "status-bar-good": f"bg:{status_bg} {status_ok} bold",
+        "status-bar-warn": f"bg:{status_bg} {status_warn} bold",
+        "status-bar-bad": f"bg:{status_bg} {status_bad} bold",
+        "status-bar-critical": f"bg:{status_bg} {status_error} bold",
         "input-rule": input_rule,
         "image-badge": f"{label} bold",
-        "completion-menu": f"bg:#1a1a2e {text}",
-        "completion-menu.completion": f"bg:#1a1a2e {text}",
-        "completion-menu.completion.current": f"bg:#333355 {title}",
-        "completion-menu.meta.completion": f"bg:#1a1a2e {dim}",
-        "completion-menu.meta.completion.current": f"bg:#333355 {label}",
+        "completion-menu": f"bg:{status_bg} {status_text}",
+        "completion-menu.completion": f"bg:{status_bg} {status_text}",
+        "completion-menu.completion.current": f"bg:{status_selected_bg} {status_strong}",
+        "completion-menu.meta.completion": f"bg:{status_bg} {dim}",
+        "completion-menu.meta.completion.current": f"bg:{status_selected_bg} {voice_text}",
         "clarify-border": input_rule,
         "clarify-title": f"{title} bold",
         "clarify-question": f"{text} bold",
@@ -710,14 +740,19 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
         "clarify-selected": f"{title} bold",
         "clarify-active-other": f"{title} italic",
         "clarify-countdown": input_rule,
-        "sudo-prompt": f"{error} bold",
+        "sudo-prompt": f"{ui_error} bold",
         "sudo-border": input_rule,
-        "sudo-title": f"{error} bold",
+        "sudo-title": f"{ui_error} bold",
         "sudo-text": text,
         "approval-border": input_rule,
-        "approval-title": f"{warn} bold",
+        "approval-title": f"{ui_warn} bold",
         "approval-desc": f"{text} bold",
         "approval-cmd": f"{dim} italic",
         "approval-choice": dim,
         "approval-selected": f"{title} bold",
+        "voice-prompt": voice_text,
+        "voice-recording": f"{ui_error} bold",
+        "voice-processing": f"{ui_warn} italic",
+        "voice-status": f"bg:{status_bg} {voice_text}",
+        "voice-status-recording": f"bg:{status_bg} {voice_text} bold",
     }

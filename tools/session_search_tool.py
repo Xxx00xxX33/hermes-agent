@@ -24,6 +24,7 @@ from typing import Dict, Any, List, Optional, Union
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
+SESSION_SUMMARIZATION_TIMEOUT_SECONDS = 25
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -149,10 +150,9 @@ async def _summarize_session(
         f"Summarize this conversation with focus on: {query}"
     )
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = await async_call_llm(
+    try:
+        response = await asyncio.wait_for(
+            async_call_llm(
                 task="session_search",
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -160,30 +160,32 @@ async def _summarize_session(
                 ],
                 temperature=0.1,
                 max_tokens=MAX_SUMMARY_TOKENS,
-            )
-            content = extract_content_or_reasoning(response)
-            if content:
-                return content
-            # Reasoning-only / empty — let the retry loop handle it
-            logging.warning("Session search LLM returned empty content (attempt %d/%d)", attempt + 1, max_retries)
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1 * (attempt + 1))
-                continue
-            return content
-        except RuntimeError:
-            logging.warning("No auxiliary model available for session summarization")
-            return None
-        except Exception as e:
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1 * (attempt + 1))
-            else:
-                logging.warning(
-                    "Session summarization failed after %d attempts: %s",
-                    max_retries,
-                    e,
-                    exc_info=True,
-                )
-                return None
+            ),
+            timeout=SESSION_SUMMARIZATION_TIMEOUT_SECONDS,
+        )
+    except RuntimeError:
+        logging.warning("No auxiliary model available for session summarization")
+        return None
+    except asyncio.TimeoutError:
+        logging.warning(
+            "Session summarization timed out after %d seconds; using raw preview fallback",
+            SESSION_SUMMARIZATION_TIMEOUT_SECONDS,
+        )
+        return None
+    except Exception as e:
+        logging.warning(
+            "Session summarization failed; using raw preview fallback: %s",
+            e,
+            exc_info=True,
+        )
+        return None
+
+    content = extract_content_or_reasoning(response).strip()
+    if content:
+        return content
+
+    logging.warning("Session search LLM returned empty content; using raw preview fallback")
+    return None
 
 
 # Sources that are excluded from session browsing/searching by default.

@@ -12,7 +12,12 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from hermes_cli.main import _session_browse_picker
+from hermes_cli.main import (
+    _resolve_session_by_name_or_id,
+    _session_browse_picker,
+    _session_cwd_score,
+    _session_sort_key,
+)
 
 
 # ─── Sample session data ──────────────────────────────────────────────────────
@@ -216,6 +221,66 @@ class TestSessionBrowsePicker:
         output = capsys.readouterr().out
         assert "Hello world test message" in output
 
+    def test_fallback_shows_preview_even_when_title_exists(self, capsys):
+        """When both title and preview exist, the preview should also be visible."""
+        sessions = [{
+            "id": "test_002b",
+            "source": "cli",
+            "title": "My Cool Project",
+            "preview": "Patch the Hermes resume flow for better searchability",
+            "last_active": time.time(),
+            "message_count": 14,
+        }]
+
+        import builtins
+        original_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "curses":
+                raise ImportError("no curses")
+            return original_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=mock_import):
+            with patch("builtins.input", return_value="q"):
+                _session_browse_picker(sessions)
+
+        output = capsys.readouterr().out
+        assert "My Cool Project" in output
+        assert "Patch the Hermes resume flow" in output
+
+    def test_fallback_initial_query_supports_multi_term_matching(self):
+        """Multi-word filters should match across title/preview fields."""
+        sessions = [
+            {
+                "id": "s1",
+                "source": "cli",
+                "title": "Running notes",
+                "preview": "Hermes status bar patch discussion",
+                "last_active": time.time(),
+            },
+            {
+                "id": "s2",
+                "source": "cli",
+                "title": "Other topic",
+                "preview": "Nothing relevant here",
+                "last_active": time.time(),
+            },
+        ]
+
+        import builtins
+        original_import = builtins.__import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "curses":
+                raise ImportError("no curses")
+            return original_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=mock_import):
+            with patch("builtins.input", return_value="1"):
+                result = _session_browse_picker(sessions, initial_query="running hermes")
+
+        assert result == "s1"
+
     def test_fallback_shows_id_when_no_title_or_preview(self, capsys):
         """When neither title nor preview, show session ID."""
         sessions = [{
@@ -240,6 +305,62 @@ class TestSessionBrowsePicker:
 
         output = capsys.readouterr().out
         assert "test_003_fallback" in output
+
+
+class TestResolveSessionByNameOrId:
+    def test_unique_fuzzy_match_across_title_and_preview_returns_session_id(self):
+        sessions = [
+            {
+                "id": "s1",
+                "source": "cli",
+                "title": "Running notes",
+                "preview": "Hermes resume bug triage",
+                "last_active": time.time(),
+            },
+            {
+                "id": "s2",
+                "source": "cli",
+                "title": "Other work",
+                "preview": "Unrelated topic",
+                "last_active": time.time(),
+            },
+        ]
+
+        fake_db = MagicMock()
+        fake_db.resolve_session_id.return_value = None
+        fake_db.resolve_session_by_title.return_value = None
+        fake_db.list_sessions_rich.return_value = sessions
+
+        with patch("hermes_state.SessionDB", return_value=fake_db):
+            assert _resolve_session_by_name_or_id("running hermes") == "s1"
+
+        fake_db.close.assert_called()
+
+    def test_ambiguous_fuzzy_match_returns_none(self):
+        sessions = [
+            {
+                "id": "s1",
+                "source": "cli",
+                "title": "Running notes",
+                "preview": "Hermes resume bug triage",
+                "last_active": time.time(),
+            },
+            {
+                "id": "s2",
+                "source": "cli",
+                "title": "Running deployment",
+                "preview": "Hermes status follow-up",
+                "last_active": time.time(),
+            },
+        ]
+
+        fake_db = MagicMock()
+        fake_db.resolve_session_id.return_value = None
+        fake_db.resolve_session_by_title.return_value = None
+        fake_db.list_sessions_rich.return_value = sessions
+
+        with patch("hermes_state.SessionDB", return_value=fake_db):
+            assert _resolve_session_by_name_or_id("running hermes") is None
 
 
 # ─── Curses-based picker (mocked curses) ────────────────────────────────────
@@ -326,11 +447,12 @@ class TestCursesBrowse:
     def test_backspace_removes_filter_char(self):
         """Backspace removes the last character from the filter."""
         import curses
+        now = time.time()
         sessions = [
-            {"id": "s1", "source": "cli", "title": "Alpha", "preview": "", "last_active": time.time()},
-            {"id": "s2", "source": "cli", "title": "Beta", "preview": "", "last_active": time.time()},
+            {"id": "s1", "source": "cli", "title": "Alpha", "preview": "", "last_active": now},
+            {"id": "s2", "source": "cli", "title": "Beta", "preview": "", "last_active": now - 1},
         ]
-        # Type "Bet", backspace, backspace, backspace (clears filter), then Enter (selects first)
+        # Type "Bet", backspace, backspace, backspace (clears filter), then Enter (selects top-ranked session)
         keys = [ord('B'), ord('e'), ord('t'), 127, 127, 127, 10]
         result = self._run_with_keys(sessions, keys)
         assert result == "s1"
@@ -540,3 +662,89 @@ class TestEdgeCases:
         assert "just now" in output
         assert "2h ago" in output
         assert "3d ago" in output
+
+
+class TestSessionBrowseRanking:
+    """Ranking behavior for /resume session discovery."""
+
+    def test_session_sort_key_prefers_most_recent_session_when_query_empty(self):
+        now = time.time()
+        sessions = [
+            {
+                "id": "recent_other_project",
+                "title": "Recent other project",
+                "preview": "Most recent overall",
+                "last_active": now,
+                "started_at": now - 60,
+                "model_config": {"cwd": "/tmp/other-project"},
+            },
+            {
+                "id": "older_current_project",
+                "title": "Current repo work",
+                "preview": "Slightly older but same repo",
+                "last_active": now - 3600,
+                "started_at": now - 3660,
+                "model_config": {"cwd": "/work/hermes-agent"},
+            },
+        ]
+
+        ordered = sorted(sessions, key=lambda s: _session_sort_key(s, "", "/work/hermes-agent"))
+        assert ordered[0]["id"] == "recent_other_project"
+
+    def test_session_sort_key_prefers_current_project_when_query_present(self):
+        now = time.time()
+        sessions = [
+            {
+                "id": "recent_other_project",
+                "title": "Recent other project",
+                "preview": "Most recent overall",
+                "last_active": now,
+                "started_at": now - 60,
+                "model_config": {"cwd": "/tmp/other-project"},
+            },
+            {
+                "id": "older_current_project",
+                "title": "Current repo work",
+                "preview": "Slightly older but same repo",
+                "last_active": now - 3600,
+                "started_at": now - 3660,
+                "model_config": {"cwd": "/work/hermes-agent"},
+            },
+        ]
+
+        ordered = sorted(
+            sessions,
+            key=lambda s: _session_sort_key(s, "repo", "/work/hermes-agent"),
+        )
+        assert ordered[0]["id"] == "older_current_project"
+
+    def test_session_sort_key_prefers_title_match_over_recency(self):
+        now = time.time()
+        sessions = [
+            {
+                "id": "recent_partial",
+                "title": "General maintenance",
+                "preview": "running hermes in a different context",
+                "last_active": now,
+                "started_at": now - 60,
+            },
+            {
+                "id": "older_exact",
+                "title": "Running Hermes Agent",
+                "preview": "Exact title match should rank first",
+                "last_active": now - 7200,
+                "started_at": now - 7260,
+            },
+        ]
+
+        ordered = sorted(sessions, key=lambda s: _session_sort_key(s, "running hermes", ""))
+        assert ordered[0]["id"] == "older_exact"
+
+    def test_session_cwd_score_parses_model_config_json(self):
+        session = {
+            "id": "json_cfg",
+            "title": "Stored in sqlite",
+            "model_config": '{"cwd": "/srv/apps/hermes"}',
+        }
+
+        assert _session_cwd_score(session, "/srv/apps/hermes") > 0

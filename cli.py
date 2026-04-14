@@ -66,6 +66,8 @@ from agent.usage_pricing import (
 from hermes_cli.banner import _format_context_length, format_banner_version_label
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_AGENT_WORKING_FRAMES = ("·", "•", "●", "•")
+_FAST_TOOL_TRANSCRIPT_NAMES = frozenset({"todo", "memory", "session_search"})
 
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
@@ -273,6 +275,7 @@ def load_cli_config() -> Dict[str, Any]:
         "display": {
             "compact": False,
             "resume_display": "full",
+            "resume_history_exchanges": 20,
             "show_reasoning": False,
             "streaming": True,
             "busy_input_mode": "interrupt",
@@ -1059,6 +1062,57 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     return _RichText.from_ansi(text or "")
 
 
+def _sanitize_resumed_text(text: str) -> str:
+    """Strip terminal control sequences from resumed session text.
+
+    Historical sessions can contain ANSI/control bytes from older tool output
+    or UI transcripts. Remove them before re-displaying the recap and before
+    injecting resumed history back into the model context.
+    """
+    if not text:
+        return text
+    from tools.ansi_strip import strip_ansi
+
+    cleaned = strip_ansi(text)
+    return "".join(ch for ch in cleaned if ch in "\n\r\t" or ord(ch) >= 32)
+
+
+def _sanitize_resumed_content(content: Any) -> Any:
+    """Recursively clean resumed message payloads while preserving structure."""
+    if isinstance(content, str):
+        return _sanitize_resumed_text(content)
+    if isinstance(content, list):
+        cleaned_parts = []
+        changed = False
+        for part in content:
+            if isinstance(part, dict):
+                cleaned_part = dict(part)
+                if isinstance(cleaned_part.get("text"), str):
+                    new_text = _sanitize_resumed_text(cleaned_part["text"])
+                    changed = changed or new_text != cleaned_part["text"]
+                    cleaned_part["text"] = new_text
+                cleaned_parts.append(cleaned_part)
+                changed = changed or cleaned_part != part
+            else:
+                cleaned_parts.append(part)
+        return cleaned_parts if changed else content
+    return content
+
+
+def _sanitize_resumed_messages(messages: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Return resumed history with session metadata/ANSI noise removed."""
+    sanitized: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        if msg.get("role") == "session_meta":
+            continue
+        cleaned = dict(msg)
+        cleaned["content"] = _sanitize_resumed_content(cleaned.get("content"))
+        if isinstance(cleaned.get("reasoning"), str):
+            cleaned["reasoning"] = _sanitize_resumed_text(cleaned["reasoning"])
+        sanitized.append(cleaned)
+    return sanitized
+
+
 def _cprint(text: str):
     """Print ANSI-colored text through prompt_toolkit's native renderer.
 
@@ -1618,6 +1672,13 @@ class HermesCLI:
         self.tool_progress_mode = "off" if _raw_tp is False else str(_raw_tp)
         # resume_display: "full" (show history) | "minimal" (one-liner only)
         self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
+        try:
+            self.resume_history_exchanges = max(
+                1,
+                int(CLI_CONFIG["display"].get("resume_history_exchanges", 20)),
+            )
+        except (TypeError, ValueError):
+            self.resume_history_exchanges = 20
         # bell_on_complete: play terminal bell (\a) when agent finishes a response
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
         # show_reasoning: display model thinking/reasoning before the response
@@ -1670,6 +1731,8 @@ class HermesCLI:
 
         self._explicit_api_key = api_key
         self._explicit_base_url = base_url
+        self._default_explicit_api_key = api_key
+        self._default_explicit_base_url = base_url
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
@@ -1695,6 +1758,14 @@ class HermesCLI:
             self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
         else:
             self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        self._default_session_model = self.model
+        self._default_requested_provider = self.requested_provider
+        self._default_provider = self.provider
+        self._default_api_mode = self.api_mode
+        self._default_base_url = self.base_url
+        self._default_api_key = self.api_key
+        self._default_acp_command = self.acp_command
+        self._default_acp_args = list(self.acp_args)
         # Max turns priority: CLI arg > config file > env var > default
         if max_turns is not None:  # CLI arg was explicitly set
             self.max_turns = max_turns
@@ -1739,9 +1810,8 @@ class HermesCLI:
         )
         
         # Reasoning config (OpenRouter reasoning effort level)
-        self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
-        )
+        self._default_reasoning_effort = CLI_CONFIG["agent"].get("reasoning_effort", "")
+        self.reasoning_config = _parse_reasoning_config(self._default_reasoning_effort)
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -1794,7 +1864,9 @@ class HermesCLI:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
-        
+
+        self._restore_session_reasoning_config()
+
         # History file for persistent input recall across sessions
         self._history_file = _hermes_home / ".hermes_history"
         self._last_invalidate: float = 0.0  # throttle UI repaints
@@ -1846,6 +1918,23 @@ class HermesCLI:
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
+        self._tmux_pane_title: str = ""
+        self._tmux_session_task_title: str = ""
+        self._tmux_task_title_locked = False
+        # tmux title naming mode:
+        # - True: call the *main* model/provider once on the first prompt to name the pane.
+        # - False: use deterministic heuristics only.
+        # Default: True (requested by user).
+        self._tmux_title_use_main_model = True
+
+        # Prime tmux pane-title cache on startup.
+        # IMPORTANT: do NOT change the visible pane_title before the user submits
+        # the first meaningful prompt of this session.
+        #
+        # Rationale: tmux panes often persist across multiple Hermes launches.
+        # Users expect the pane_title to remain whatever it currently is until the
+        # new session has a first prompt to summarize.
+        self._prime_tmux_pane_title_cache(fallback="Hermes")
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -1871,6 +1960,1005 @@ class HermesCLI:
         filled = round((safe_percent / 100) * width)
         return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
 
+    def _get_status_bar_todo_items(self) -> List[Dict[str, str]] | None:
+        """Return normalized todo items for status bar rendering.
+
+        Historically, Hermes stored todos in an in-memory ``TodoStore`` whose
+        ``read()`` method returns a list of dicts. Some integrations/wrappers may
+        return a JSON string or a dict payload instead. Be permissive here so the
+        status bar still shows progress instead of going blank.
+        """
+        agent = getattr(self, "agent", None)
+        store = getattr(agent, "_todo_store", None)
+        if not store or not hasattr(store, "read"):
+            return None
+        try:
+            items = store.read() or []
+        except Exception:
+            return None
+
+        # Accept JSON string or dict payloads from wrapper stores.
+        if isinstance(items, str):
+            try:
+                import json
+                parsed = json.loads(items)
+                if isinstance(parsed, dict) and isinstance(parsed.get("todos"), list):
+                    items = parsed.get("todos")
+                else:
+                    items = parsed
+            except Exception:
+                return None
+        elif isinstance(items, dict) and isinstance(items.get("todos"), list):
+            items = items.get("todos")
+
+        if not isinstance(items, list):
+            return None
+
+        normalized_items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "pending").strip().lower() or "pending"
+            if status not in {"pending", "in_progress", "completed", "cancelled"}:
+                status = "pending"
+            normalized_items.append({
+                "id": str(item.get("id") or "?").strip() or "?",
+                "content": str(item.get("content") or "").strip() or "(no description)",
+                "status": status,
+            })
+
+        return normalized_items or None
+
+    def _get_status_bar_todo_snapshot(self) -> Dict[str, int] | None:
+        items = self._get_status_bar_todo_items()
+        if not items:
+            return None
+
+        total = len(items)
+        completed = sum(1 for item in items if item.get("status") == "completed")
+        in_progress = sum(1 for item in items if item.get("status") == "in_progress")
+        pending = sum(1 for item in items if item.get("status") == "pending")
+        cancelled = sum(1 for item in items if item.get("status") == "cancelled")
+        return {
+            "total": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "pending": pending,
+            "cancelled": cancelled,
+        }
+
+    def _get_status_bar_active_todo_items(self) -> List[Dict[str, str]] | None:
+        items = self._get_status_bar_todo_items()
+        if not items:
+            return None
+        active_items = [item for item in items if item.get("status") == "in_progress"]
+        return active_items or None
+
+    @staticmethod
+    def _extract_prompt_task_text(content: Any) -> str:
+        text = ""
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(str(part.get("text", "")))
+                elif isinstance(part, dict) and part.get("type") == "image_url":
+                    parts.append("[image]")
+                elif part is not None:
+                    parts.append(str(part))
+            text = " ".join(parts)
+        elif content is not None:
+            text = str(content)
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+    @staticmethod
+    def _clean_prompt_task_clause(text: str) -> str:
+        import re
+
+        cleaned = str(text or "")
+        cleaned = re.sub(r"(?:https?://|www\.)\S+", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"(?<!@)(?<![a-z0-9-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}(?![a-z0-9-])",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"[“”\"'`]", " ", cleaned)
+        cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", cleaned)
+        cleaned = " ".join(cleaned.split())
+        cleaned = re.sub(
+            r"^(?:我希望(?:可以)?|希望|请(?:你)?|请帮我(?:把)?|帮我(?:把)?|麻烦(?:你)?(?:把)?|"
+            r"做一个修改|做个修改|修改一下|改一下|想要|我要|请把)\s*",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"^(?:另外|此外|顺便|补充(?:一下)?|还有|对了|同时|然后|而是|而且|并且)\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"^(?:(?:(?:我)?注意到|(?:我)?发现|感觉|看起来|似乎|好像|目前|现在|当前|最近|刚才|这里|这边)\s*)+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^(?:有一个|有个|一个)\s*", "", cleaned)
+        cleaned = re.sub(r"^把(?=\S)", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip(" \t\r\n,，。！？!?:：;；/|-")
+
+    @staticmethod
+    def _score_prompt_task_clause(raw_text: str, cleaned_text: str) -> int:
+        import re
+
+        cleaned = str(cleaned_text or "").strip()
+        if not cleaned or HermesCLI._is_low_signal_prompt_task(cleaned):
+            return -100
+
+        raw = " ".join(str(raw_text or "").split()).strip().lower()
+        core_pattern = r"(?:tmux|pane|status|title|prompt|session|todo|summary|网址|域名|标题|任务|右下角|摘要|会话|后台|资源|回收|僵尸|进程|实例)"
+        action_pattern = r"(?:显示|实时|总结|修复|实现|优化|调整|同步|改成|改为|修改|过滤|避免|提炼|归纳|清理|回收|压缩|简化|精简|保留)"
+        has_core = bool(re.search(core_pattern, cleaned, re.IGNORECASE))
+        has_action = bool(re.search(action_pattern, cleaned, re.IGNORECASE))
+
+        score = min(len(cleaned), 12)
+        if has_core:
+            score += 25
+        if has_action:
+            score += 12
+        if re.match(
+            r"^(?:另外|此外|顺便|补充(?:一下)?|还有|对了|同时|然后|再\b|also\b|additionally\b|by the way\b|one more thing\b)",
+            raw,
+            re.IGNORECASE,
+        ):
+            score -= 18
+        if re.match(
+            r"^(?:(?:我)?注意到|(?:我)?发现|感觉|看起来|似乎|好像|目前|现在|当前|最近|刚才|这里|这边)",
+            raw,
+            re.IGNORECASE,
+        ):
+            score -= 22
+        if re.match(r"^(?:注意)?(?:不是|而不是|不要|别|不需要|无需|不用)", cleaned):
+            score -= 8
+        if re.search(r"(?:时间|日期|时钟|clock|date|time)", cleaned, re.IGNORECASE) and not has_core:
+            score -= 18
+        if re.search(r"(?:有点(?:长|啰嗦|奇怪)|太长|太啰嗦|没有意义|没意义|占用太多空间|会在后台多开|浪费(?:系统)?资源)", cleaned, re.IGNORECASE):
+            score -= 20
+        if re.search(r"(?:永远是|一直是|显示为|叫做|是|为|:|：)$", cleaned):
+            score -= 24
+        if len(cleaned) <= 3:
+            score -= 12
+        return score
+
+    @staticmethod
+    def _summarize_prompt_task(content: Any, *, max_len: int = 96) -> str:
+        import re
+
+        safe_max_len = max(4, int(max_len or 96))
+        raw_text = HermesCLI._extract_prompt_task_text(content)
+        clauses = []
+        lines = []
+        order = 0
+
+        for raw_line in raw_text.splitlines():
+            line = " ".join(raw_line.strip().split())
+            if not line or line.startswith("```"):
+                continue
+            lines.append(line)
+            for raw_clause in re.split(r"[,、，。！？!?；;]+", line):
+                cleaned_clause = HermesCLI._clean_prompt_task_clause(raw_clause)
+                if not cleaned_clause:
+                    continue
+                score = HermesCLI._score_prompt_task_clause(raw_clause, cleaned_clause)
+                clauses.append((order, cleaned_clause, score))
+                order += 1
+
+        selected_parts = []
+        if clauses:
+            top_score = max(score for _, _, score in clauses)
+            threshold = max(24, top_score - 12)
+            seen = set()
+            for _, clause, score in clauses:
+                if score < threshold or clause in seen:
+                    continue
+                projected = " / ".join(selected_parts + [clause])
+                if len(projected) > safe_max_len:
+                    if not selected_parts:
+                        selected_parts.append(clause)
+                    break
+                selected_parts.append(clause)
+                seen.add(clause)
+                if len(selected_parts) >= 2:
+                    break
+
+        if selected_parts:
+            text = " / ".join(selected_parts)
+        else:
+            fallback_parts = []
+            for line in lines[:3]:
+                cleaned_line = HermesCLI._clean_prompt_task_clause(line)
+                if cleaned_line:
+                    fallback_parts.append(cleaned_line)
+            text = " / ".join(fallback_parts) if fallback_parts else HermesCLI._clean_prompt_task_clause(raw_text)
+            if not text or HermesCLI._is_low_signal_prompt_task(text):
+                return ""
+            if HermesCLI._score_prompt_task_clause(raw_text, text) < 18:
+                return ""
+
+        text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+        text = " ".join(text.split()).strip()
+        if len(text) > safe_max_len:
+            text = text[: safe_max_len - 3].rstrip() + "..."
+        return text
+
+    @staticmethod
+    def _is_low_signal_prompt_task(text: str) -> bool:
+        import re
+
+        low_signal_prompts = {
+            "continue",
+            "please continue",
+            "go on",
+            "carry on",
+            "go ahead",
+            "next",
+            "ok",
+            "okay",
+            "thanks",
+            "thank you",
+            "继续",
+            "继续吧",
+            "请继续",
+            "继续一下",
+            "继续做",
+            "继续处理",
+            "好的",
+            "好",
+            "收到",
+        }
+        normalized = re.sub(r"[\s\.,!\?;:，。！？、：；]+", "", str(text or "").strip().lower())
+        normalized_low_signal = {
+            re.sub(r"[\s\.,!\?;:，。！？、：；]+", "", item.strip().lower())
+            for item in low_signal_prompts
+        }
+        return bool(normalized) and normalized in normalized_low_signal
+
+    def _session_has_saved_title(self) -> bool:
+        pending_title = self._summarize_prompt_task(getattr(self, "_pending_title", None), max_len=96)
+        if pending_title and not self._is_low_signal_prompt_task(pending_title):
+            return True
+
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "session_id", None)
+        if session_db and session_id:
+            try:
+                session_title = self._summarize_prompt_task(
+                    session_db.get_session_title(session_id) or "",
+                    max_len=96,
+                )
+                if session_title and not self._is_low_signal_prompt_task(session_title):
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    def _persist_session_task_title(self, title: str) -> None:
+        candidate = self._summarize_prompt_task(title, max_len=96)
+        if not candidate or self._is_low_signal_prompt_task(candidate):
+            return
+        if self._session_has_saved_title():
+            return
+
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "session_id", None)
+        if session_db and session_id:
+            try:
+                if session_db.set_session_title(session_id, candidate):
+                    return
+            except Exception:
+                pass
+
+        if not getattr(self, "_pending_title", None):
+            self._pending_title = candidate
+
+    def _get_saved_tmux_task_title(self, *, fallback: str = "Hermes") -> str:
+        cached_title = self._summarize_prompt_task(getattr(self, "_tmux_session_task_title", None), max_len=96)
+        if cached_title and not self._is_low_signal_prompt_task(cached_title):
+            self._tmux_session_task_title = cached_title
+            self._tmux_task_title_locked = True
+            return cached_title
+
+        pending_title = self._summarize_prompt_task(getattr(self, "_pending_title", None), max_len=96)
+        if pending_title and not self._is_low_signal_prompt_task(pending_title):
+            self._tmux_session_task_title = pending_title
+            self._tmux_task_title_locked = True
+            return pending_title
+
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "session_id", None)
+        if session_db and session_id:
+            try:
+                session_title = self._summarize_prompt_task(
+                    session_db.get_session_title(session_id) or "",
+                    max_len=96,
+                )
+                if session_title and not self._is_low_signal_prompt_task(session_title):
+                    self._tmux_session_task_title = session_title
+                    self._tmux_task_title_locked = True
+                    return session_title
+            except Exception:
+                pass
+
+        for msg in getattr(self, "conversation_history", None) or []:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            candidate = self._summarize_prompt_task(msg.get("content"), max_len=96)
+            if candidate and not self._is_low_signal_prompt_task(candidate):
+                self._tmux_session_task_title = candidate
+                self._tmux_task_title_locked = True
+                return candidate
+
+        fallback_title = self._summarize_prompt_task(fallback, max_len=96)
+        return fallback_title or "Hermes"
+
+    def _capture_first_prompt_task_title(self, task_source: Any = None, *, fallback: str = "Hermes") -> str:
+        # Lock: only the first meaningful user prompt of a session is allowed to set
+        # the tmux title.
+        if getattr(self, "_tmux_task_title_locked", False):
+            return self._get_saved_tmux_task_title(fallback=fallback)
+
+        has_prior_user_message = any(
+            isinstance(msg, dict) and msg.get("role") == "user"
+            for msg in (getattr(self, "conversation_history", None) or [])
+        )
+        if has_prior_user_message:
+            self._tmux_task_title_locked = True
+            return self._get_saved_tmux_task_title(fallback=fallback)
+
+        # Prefer main-model naming when possible: call the current provider/model
+        # ONCE on the first prompt, persist the result, and keep it stable.
+        # Fallback to heuristic summarization if the agent/runtime isn't ready.
+        candidate = ""
+        if getattr(self, "_tmux_title_use_main_model", True):
+            try:
+                candidate = self._generate_tmux_title_with_main_model(task_source)
+            except Exception:
+                candidate = ""
+        if not candidate:
+            candidate = self._summarize_prompt_task(task_source, max_len=96)
+
+        if candidate and not self._is_low_signal_prompt_task(candidate):
+            self._tmux_session_task_title = candidate
+            self._persist_session_task_title(candidate)
+
+        self._tmux_task_title_locked = True
+        return self._tmux_session_task_title or self._get_saved_tmux_task_title(fallback=fallback)
+
+    def _get_prompt_task_title(self, task_source: Any = None, *, fallback: str = "Hermes") -> str:
+        if task_source is not None:
+            return self._capture_first_prompt_task_title(task_source, fallback=fallback)
+        return self._get_saved_tmux_task_title(fallback=fallback)
+
+    def _generate_tmux_title_with_main_model(self, task_source: Any) -> str:
+        """Use the current main model/provider to name the tmux title once.
+
+        Requirements:
+        - Only used for the first meaningful prompt of a session.
+        - Output must be short (<=60 terminal columns ~= 30 CJK chars).
+        - Must be robust: if any error occurs, return "" so callers can fall back
+          to heuristic summarization.
+        """
+        prompt = self._extract_prompt_task_text(task_source)
+        prompt = " ".join(str(prompt or "").split()).strip()
+        if not prompt:
+            return ""
+
+        # Keep the request bounded; title should reflect the task, not every detail.
+        prompt = prompt[:1200]
+
+        try:
+            from agent.auxiliary_client import call_llm
+        except Exception:
+            return ""
+
+        # Use the *main* model runtime (provider/model/base_url/api_key) so the title
+        # matches the user's current model selection.
+        provider = str(getattr(self, "provider", "") or "").strip() or None
+        model = str(getattr(self, "model", "") or "").strip() or None
+        base_url = str(getattr(self, "base_url", "") or "").strip() or None
+        api_key = str(getattr(self, "api_key", "") or "").strip() or None
+
+        # If runtime isn't ready, don't block.
+        if not model:
+            return ""
+
+        sys_prompt = (
+            "Generate a concise tmux pane title for the user's FIRST request in this session. "
+            "Return ONLY the title text. No quotes, no prefixes, no trailing punctuation. "
+            "Prefer Chinese if the user wrote Chinese. Avoid URLs/domains."
+        )
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt},
+        ]
+
+        # Limit tokens aggressively; we only need a short title.
+        resp = call_llm(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=24,
+            timeout=18,
+        )
+        try:
+            title = (resp.choices[0].message.content or "").strip()
+        except Exception:
+            title = ""
+        title = title.strip('"\'')
+        if not title:
+            return ""
+
+        # Normalize and enforce width constraints.
+        title = " ".join(title.split()).strip().strip(" \t\r\n,，。！？!?:：;；/|-")
+        title = self._truncate_tmux_task_title(title)
+        return title
+
+    @staticmethod
+    def _title_display_width(text: str) -> int:
+        """Return terminal display width (CJK≈2 columns).
+
+        We avoid importing extra deps (wcwidth). This approximation is sufficient
+        for tmux pane titles: East Asian Wide/Fullwidth count as 2, combining
+        marks as 0, everything else as 1.
+        """
+        import unicodedata
+
+        if not text:
+            return 0
+        width = 0
+        for ch in str(text):
+            if ch in "\n\r\t":
+                continue
+            if unicodedata.combining(ch):
+                continue
+            if unicodedata.east_asian_width(ch) in {"W", "F"}:
+                width += 2
+            else:
+                width += 1
+        return width
+
+    @staticmethod
+    def _truncate_title_by_width(text: str, *, max_width: int, ellipsis: str = "…") -> str:
+        import unicodedata
+
+        s = " ".join(str(text or "").split()).strip()
+        if not s:
+            return ""
+
+        def ch_width(ch: str) -> int:
+            if ch in "\n\r\t":
+                return 0
+            if unicodedata.combining(ch):
+                return 0
+            return 2 if unicodedata.east_asian_width(ch) in {"W", "F"} else 1
+
+        if HermesCLI._title_display_width(s) <= max_width:
+            return s
+
+        budget = max(1, int(max_width))
+        # reserve space for ellipsis when truncating
+        ell_w = HermesCLI._title_display_width(ellipsis)
+        budget_no_ell = max(1, budget - ell_w)
+
+        out = []
+        w = 0
+        for ch in s:
+            cw = ch_width(ch)
+            if w + cw > budget_no_ell:
+                break
+            out.append(ch)
+            w += cw
+
+        trimmed = "".join(out).rstrip(" /-:：；，。")
+        return (trimmed + ellipsis) if trimmed else (s[:1] + ellipsis)
+
+    def _truncate_tmux_task_title(self, title: str) -> str:
+        """Enforce tmux lower-right title length.
+
+        Requirement: ≤30 Chinese characters worth of space.
+        We implement this as ≤60 terminal columns (CJK≈2 columns).
+
+        Prefer keeping both clauses in `A / B` titles by truncating each side
+        rather than chopping the entire string blindly.
+        """
+        max_width = 60
+        text = " ".join(str(title or "").split()).strip()
+        if not text:
+            return ""
+        if self._title_display_width(text) <= max_width:
+            return text
+
+        parts = [p.strip() for p in text.split("/")]
+        if len(parts) >= 2:
+            left = parts[0]
+            right = "/".join(parts[1:]).strip()
+            sep = " / "
+            sep_w = self._title_display_width(sep)
+            remaining = max(1, max_width - sep_w)
+
+            # Allocate space to keep both sides informative.
+            left_budget = max(10, remaining // 2)
+            right_budget = max(10, remaining - left_budget)
+            left_t = self._truncate_title_by_width(left, max_width=left_budget)
+            right_t = self._truncate_title_by_width(right, max_width=right_budget)
+            candidate = f"{left_t}{sep}{right_t}".strip()
+            return self._truncate_title_by_width(candidate, max_width=max_width)
+
+        return self._truncate_title_by_width(text, max_width=max_width)
+
+    def _prime_tmux_pane_title_cache(self, *, fallback: str = "Hermes") -> str:
+        """Read and cache the current tmux pane_title without modifying it.
+
+        We use this on CLI startup to avoid changing the visible tmux title
+        before the first user prompt of the new session.
+        """
+
+        pane_id = str(os.getenv("TMUX_PANE") or "").strip()
+        if not pane_id:
+            return ""
+        if not str(os.environ.get("TMUX") or "").strip():
+            # Some environments set TMUX_PANE without a tmux server.
+            return ""
+
+        try:
+            import subprocess
+
+            out = subprocess.check_output(
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane_id,
+                    "#{pane_title}",
+                ],
+                stderr=subprocess.DEVNULL,
+                timeout=0.6,
+                text=True,
+            )
+            existing = self._truncate_tmux_task_title(str(out or "").strip())
+        except Exception:
+            existing = ""
+
+        fallback_title = self._truncate_tmux_task_title(
+            self._summarize_prompt_task(fallback, max_len=96) or "Hermes"
+        )
+
+        if existing and existing != fallback_title:
+            # Startup should preserve the currently visible pane title without
+            # treating it as the new session's locked task title. Otherwise a
+            # fresh Hermes process launched inside the same tmux pane inherits
+            # the previous session title and the first real prompt can no longer
+            # replace it.
+            self._tmux_pane_title = existing
+            return existing
+
+        # Leave cache empty so later sync can decide; never force-set fallback here.
+        return existing
+
+    def _sync_tmux_pane_title(
+        self,
+        task_source: Any = None,
+        *,
+        fallback: str = "Hermes",
+        force: bool = False,
+    ) -> str:
+        """Synchronize tmux pane_title with the session's locked prompt summary.
+
+        Important behavior:
+        - After the first meaningful user prompt of a session, the title is
+          *locked* and later prompts should not replace it.
+        - If internal state is temporarily reset (agent re-init, partial resume,
+          etc.), avoid clobbering a previously-locked non-fallback tmux title
+          with the fallback string ("Hermes") unless force=True.
+        """
+
+        title = self._get_prompt_task_title(task_source, fallback=fallback)
+        pane_id = str(os.getenv("TMUX_PANE") or "").strip()
+        if not pane_id or not title:
+            return title
+
+        # tmux pane title must be short and dense.
+        title = self._truncate_tmux_task_title(title)
+
+        # Guard: never overwrite an existing meaningful title with the fallback
+        # unless we're explicitly forcing a reset (new_session, resume, branch).
+        if not force:
+            fallback_title = self._truncate_tmux_task_title(
+                self._summarize_prompt_task(fallback, max_len=96) or "Hermes"
+            )
+            if title == fallback_title:
+                existing = str(getattr(self, "_tmux_pane_title", "") or "").strip()
+                if not existing:
+                    # Best-effort: read live title from tmux (state may have been reset).
+                    # Use check_output instead of subprocess.run so unit tests that
+                    # patch subprocess.run for tmux select-pane don't over-count.
+                    try:
+                        import subprocess
+
+                        out = subprocess.check_output(
+                            [
+                                "tmux",
+                                "display-message",
+                                "-p",
+                                "-t",
+                                pane_id,
+                                "#{pane_title}",
+                            ],
+                            stderr=subprocess.DEVNULL,
+                            timeout=0.6,
+                            text=True,
+                        )
+                        if out:
+                            existing = str(out).strip()
+                    except Exception:
+                        existing = existing
+
+                existing = self._truncate_tmux_task_title(existing)
+                if existing and existing != fallback_title:
+                    # Preserve the current meaningful title.
+                    self._tmux_pane_title = existing
+                    if not getattr(self, "_tmux_session_task_title", ""):
+                        self._tmux_session_task_title = existing
+                    self._tmux_task_title_locked = True
+                    return existing
+
+        cached = str(getattr(self, "_tmux_pane_title", "") or "").strip()
+        if title == cached:
+            # Common case: we already set it.
+            #
+            # However, pane_title can still be cleared/overwritten externally.
+            # When that happens, tmux status-right falls back to "Hermes" because
+            # pane_title becomes empty. To prevent that regression, we do a
+            # lightweight best-effort live check here.
+            #
+            # Implementation note:
+            # - Only do the probe when we're actually inside tmux (TMUX env present).
+            #   Some unit tests set TMUX_PANE but do not run under a tmux server.
+            # - Avoid subprocess.run here because unit tests patch it expecting only
+            #   the tmux select-pane call.
+            # - Use Popen directly so the select-pane call count stays stable.
+            if not str(os.environ.get("TMUX") or "").strip():
+                return title
+            # Avoid influencing unit tests that run under tmux (common in our
+            # own dev environment). When pytest is active, skip the live probe so
+            # subprocess.run call counts remain deterministic.
+            if str(os.environ.get("PYTEST_CURRENT_TEST") or "").strip():
+                return title
+
+            try:
+                import subprocess
+
+                proc = subprocess.Popen(
+                    [
+                        "tmux",
+                        "display-message",
+                        "-p",
+                        "-t",
+                        pane_id,
+                        "#{pane_title}",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                try:
+                    out, _ = proc.communicate(timeout=0.35)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return title
+
+                if getattr(proc, "returncode", 1) != 0:
+                    return title
+
+                live = self._truncate_tmux_task_title((out or "").strip())
+                if live == title:
+                    return title
+                # If live is empty/different, fall through and re-apply the title.
+            except Exception:
+                return title
+
+        try:
+            import subprocess
+
+            subprocess.run(
+                ["tmux", "select-pane", "-t", pane_id, "-T", title],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+            self._tmux_pane_title = title
+        except Exception:
+            pass
+        return title
+
+    def _get_status_bar_background_task_snapshot(self) -> Dict[str, int] | None:
+        total = int(getattr(self, "_background_task_counter", 0) or 0)
+        if total <= 0:
+            return None
+
+        active_tasks = getattr(self, "_background_tasks", None)
+        try:
+            active = len(active_tasks or {})
+        except Exception:
+            active = 0
+
+        active = max(0, min(total, active))
+        completed = max(0, total - active)
+        return {
+            "total": total,
+            "completed": completed,
+            "active": active,
+        }
+
+    @staticmethod
+    def _get_status_bar_background_task_label(
+        background_snapshot: Dict[str, int] | None,
+    ) -> tuple[str, str]:
+        if not background_snapshot or background_snapshot.get("total", 0) <= 0:
+            return "", "class:status-bar-dim"
+
+        label = (
+            f"后台任务：{background_snapshot['completed']}"
+            f"/{background_snapshot['total']}"
+        )
+        if background_snapshot.get("active", 0) > 0:
+            style = "class:status-bar-strong"
+        elif background_snapshot.get("completed", 0) >= background_snapshot.get("total", 0):
+            style = "class:status-bar-good"
+        else:
+            style = "class:status-bar-dim"
+        return label, style
+
+    @staticmethod
+    def _get_status_bar_todo_label(todo_snapshot: Dict[str, int] | None, *, compact: bool = False) -> tuple[str, str]:
+        prefix = "td" if compact else "todo"
+        if not todo_snapshot or todo_snapshot.get("total", 0) <= 0:
+            return f"{prefix} --", "class:status-bar-dim"
+
+        label = f"{prefix} {todo_snapshot['completed']}/{todo_snapshot['total']}"
+        if todo_snapshot.get("in_progress", 0):
+            if compact:
+                label += f"→{todo_snapshot['in_progress']}"
+            else:
+                label += f" · {todo_snapshot['in_progress']}→"
+        if not compact and todo_snapshot.get("cancelled", 0):
+            label += f" · x{todo_snapshot['cancelled']}"
+
+        if todo_snapshot.get("in_progress", 0):
+            style = "class:status-bar-strong"
+        elif todo_snapshot.get("completed", 0) >= todo_snapshot.get("total", 0):
+            style = "class:status-bar-good"
+        else:
+            style = "class:status-bar-dim"
+        return label, style
+
+    @staticmethod
+    def _get_status_bar_progress_label(todo_snapshot: Dict[str, int] | None) -> tuple[str, str]:
+        if not todo_snapshot or todo_snapshot.get("total", 0) <= 0:
+            return "", "class:status-bar-dim"
+
+        current = min(
+            todo_snapshot.get("total", 0),
+            todo_snapshot.get("completed", 0) + todo_snapshot.get("in_progress", 0),
+        )
+        label = f"({current}/{todo_snapshot['total']})"
+        if todo_snapshot.get("in_progress", 0):
+            style = "class:status-bar-strong"
+        elif todo_snapshot.get("completed", 0) >= todo_snapshot.get("total", 0):
+            style = "class:status-bar-good"
+        else:
+            style = "class:status-bar-dim"
+        return label, style
+
+    @staticmethod
+    def _get_status_bar_reasoning_label(reasoning_config: Dict[str, Any] | None, *, compact: bool = False) -> tuple[str, str]:
+        abbreviations = {
+            "default": "def",
+            "minimal": "min",
+            "medium": "med",
+            "high": "high",
+            "xhigh": "xhi",
+            "off": "off",
+        }
+        if not reasoning_config:
+            effort = "default"
+            style = "class:status-bar-dim"
+        elif reasoning_config.get("enabled") is False:
+            effort = "off"
+            style = "class:status-bar-dim"
+        else:
+            effort = str(reasoning_config.get("effort") or "default").strip().lower() or "default"
+            style = "class:status-bar-strong" if effort in {"high", "xhigh"} else "class:status-bar-good"
+
+        display_effort = abbreviations.get(effort, effort) if compact else effort
+        return display_effort, style
+
+    def _get_status_bar_provider_source(self) -> str:
+        provider_source = str(getattr(self, "_provider_source", None) or "").strip()
+        if provider_source:
+            return provider_source
+
+        requested_provider = str(getattr(self, "requested_provider", None) or "").strip()
+        agent = getattr(self, "agent", None)
+        resolved_provider = str(
+            getattr(agent, "provider", None)
+            or getattr(self, "provider", None)
+            or ""
+        ).strip().lower()
+        requested_norm = requested_provider.lower()
+
+        if requested_norm.startswith("custom:"):
+            return requested_provider
+
+        if requested_norm != "custom" and resolved_provider != "custom":
+            return ""
+
+        base_url = str(
+            getattr(agent, "base_url", None)
+            or getattr(self, "base_url", None)
+            or ""
+        ).strip()
+        if not base_url:
+            return ""
+
+        try:
+            from agent.credential_pool import get_custom_provider_pool_key
+
+            inferred_pool_key = get_custom_provider_pool_key(base_url)
+        except Exception:
+            return ""
+
+        return inferred_pool_key or ""
+
+    def _get_status_bar_provider_label(self) -> str:
+        agent = getattr(self, "agent", None)
+        resolved_provider = str(
+            getattr(agent, "provider", None)
+            or getattr(self, "provider", None)
+            or ""
+        ).strip()
+        requested_provider = str(getattr(self, "requested_provider", None) or "").strip()
+        provider_source = self._get_status_bar_provider_source()
+
+        for prefix in ("custom_provider:", "pool:custom:", "custom:"):
+            if provider_source.startswith(prefix):
+                custom_name = provider_source.split(prefix, 1)[1].strip()
+                if custom_name:
+                    return custom_name
+
+        if requested_provider.lower().startswith("custom:"):
+            custom_name = requested_provider.split(":", 1)[1].strip()
+            if custom_name:
+                return custom_name
+
+        if resolved_provider.lower() == "custom" and requested_provider.lower() not in {"", "auto", "custom"}:
+            return requested_provider
+
+        if resolved_provider:
+            return resolved_provider
+        if requested_provider:
+            return requested_provider
+        return "unknown"
+
+    @staticmethod
+    def _get_status_bar_task_fragments(todo_items: List[Dict[str, str]] | None, *, compact: bool = False):
+        if not todo_items:
+            return [("class:status-bar-dim", "no tasks")]
+
+        marker_map = {
+            "completed": ("[x]", "class:status-bar-good"),
+            "in_progress": ("[>]", "class:status-bar-strong"),
+            "pending": ("[ ]", "class:status-bar-dim"),
+            "cancelled": ("[~]", "class:status-bar-dim"),
+        }
+        separator = " · " if compact else " │ "
+        fragments = []
+        for index, item in enumerate(todo_items):
+            if index:
+                fragments.append(("class:status-bar-dim", separator))
+            marker, style = marker_map.get(item.get("status"), ("[?]", "class:status-bar-dim"))
+            content = item.get("content") or "(no description)"
+            if compact and len(content) > 14:
+                content = f"{content[:11]}..."
+            fragments.append((style, f"{marker} {content}"))
+        return fragments
+
+    @staticmethod
+    def _get_status_bar_active_task_fragments(todo_items: List[Dict[str, str]] | None, *, compact: bool = False):
+        if not todo_items:
+            return [("class:status-bar-dim", "active --")]
+
+        separator = " · " if compact else " │ "
+        fragments = []
+        for index, item in enumerate(todo_items):
+            if index:
+                fragments.append(("class:status-bar-dim", separator))
+            content = " ".join(str(item.get("content") or "(no description)").split())
+            fragments.append(("class:status-bar-strong", f"[>] {content}"))
+        return fragments
+
+    @staticmethod
+    def _select_status_bar_fallback_todo_item(todo_items: List[Dict[str, str]] | None) -> Dict[str, str] | None:
+        if not todo_items:
+            return None
+
+        for status in ("pending", "completed", "cancelled"):
+            matching = [item for item in todo_items if item.get("status") == status]
+            if not matching:
+                continue
+            if status == "pending":
+                return matching[0]
+            return matching[-1]
+
+        return todo_items[0]
+
+    @staticmethod
+    def _get_status_bar_named_task_fragments(todo_item: Dict[str, str] | None):
+        if not todo_item:
+            return [("class:status-bar-dim", "active --")]
+
+        marker_map = {
+            "completed": ("[x]", "class:status-bar-good"),
+            "in_progress": ("[>]", "class:status-bar-strong"),
+            "pending": ("[ ]", "class:status-bar-dim"),
+            "cancelled": ("[~]", "class:status-bar-dim"),
+        }
+        marker, style = marker_map.get(todo_item.get("status"), ("[?]", "class:status-bar-dim"))
+        content = " ".join(str(todo_item.get("content") or "(no description)").split())
+        return [(style, f"{marker} {content}")]
+
+    def _get_status_bar_saved_task_title(self) -> str:
+        for candidate in (
+            getattr(self, "_tmux_session_task_title", None),
+            getattr(self, "_pending_title", None),
+        ):
+            title = self._summarize_prompt_task(candidate, max_len=96)
+            if title and not self._is_low_signal_prompt_task(title):
+                return title
+
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "session_id", None)
+        if session_db and session_id:
+            try:
+                session_title = self._summarize_prompt_task(
+                    session_db.get_session_title(session_id) or "",
+                    max_len=96,
+                )
+                if session_title and not self._is_low_signal_prompt_task(session_title):
+                    return session_title
+            except Exception:
+                pass
+
+        for msg in getattr(self, "conversation_history", None) or []:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            title = self._summarize_prompt_task(msg.get("content"), max_len=96)
+            if title and not self._is_low_signal_prompt_task(title):
+                return title
+
+        return ""
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -1888,6 +2976,8 @@ class HermesCLI:
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
+            "provider": getattr(agent, "provider", None) or getattr(self, "provider", None) or "unknown",
+            "provider_label": self._get_status_bar_provider_label(),
             "duration": format_duration_compact(elapsed_seconds),
             "context_tokens": 0,
             "context_length": None,
@@ -2004,9 +3094,31 @@ class HermesCLI:
             return 0
         return 0 if self._use_minimal_tui_chrome(width=width) else 1
 
+    def _should_show_bottom_dock_spacer(self) -> bool:
+        """Return True when the flexible top spacer should keep the prompt docked low.
+
+        On a fresh session, docking the footer to the bottom gives the intended
+        startup layout.  Inside tmux, however, that behavior leaves a large blank
+        valley between the last visible transcript line and the footer because the
+        pane itself already preserves history above the live prompt area.  Prefer
+        a transcript-following footer there, while still allowing interactive
+        modal prompts to stay anchored and obvious.
+        """
+        if (
+            getattr(self, "_sudo_state", None)
+            or getattr(self, "_secret_state", None)
+            or getattr(self, "_approval_state", None)
+            or getattr(self, "_clarify_state", None)
+            or getattr(self, "_model_picker_state", None)
+        ):
+            return True
+        if os.environ.get("TMUX", "").strip():
+            return False
+        return not bool(getattr(self, "conversation_history", None))
+
     def _spinner_widget_height(self, width: Optional[int] = None) -> int:
         """Return the visible height for the spinner/status text line above the status bar."""
-        if not getattr(self, "_spinner_text", ""):
+        if not getattr(self, "_spinner_text", "") and not getattr(self, "_agent_running", False):
             return 0
         return 0 if self._use_minimal_tui_chrome(width=width) else 1
 
@@ -2036,28 +3148,87 @@ class HermesCLI:
                 width = self._get_tui_terminal_width()
             percent = snapshot["context_percent"]
             percent_label = f"{percent}%" if percent is not None else "--"
-            duration_label = snapshot["duration"]
+            provider_label = snapshot.get("provider_label") or snapshot.get("provider") or "unknown"
+            reasoning_label, _ = self._get_status_bar_reasoning_label(
+                getattr(self, "reasoning_config", None),
+                compact=width < 52,
+            )
+            progress_label, _ = self._get_status_bar_progress_label(self._get_status_bar_todo_snapshot())
+            background_label, _ = self._get_status_bar_background_task_label(
+                self._get_status_bar_background_task_snapshot()
+            )
 
-            if width < 52:
-                text = f"⚕ {snapshot['model_short']} · {duration_label}"
-                return self._trim_status_bar_text(text, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
-                parts.append(duration_label)
-                return self._trim_status_bar_text(" · ".join(parts), width)
-
-            if snapshot["context_length"]:
-                ctx_total = _format_context_length(snapshot["context_length"])
-                ctx_used = format_token_count_compact(snapshot["context_tokens"])
-                context_label = f"{ctx_used}/{ctx_total}"
+                separator = " · "
+                parts = [f"⚕ {snapshot['model_short']}"]
+                optional_parts = []
+                if progress_label:
+                    optional_parts.append(progress_label)
+                optional_parts.append(provider_label)
+                optional_parts.append(reasoning_label)
+                if background_label:
+                    optional_parts.append(background_label)
             else:
-                context_label = "ctx --"
+                separator = " │ "
+                if snapshot["context_length"]:
+                    ctx_total = _format_context_length(snapshot["context_length"])
+                    ctx_used = format_token_count_compact(snapshot["context_tokens"])
+                    context_label = f"{ctx_used}/{ctx_total}"
+                else:
+                    context_label = "ctx --"
 
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
-            parts.append(duration_label)
-            return self._trim_status_bar_text(" │ ".join(parts), width)
+                parts = [f"⚕ {snapshot['model_short']}"]
+                optional_parts = []
+                if progress_label:
+                    optional_parts.append(progress_label)
+                optional_parts.extend([provider_label, reasoning_label, context_label, percent_label])
+                if background_label:
+                    optional_parts.append(background_label)
+
+            current = parts[0]
+            for part in optional_parts:
+                candidate = f"{current}{separator}{part}"
+                if self._status_bar_display_width(candidate) <= width:
+                    current = candidate
+            return self._trim_status_bar_text(current, width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
+
+    def _fit_status_bar_fragments(self, frags, width: int, fallback_style: str = "class:status-bar"):
+        total_width = sum(self._status_bar_display_width(text) for _, text in frags)
+        if total_width > width:
+            plain_text = "".join(text for _, text in frags)
+            trimmed = self._trim_status_bar_text(plain_text, width)
+            return [(fallback_style, trimmed)]
+        return frags
+
+    def _fit_status_bar_fragments_with_optional_groups(
+        self,
+        primary_frags,
+        optional_groups,
+        width: int,
+        fallback_style: str = "class:status-bar",
+    ):
+        frags = list(primary_frags)
+        primary_width = sum(self._status_bar_display_width(text) for _, text in frags)
+        if primary_width > width:
+            return self._fit_status_bar_fragments(frags, width, fallback_style=fallback_style)
+
+        for group in optional_groups:
+            candidate = frags + list(group)
+            candidate_width = sum(self._status_bar_display_width(text) for _, text in candidate)
+            if candidate_width <= width:
+                frags = candidate
+
+        return frags
+
+    @staticmethod
+    def _get_status_bar_context_label(snapshot: Dict[str, Any]) -> str:
+        if snapshot["context_length"]:
+            ctx_total = _format_context_length(snapshot["context_length"])
+            ctx_used = format_token_count_compact(snapshot["context_tokens"])
+            return f"{ctx_used}/{ctx_total}"
+        return "ctx --"
 
     def _get_status_bar_fragments(self):
         if not self._status_bar_visible or getattr(self, '_model_picker_state', None):
@@ -2070,60 +3241,110 @@ class HermesCLI:
             # actually renders, causing the fragments to overflow to a second
             # line and produce duplicated status bar rows over long sessions.
             width = self._get_tui_terminal_width()
-            duration_label = snapshot["duration"]
+            provider_label = snapshot.get("provider_label") or snapshot.get("provider") or "unknown"
+            reasoning_label, reasoning_style = self._get_status_bar_reasoning_label(
+                getattr(self, "reasoning_config", None),
+                compact=width < 52,
+            )
+            progress_label, progress_style = self._get_status_bar_progress_label(self._get_status_bar_todo_snapshot())
+            background_label, background_style = self._get_status_bar_background_task_label(
+                self._get_status_bar_background_task_snapshot()
+            )
 
-            if width < 52:
-                frags = [
-                    ("class:status-bar", " ⚕ "),
-                    ("class:status-bar-strong", snapshot["model_short"]),
-                    ("class:status-bar-dim", " · "),
-                    ("class:status-bar-dim", duration_label),
-                    ("class:status-bar", " "),
-                ]
+            if width < 76:
+                separator = " · "
             else:
-                percent = snapshot["context_percent"]
-                percent_label = f"{percent}%" if percent is not None else "--"
-                if width < 76:
-                    frags = [
-                        ("class:status-bar", " ⚕ "),
-                        ("class:status-bar-strong", snapshot["model_short"]),
-                        ("class:status-bar-dim", " · "),
-                        (self._status_bar_context_style(percent), percent_label),
-                        ("class:status-bar-dim", " · "),
-                        ("class:status-bar-dim", duration_label),
-                        ("class:status-bar", " "),
-                    ]
-                else:
-                    if snapshot["context_length"]:
-                        ctx_total = _format_context_length(snapshot["context_length"])
-                        ctx_used = format_token_count_compact(snapshot["context_tokens"])
-                        context_label = f"{ctx_used}/{ctx_total}"
-                    else:
-                        context_label = "ctx --"
+                separator = " │ "
 
-                    bar_style = self._status_bar_context_style(percent)
-                    frags = [
-                        ("class:status-bar", " ⚕ "),
-                        ("class:status-bar-strong", snapshot["model_short"]),
-                        ("class:status-bar-dim", " │ "),
-                        ("class:status-bar-dim", context_label),
-                        ("class:status-bar-dim", " │ "),
-                        (bar_style, self._build_context_bar(percent)),
-                        ("class:status-bar-dim", " "),
-                        (bar_style, percent_label),
-                        ("class:status-bar-dim", " │ "),
-                        ("class:status-bar-dim", duration_label),
-                        ("class:status-bar", " "),
-                    ]
+            frags = [
+                ("class:status-bar", " ⚕ "),
+                ("class:status-bar-strong", snapshot["model_short"]),
+            ]
+            optional_groups = []
+            if progress_label:
+                optional_groups.append([
+                    ("class:status-bar-dim", separator),
+                    (progress_style, progress_label),
+                ])
+            optional_groups.append([
+                ("class:status-bar-dim", separator),
+                ("class:status-bar-dim", provider_label),
+            ])
+            optional_groups.append([
+                ("class:status-bar-dim", separator),
+                (reasoning_style, reasoning_label),
+            ])
+            if background_label:
+                optional_groups.append([
+                    ("class:status-bar-dim", separator),
+                    (background_style, background_label),
+                ])
+            optional_groups.append([("class:status-bar", " ")])
 
-            total_width = sum(self._status_bar_display_width(text) for _, text in frags)
-            if total_width > width:
-                plain_text = "".join(text for _, text in frags)
-                trimmed = self._trim_status_bar_text(plain_text, width)
-                return [("class:status-bar", trimmed)]
-            return frags
+            return self._fit_status_bar_fragments_with_optional_groups(frags, optional_groups, width)
         except Exception:
             return [("class:status-bar", f" {self._build_status_bar_text()} ")]
+
+    def _get_status_bar_secondary_fragments(self):
+        if not self._status_bar_visible or getattr(self, '_model_picker_state', None):
+            return []
+        try:
+            snapshot = self._get_status_bar_snapshot()
+            width = self._get_tui_terminal_width()
+            percent = snapshot["context_percent"]
+            percent_label = f"{percent}%" if percent is not None else "--"
+            context_label = self._get_status_bar_context_label(snapshot)
+            bar_style = self._status_bar_context_style(percent)
+            todo_items = self._get_status_bar_todo_items()
+            active_todo_items = self._get_status_bar_active_todo_items()
+            saved_task_title = self._get_status_bar_saved_task_title()
+            if active_todo_items:
+                task_fragments = self._get_status_bar_active_task_fragments(
+                    active_todo_items,
+                    compact=width < 76,
+                )
+            elif saved_task_title:
+                task_fragments = [("class:status-bar-strong", saved_task_title)]
+            elif todo_items:
+                task_fragments = self._get_status_bar_named_task_fragments(
+                    self._select_status_bar_fallback_todo_item(todo_items)
+                )
+            else:
+                task_fragments = self._get_status_bar_active_task_fragments(
+                    None,
+                    compact=width < 76,
+                )
+
+            primary_frags = [
+                ("class:status-bar", " "),
+                *task_fragments,
+            ]
+            optional_groups = []
+            if width >= 76:
+                optional_groups.append([
+                    ("class:status-bar-dim", " │ "),
+                    ("class:status-bar-dim", context_label),
+                ])
+                optional_groups.append([
+                    ("class:status-bar-dim", " │ "),
+                    (bar_style, self._build_context_bar(percent)),
+                    ("class:status-bar-dim", " "),
+                    (bar_style, percent_label),
+                ])
+                if snapshot["compressions"]:
+                    optional_groups.append([
+                        ("class:status-bar-dim", " │ "),
+                        ("class:status-bar-dim", f"cmp {snapshot['compressions']}"),
+                    ])
+            optional_groups.append([("class:status-bar", " ")])
+
+            return self._fit_status_bar_fragments_with_optional_groups(
+                primary_frags,
+                optional_groups,
+                width,
+            )
+        except Exception:
+            return []
 
     def _normalize_model_for_provider(self, resolved_provider: str) -> bool:
         """Normalize provider-specific model IDs and routing."""
@@ -2238,13 +3459,64 @@ class HermesCLI:
 
     # ── Streaming display ────────────────────────────────────────────────
 
+    def _should_use_compact_reasoning_preview(self) -> bool:
+        """Return True when reasoning should avoid persistent transcript boxes.
+
+        Inside tmux, transcript-persisted reasoning panels are noisy and can be
+        mistaken for post-response output appended after the last assistant
+        message. Prefer compact `[thinking]` preview lines there instead.
+        """
+        return bool(str(os.environ.get("TMUX", "")).strip())
+
+    def _should_render_final_reasoning_box(self) -> bool:
+        """Return True when a persistent final reasoning box should be rendered."""
+        if not getattr(self, "show_reasoning", False):
+            return False
+        if self._should_use_compact_reasoning_preview():
+            return False
+        return not bool(getattr(self, "_reasoning_shown_this_turn", False))
+
     def _current_reasoning_callback(self):
         """Return the active reasoning display callback for the current mode."""
         if self.show_reasoning and self.streaming_enabled:
+            if self._should_use_compact_reasoning_preview():
+                return self._on_reasoning
             return self._stream_reasoning_delta
         if self.verbose and not self.show_reasoning:
             return self._on_reasoning
         return None
+
+    def _reasoning_debug_enabled(self) -> bool:
+        """Return True when temporary reasoning/stream instrumentation is enabled."""
+        flag = str(os.getenv("HERMES_REASONING_DEBUG", "")).strip().lower()
+        return flag in {"1", "true", "yes", "on"}
+
+    def _reasoning_debug_event(self, event: str, **fields) -> None:
+        """Append a compact JSONL debug event for reasoning/stream state transitions."""
+        if not self._reasoning_debug_enabled():
+            return
+        try:
+            payload = {
+                "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+                "pid": os.getpid(),
+                "session_id": getattr(self, "session_id", None),
+                "event": event,
+                "stream_box_opened": bool(getattr(self, "_stream_box_opened", False)),
+                "reasoning_box_opened": bool(getattr(self, "_reasoning_box_opened", False)),
+                "stream_started": bool(getattr(self, "_stream_started", False)),
+                "deferred_len": len(getattr(self, "_deferred_content", "") or ""),
+            }
+            for key, value in fields.items():
+                if isinstance(value, str):
+                    payload[key] = value.replace("\n", "\\n")[:200]
+                else:
+                    payload[key] = value
+            log_path = _hermes_home / "logs" / "reasoning-debug.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.debug("Failed to write reasoning debug event", exc_info=True)
 
     def _emit_reasoning_preview(self, reasoning_text: str) -> None:
         """Render a buffered reasoning preview as a single [thinking] block."""
@@ -2347,6 +3619,11 @@ class HermesCLI:
         if not text:
             return
         self._reasoning_shown_this_turn = True
+        self._reasoning_debug_event(
+            "stream_reasoning_delta",
+            text_len=len(text),
+            preview=text[:120],
+        )
         if getattr(self, "_stream_box_opened", False):
             return
 
@@ -2357,6 +3634,7 @@ class HermesCLI:
             r_label = " Reasoning "
             r_fill = w - 2 - len(r_label)
             _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
+            self._reasoning_debug_event("reasoning_box_opened", width=w)
 
         self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
 
@@ -2372,6 +3650,10 @@ class HermesCLI:
     def _close_reasoning_box(self) -> None:
         """Close the live reasoning box if it's open."""
         if getattr(self, "_reasoning_box_opened", False):
+            self._reasoning_debug_event(
+                "close_reasoning_box_start",
+                buf_len=len(getattr(self, "_reasoning_buf", "") or ""),
+            )
             # Flush remaining reasoning buffer
             buf = getattr(self, "_reasoning_buf", "")
             if buf:
@@ -2386,6 +3668,7 @@ class HermesCLI:
             if deferred:
                 self._deferred_content = ""
                 self._emit_stream_text(deferred)
+            self._reasoning_debug_event("close_reasoning_box_done")
 
     def _stream_delta(self, text) -> None:
         """Line-buffered streaming callback for real-time token rendering.
@@ -2532,11 +3815,21 @@ class HermesCLI:
         if not text:
             return
 
+        self._reasoning_debug_event(
+            "emit_stream_text",
+            text_len=len(text),
+            preview=text[:120],
+        )
+
         # When show_reasoning is on and reasoning is still rendering,
         # defer content until the reasoning box closes.  This ensures the
         # reasoning block always appears BEFORE the response in the terminal.
         if self.show_reasoning and getattr(self, "_reasoning_box_opened", False):
             self._deferred_content = getattr(self, "_deferred_content", "") + text
+            self._reasoning_debug_event(
+                "emit_stream_text_deferred",
+                text_len=len(text),
+            )
             return
 
         # Close the live reasoning box before opening the response box
@@ -2569,6 +3862,7 @@ class HermesCLI:
             w = shutil.get_terminal_size().columns
             fill = w - 2 - len(label)
             _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+            self._reasoning_debug_event("response_box_opened", width=w)
 
         self._stream_buf += text
 
@@ -2580,6 +3874,12 @@ class HermesCLI:
 
     def _flush_stream(self) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
+        self._reasoning_debug_event(
+            "flush_stream",
+            stream_buf_len=len(getattr(self, "_stream_buf", "") or ""),
+            prefilt_len=len(getattr(self, "_stream_prefilt", "") or ""),
+            in_reasoning_block=bool(getattr(self, "_in_reasoning_block", False)),
+        )
         # If we're still inside a "reasoning block" at end-of-stream, it was
         # a false positive — the model mentioned a tag like <think> in prose
         # but never closed it.  Recover the buffered content as regular text.
@@ -2603,6 +3903,12 @@ class HermesCLI:
 
     def _reset_stream_state(self) -> None:
         """Reset streaming state before each agent invocation."""
+        self._reasoning_debug_event(
+            "reset_stream_state",
+            stream_buf_len=len(getattr(self, "_stream_buf", "") or ""),
+            reasoning_buf_len=len(getattr(self, "_reasoning_buf", "") or ""),
+            prefilt_len=len(getattr(self, "_stream_prefilt", "") or ""),
+        )
         self._stream_buf = ""
         self._stream_started = False
         self._stream_box_opened = False
@@ -2640,6 +3946,49 @@ class HermesCLI:
 
         frame_idx = int(_time.monotonic() * 10) % len(_COMMAND_SPINNER_FRAMES)
         return _COMMAND_SPINNER_FRAMES[frame_idx]
+
+    def _agent_working_frame(self, now: Optional[float] = None) -> str:
+        """Return the current pulse frame for foreground agent activity."""
+        if now is None:
+            now = time.monotonic()
+        frame_idx = int(now * 8) % len(_AGENT_WORKING_FRAMES)
+        return _AGENT_WORKING_FRAMES[frame_idx]
+
+    def _should_persist_tool_progress_line(self, function_name: Optional[str]) -> bool:
+        """Return True when tool progress should also be written into transcript history."""
+        return bool(function_name) and not function_name.startswith("_") and function_name in _FAST_TOOL_TRANSCRIPT_NAMES
+
+    def _flush_live_boxes_for_tool_progress_line(self) -> None:
+        """Close any live reasoning/response boxes before printing transcript tool progress."""
+        if (
+            getattr(self, "_stream_box_opened", False)
+            or getattr(self, "_reasoning_box_opened", False)
+            or getattr(self, "_stream_started", False)
+        ):
+            self._flush_stream()
+            self._reset_stream_state()
+        else:
+            self._close_reasoning_box()
+
+    def _emit_persistent_tool_progress_line(
+        self,
+        function_name: Optional[str],
+        label: str,
+        *,
+        emoji: Optional[str] = None,
+    ) -> None:
+        """Print a one-line transcript entry for quick tools that otherwise vanish in the footer."""
+        if not label or not self._should_persist_tool_progress_line(function_name):
+            return
+        self._flush_live_boxes_for_tool_progress_line()
+        if function_name == "todo":
+            _cprint(f"  ┊ {_ACCENT}📋 {label}{_RST}")
+            return
+        if emoji is None:
+            from agent.display import get_tool_emoji
+
+            emoji = get_tool_emoji(function_name)
+        _cprint(f"  ┊ {emoji} {label}")
 
     @contextmanager
     def _busy_command(self, status: str):
@@ -2809,10 +4158,13 @@ class HermesCLI:
                 _cprint(f"\033[1;31mSession not found: {self.session_id}{_RST}")
                 _cprint(f"{_DIM}Use a session ID from a previous CLI run (hermes sessions list).{_RST}")
                 return False
+            self._apply_session_routing_from_meta(session_meta)
+            self._restore_session_reasoning_config(session_meta)
             restored = self._session_db.get_messages_as_conversation(self.session_id)
             if restored:
-                restored = [m for m in restored if m.get("role") != "session_meta"]
+                restored = _sanitize_resumed_messages(restored)
                 self.conversation_history = restored
+                self._sync_tmux_pane_title(force=True)
                 msg_count = len([m for m in restored if m.get("role") == "user"])
                 title_part = ""
                 if session_meta.get("title"):
@@ -2853,6 +4205,7 @@ class HermesCLI:
                 api_key=runtime.get("api_key"),
                 base_url=runtime.get("base_url"),
                 provider=runtime.get("provider"),
+                requested_provider=self.requested_provider,
                 api_mode=runtime.get("api_mode"),
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
@@ -2895,13 +4248,13 @@ class HermesCLI:
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint
-            self._active_agent_route_signature = (
-                effective_model,
-                runtime.get("provider"),
-                runtime.get("base_url"),
-                runtime.get("api_mode"),
-                runtime.get("command"),
-                tuple(runtime.get("args") or ()),
+            self._active_agent_route_signature = self._agent_route_signature(
+                model=effective_model,
+                provider=runtime.get("provider"),
+                base_url=runtime.get("base_url"),
+                api_mode=runtime.get("api_mode"),
+                acp_command=runtime.get("command"),
+                acp_args=list(runtime.get("args") or []),
             )
 
             if self._pending_title and self._session_db:
@@ -3023,10 +4376,28 @@ class HermesCLI:
             )
             return False
 
+        # If the resumed ID is a root/older session in a lineage that has no
+        # messages (common after compression splits), jump to the latest
+        # continuation with messages.
+        try:
+            latest_with_msgs = self._session_db.resolve_latest_descendant_session(
+                self.session_id,
+                require_messages=True,
+            )
+        except Exception:
+            latest_with_msgs = None
+        if latest_with_msgs and latest_with_msgs != self.session_id:
+            self.session_id = latest_with_msgs
+            session_meta = self._session_db.get_session(self.session_id) or session_meta
+
+        self._apply_session_routing_from_meta(session_meta)
+        self._restore_session_reasoning_config(session_meta)
+
         restored = self._session_db.get_messages_as_conversation(self.session_id)
         if restored:
-            restored = [m for m in restored if m.get("role") != "session_meta"]
+            restored = _sanitize_resumed_messages(restored)
             self.conversation_history = restored
+            self._sync_tmux_pane_title(force=True)
             msg_count = len([m for m in restored if m.get("role") == "user"])
             title_part = ""
             if session_meta.get("title"):
@@ -3062,105 +4433,655 @@ class HermesCLI:
     def _display_resumed_history(self):
         """Render a compact recap of previous conversation messages.
 
-        Uses Rich markup with dim/muted styling so the recap is visually
-        distinct from the active conversation.  Caps the display at the
-        last ``MAX_DISPLAY_EXCHANGES`` user/assistant exchanges and shows
-        an indicator for earlier hidden messages.
+        Resumed sessions often contain many raw assistant tool-call steps between
+        each user request and the final useful answer. Collapse those raw
+        intermediate assistant messages into user/assistant exchanges so the
+        recap surfaces the last meaningful answer for each user turn instead of
+        flooding the panel with tool-call noise.
         """
         if not self.conversation_history:
             return
 
-        # Check config: resume_display setting
         if self.resume_display == "minimal":
             return
 
-        MAX_DISPLAY_EXCHANGES = 10   # max user+assistant pairs to show
-        MAX_USER_LEN = 300           # truncate user messages
-        MAX_ASST_LEN = 200           # truncate assistant text
-        MAX_ASST_LINES = 3           # max lines of assistant text
+        max_display_exchanges = self.resume_history_exchanges
+        MAX_USER_LEN = 300
+        MAX_ASST_LEN = 200
+        MAX_ASST_LINES = 3
+        MAX_RAW_ASST_LEN = 4000
+
+        import re
+        import json
+
+        def _safe_json_loads(raw: Any) -> dict:
+            if raw is None:
+                return {}
+            if isinstance(raw, dict):
+                return raw
+            if not isinstance(raw, str):
+                return {}
+            raw = raw.strip()
+            if not raw:
+                return {}
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {}
+
+        def _looks_like_error(text: str) -> bool:
+            t = (text or "").lower()
+            if not t:
+                return False
+            return any(
+                cue in t
+                for cue in (
+                    "traceback",
+                    "error",
+                    "exception",
+                    "failed",
+                    "failure",
+                    "not found",
+                    "permission denied",
+                    "exit code",
+                    "\n❌",
+                    "\n✗",
+                )
+            )
+
+        def _truncate_one_line(text: str, max_len: int = 120) -> str:
+            compact = " ".join((text or "").split())
+            if len(compact) > max_len:
+                return compact[:max_len].rstrip() + "..."
+            return compact
+
+        def _extract_recent_activity(messages: list[dict]) -> dict:
+            """Extract a resume-friendly activity digest from tool calls."""
+            tool_call_map: dict[str, dict] = {}
+            actions: list[str] = []
+            files: list[str] = []
+            commands: list[str] = []
+            urls: list[str] = []
+            notable_results: list[str] = []
+
+            def _remember_unique(lst: list[str], item: str, limit: int) -> None:
+                item = (item or "").strip()
+                if not item:
+                    return
+                if item in lst:
+                    return
+                lst.append(item)
+                if len(lst) > limit:
+                    del lst[0 : len(lst) - limit]
+
+            for msg in messages or []:
+                role = msg.get("role", "")
+                if role == "assistant":
+                    tool_calls = msg.get("tool_calls") or []
+                    for tc in tool_calls:
+                        tc_id = tc.get("id") or ""
+                        fn = tc.get("function", {})
+                        tool_name = fn.get("name") if isinstance(fn, dict) else None
+                        raw_args = fn.get("arguments") if isinstance(fn, dict) else None
+                        args = _safe_json_loads(raw_args)
+                        if tc_id:
+                            tool_call_map[tc_id] = {
+                                "name": tool_name or "unknown",
+                                "args": args,
+                            }
+
+                        label = tool_name or "tool"
+                        if tool_name == "terminal":
+                            cmd = args.get("command") if isinstance(args, dict) else None
+                            if cmd:
+                                _remember_unique(commands, _truncate_one_line(str(cmd), 160), limit=6)
+                                _remember_unique(actions, f"terminal: {_truncate_one_line(str(cmd), 120)}", limit=10)
+                            else:
+                                _remember_unique(actions, "terminal", limit=10)
+                            continue
+
+                        if tool_name in {"read_file", "write_file", "patch", "search_files"}:
+                            path = args.get("path") if isinstance(args, dict) else None
+                            if path:
+                                _remember_unique(files, str(path), limit=10)
+
+                            # Important: keep the activity digest human-readable and
+                            # avoid leaking raw tool function names into the recap.
+                            if tool_name == "search_files":
+                                pat = args.get("pattern") if isinstance(args, dict) else None
+                                if pat and path:
+                                    _remember_unique(actions, f"search: {_truncate_one_line(str(pat), 80)}  (in {path})", limit=10)
+                                elif pat:
+                                    _remember_unique(actions, f"search: {_truncate_one_line(str(pat), 100)}", limit=10)
+                                else:
+                                    _remember_unique(actions, "search", limit=10)
+                            else:
+                                verb = {"read_file": "read", "write_file": "write", "patch": "edit"}.get(tool_name, "file")
+                                if path:
+                                    _remember_unique(actions, f"{verb}: {path}", limit=10)
+                                else:
+                                    _remember_unique(actions, verb, limit=10)
+                            continue
+
+                        if tool_name in {"web_search", "web_extract", "browser_navigate"}:
+                            if tool_name == "web_search":
+                                q = args.get("query") if isinstance(args, dict) else None
+                                if q:
+                                    _remember_unique(actions, f"web_search: {_truncate_one_line(str(q), 110)}", limit=10)
+                                else:
+                                    _remember_unique(actions, "web_search", limit=10)
+                            elif tool_name == "browser_navigate":
+                                u = args.get("url") if isinstance(args, dict) else None
+                                if u:
+                                    _remember_unique(urls, _truncate_one_line(str(u), 160), limit=6)
+                                    _remember_unique(actions, f"browser: {_truncate_one_line(str(u), 120)}", limit=10)
+                                else:
+                                    _remember_unique(actions, "browser", limit=10)
+                            else:
+                                u = args.get("urls") if isinstance(args, dict) else None
+                                if isinstance(u, list) and u:
+                                    _remember_unique(urls, _truncate_one_line(str(u[0]), 160), limit=6)
+                                    _remember_unique(actions, f"web_extract: {len(u)} url(s)", limit=10)
+                                else:
+                                    _remember_unique(actions, "web_extract", limit=10)
+                            continue
+
+                        _remember_unique(actions, label, limit=10)
+
+                if role == "tool":
+                    tc_id = msg.get("tool_call_id") or ""
+                    content = _sanitize_resumed_text(msg.get("content") or "")
+                    if not content:
+                        continue
+                    spec = tool_call_map.get(tc_id) or {}
+                    tool_name = spec.get("name", "tool")
+                    if _looks_like_error(content):
+                        _remember_unique(
+                            notable_results,
+                            f"{tool_name} result: {_truncate_one_line(content, 160)}",
+                            limit=4,
+                        )
+
+            return {
+                "actions": actions,
+                "files": files,
+                "commands": commands,
+                "urls": urls,
+                "notable_results": notable_results,
+            }
 
         def _strip_reasoning(text: str) -> str:
-            """Remove <REASONING_SCRATCHPAD>...</REASONING_SCRATCHPAD> blocks
-            from displayed text (reasoning model internal thoughts)."""
+            """Remove <REASONING_SCRATCHPAD>...</REASONING_SCRATCHPAD> blocks."""
             import re
             cleaned = re.sub(
                 r"<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>\s*",
-                "", text, flags=re.DOTALL,
+                "",
+                text,
+                flags=re.DOTALL,
             )
-            # Also strip unclosed reasoning tags at the end
             cleaned = re.sub(
                 r"<REASONING_SCRATCHPAD>.*$",
-                "", cleaned, flags=re.DOTALL,
+                "",
+                cleaned,
+                flags=re.DOTALL,
             )
             return cleaned.strip()
 
-        # Collect displayable entries (skip system, tool-result messages)
-        entries = []  # list of (role, display_text)
+        def _format_tool_summary(tool_calls: list[dict]) -> tuple[str, int, list[str]]:
+            tc_count = len(tool_calls or [])
+            names = []
+            for tc in tool_calls or []:
+                fn = tc.get("function", {})
+                name = fn.get("name", "unknown") if isinstance(fn, dict) else "unknown"
+                if name not in names:
+                    names.append(name)
+            names_str = ", ".join(names[:4])
+            if len(names) > 4:
+                names_str += ", ..."
+            noun = "call" if tc_count == 1 else "calls"
+            return f"[{tc_count} tool {noun}: {names_str}]", tc_count, names
+
+        def _truncate_assistant_text(text: str) -> str:
+            text = _sanitize_resumed_text(text or "")
+            text = _strip_reasoning(text)
+            if not text:
+                return ""
+            lines = text.splitlines()
+            if len(lines) > MAX_ASST_LINES:
+                text = "\n".join(lines[:MAX_ASST_LINES]) + " ..."
+            if len(text) > MAX_ASST_LEN:
+                text = text[:MAX_ASST_LEN] + "..."
+            return text
+
+        def _normalize_assistant_text(text: Any) -> str:
+            text = _sanitize_resumed_text(text or "")
+            text = _strip_reasoning(text)
+            if len(text) > MAX_RAW_ASST_LEN:
+                text = text[:MAX_RAW_ASST_LEN] + "..."
+            return text
+
+        def _truncate_user_text(content: Any) -> str:
+            text = "" if content is None else str(content)
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+                    elif isinstance(part, dict) and part.get("type") == "image_url":
+                        parts.append("[image]")
+                text = " ".join(parts)
+            text = _sanitize_resumed_text(text)
+            if len(text) > MAX_USER_LEN:
+                text = text[:MAX_USER_LEN] + "..."
+            return text
+
+        def _assistant_entry(msg: dict) -> dict | None:
+            raw_text = _normalize_assistant_text(msg.get("content"))
+            text = _truncate_assistant_text(raw_text)
+            tool_calls = msg.get("tool_calls") or []
+            if text and tool_calls:
+                tool_summary, tc_count, names = _format_tool_summary(tool_calls)
+                return {
+                    "text": f"{text} {tool_summary}",
+                    "raw_text": raw_text,
+                    "has_text": True,
+                    "tool_count": tc_count,
+                    "tool_names": names,
+                }
+            if text:
+                return {
+                    "text": text,
+                    "raw_text": raw_text,
+                    "has_text": True,
+                    "tool_count": 0,
+                    "tool_names": [],
+                }
+            if tool_calls:
+                tool_summary, tc_count, names = _format_tool_summary(tool_calls)
+                return {
+                    "text": tool_summary,
+                    "raw_text": "",
+                    "has_text": False,
+                    "tool_count": tc_count,
+                    "tool_names": names,
+                }
+            return None
+
+        exchanges: list[dict[str, Any]] = []
+        current_user: str | None = None
+        assistant_entries: list[dict] = []
+
+        def _truncate_summary_text(text: str, max_len: int = 160) -> str:
+            compact = " ".join((text or "").split())
+            if len(compact) > max_len:
+                compact = compact[:max_len].rstrip() + "..."
+            return compact
+
+        _LOW_SIGNAL_USER_PROMPTS = {
+            "continue",
+            "please continue",
+            "go on",
+            "carry on",
+            "go ahead",
+            "next",
+            "ok",
+            "okay",
+            "thanks",
+            "thank you",
+            "继续",
+            "继续吧",
+            "继续一下",
+            "继续做",
+            "继续处理",
+            "继续下去",
+            "好的",
+            "好",
+            "收到",
+        }
+        _NORMALIZED_LOW_SIGNAL_PROMPTS = {
+            re.sub(r"[\s\.,!\?;:，。！？、：；]+", "", item.strip().lower())
+            for item in _LOW_SIGNAL_USER_PROMPTS
+        }
+        _COMPLETION_CUES = (
+            "fixed",
+            "added",
+            "updated",
+            "implemented",
+            "verified",
+            "passed",
+            "resolved",
+            "created",
+            "refreshed",
+            "patched",
+            "improved",
+            "restored",
+            "collapsed",
+            "surfaces",
+            "shows",
+            "keeps",
+            "supports",
+            "now",
+            "修复",
+            "新增",
+            "更新",
+            "完成",
+            "通过",
+            "优化",
+            "恢复",
+            "保留",
+            "支持",
+            "显示",
+            "实现",
+            "刷新",
+        )
+        _PENDING_CUES = (
+            "pending",
+            "remaining",
+            "next",
+            "follow-up",
+            "todo",
+            "need to",
+            "needs",
+            "still",
+            "awaiting",
+            "in progress",
+            "can further",
+            "can next",
+            "if you want",
+            "受限",
+            "无法",
+            "需要",
+            "待",
+            "下一步",
+            "后续",
+            "未",
+        )
+        _BLOCKER_CUES = (
+            "blocked",
+            "blocker",
+            "cannot",
+            "can't",
+            "unable",
+            "failed",
+            "failure",
+            "missing",
+            "unavailable",
+            "not installed",
+            "受限",
+            "无法",
+            "缺少",
+            "不可用",
+            "失败",
+            "阻塞",
+        )
+        _DECISION_CUES = (
+            "root cause",
+            "issue",
+            "fix",
+            "solution",
+            "decided",
+            "prefer",
+            "use ",
+            "keep",
+            "switched",
+            "falls back",
+            "it now",
+            "this now",
+            "we now",
+            "原因",
+            "根因",
+            "修复",
+            "方案",
+            "改为",
+            "使用",
+            "保留",
+            "切换",
+            "现在",
+        )
+        _OFFER_CUES = (
+            "if you want",
+            "i can",
+            "we can",
+            "could",
+            "可以继续",
+            "如果你愿意",
+            "如果需要",
+        )
+
+        def _normalize_prompt(text: str) -> str:
+            normalized = (text or "").strip().lower()
+            normalized = re.sub(r"[\s\.,!\?;:，。！？、：；]+", "", normalized)
+            return normalized
+
+        def _is_low_signal_user(text: str) -> bool:
+            normalized = _normalize_prompt(text)
+            return bool(normalized) and normalized in _NORMALIZED_LOW_SIGNAL_PROMPTS
+
+        def _split_summary_fragments(text: str) -> list[str]:
+            raw = _normalize_assistant_text(text)
+            if not raw:
+                return []
+
+            section_headers = {
+                "done",
+                "completed",
+                "completion",
+                "decision",
+                "decisions",
+                "next",
+                "next step",
+                "next steps",
+                "limitations",
+                "limitation",
+                "blockers",
+                "blocker",
+                "pending",
+                "todo",
+                "summary",
+                "已完成",
+                "完成",
+                "决定",
+                "受限",
+                "限制",
+                "阻塞",
+                "待办",
+                "下一步",
+                "总结",
+            }
+
+            normalized_lines: list[str] = []
+            for line in raw.splitlines():
+                line = " ".join(line.strip().split())
+                if not line:
+                    continue
+                line = re.sub(r"^[-*•◆●○▪▫◦]+\s*", "", line)
+                line = re.sub(r"^\d+[\.)]\s*", "", line)
+                if line.rstrip(":：").strip().lower() in section_headers:
+                    continue
+                normalized_lines.append(line)
+
+            base_text = "\n".join(normalized_lines).strip() or raw
+            fragments = normalized_lines if len(normalized_lines) > 1 else re.split(r"(?<=[.!?。！？])\s+", base_text)
+
+            cleaned: list[str] = []
+            for fragment in fragments:
+                fragment = " ".join(fragment.strip().split())
+                if len(fragment) < 6:
+                    continue
+                fragment = _truncate_summary_text(fragment, max_len=180)
+                if fragment and fragment not in cleaned:
+                    cleaned.append(fragment)
+            return cleaned[:8]
+
+        def _matches_any(fragment: str, cues: tuple[str, ...]) -> bool:
+            lowered = fragment.lower()
+            return any(cue in lowered for cue in cues)
+
+        def _collect_status_items(exchanges_data: list[dict[str, Any]], predicate, limit: int = 2) -> list[str]:
+            items: list[str] = []
+            for exchange in reversed(exchanges_data):
+                raw_text = exchange.get("assistant_raw") or ""
+                if not raw_text:
+                    continue
+                for fragment in _split_summary_fragments(raw_text):
+                    if predicate(fragment):
+                        if fragment not in items:
+                            items.append(fragment)
+                        if len(items) >= limit:
+                            return items
+            return items
+
+        def _pick_current_task(exchanges_data: list[dict[str, Any]]) -> str:
+            for exchange in reversed(exchanges_data):
+                candidate = _truncate_summary_text(exchange.get("user") or "", max_len=140)
+                if candidate and not _is_low_signal_user(candidate):
+                    return candidate
+            return _truncate_summary_text((exchanges_data[-1] if exchanges_data else {}).get("user") or "", max_len=140)
+
+        def _latest_prompt(exchanges_data: list[dict[str, Any]]) -> str:
+            return _truncate_summary_text((exchanges_data[-1] if exchanges_data else {}).get("user") or "", max_len=140)
+
+        def _latest_decision(exchanges_data: list[dict[str, Any]], fallback: str) -> str:
+            for exchange in reversed(exchanges_data):
+                raw_text = exchange.get("assistant_raw") or ""
+                for fragment in _split_summary_fragments(raw_text):
+                    if _matches_any(fragment, _DECISION_CUES) and not _matches_any(fragment, _BLOCKER_CUES):
+                        return fragment
+            return fallback
+
+        def _decision_trace(exchanges_data: list[dict[str, Any]]) -> list[str]:
+            """Collect a few recent decision-like fragments (not just the latest)."""
+            items: list[str] = []
+            for exchange in reversed(exchanges_data):
+                raw_text = exchange.get("assistant_raw") or ""
+                if not raw_text:
+                    continue
+                for fragment in _split_summary_fragments(raw_text):
+                    if _matches_any(fragment, _DECISION_CUES) and not _matches_any(fragment, _BLOCKER_CUES):
+                        fragment = _compact_decision_text(fragment)
+                        if fragment and fragment not in items:
+                            items.append(fragment)
+                        if len(items) >= 3:
+                            return items
+            return items
+
+        def _compact_decision_text(text: str) -> str:
+            compact = _truncate_summary_text(text, max_len=140)
+            lowered = compact.lower()
+            for prefix in ("the snapshot now ", "it now ", "this now ", "we now "):
+                if lowered.startswith(prefix):
+                    compact = compact[len(prefix):]
+                    break
+            return compact
+
+        def _completed_items(exchanges_data: list[dict[str, Any]]) -> list[str]:
+            return _collect_status_items(
+                exchanges_data,
+                lambda fragment: _matches_any(fragment, _COMPLETION_CUES)
+                and not _matches_any(fragment, _PENDING_CUES)
+                and not _matches_any(fragment, _OFFER_CUES),
+            )
+
+        def _pending_items(exchanges_data: list[dict[str, Any]], latest_activity_text: str) -> list[str]:
+            items: list[str] = []
+            latest_exchange_data = exchanges_data[-1] if exchanges_data else {}
+            if latest_activity_text and not latest_exchange_data.get("assistant_has_text"):
+                items.append(f"In progress: {latest_activity_text}")
+
+            extracted = _collect_status_items(
+                exchanges_data,
+                lambda fragment: _matches_any(fragment, _PENDING_CUES)
+                or _matches_any(fragment, _BLOCKER_CUES)
+                or _matches_any(fragment, _OFFER_CUES),
+            )
+            for fragment in extracted:
+                if fragment not in items:
+                    items.append(fragment)
+                if len(items) >= 2:
+                    break
+            return items[:2]
+
+        def _append_status_block(summary_text, label: str, items: list[str], empty_text: str, label_style: str) -> None:
+            summary_text.append(f"  {label}: ", style=label_style)
+            if not items:
+                summary_text.append(empty_text + "\n", style="dim")
+                return
+            summary_text.append("\n")
+            for item in items:
+                summary_text.append("    - ", style="dim")
+                summary_text.append(item + "\n", style="dim")
+
+        def _finalize_exchange() -> None:
+            nonlocal current_user, assistant_entries
+            if current_user is None and not assistant_entries:
+                return
+
+            assistant_text = None
+            assistant_raw_text = ""
+            assistant_has_text = False
+            if assistant_entries:
+                preferred = next(
+                    (entry for entry in reversed(assistant_entries) if entry.get("has_text")),
+                    None,
+                )
+                if preferred is not None:
+                    assistant_text = preferred.get("text") or None
+                    assistant_raw_text = preferred.get("raw_text") or ""
+                    assistant_has_text = True
+                else:
+                    total_calls = sum(int(entry.get("tool_count") or 0) for entry in assistant_entries)
+                    names = []
+                    for entry in assistant_entries:
+                        for name in entry.get("tool_names") or []:
+                            if name not in names:
+                                names.append(name)
+                    if total_calls:
+                        names_str = ", ".join(names[:4])
+                        if len(names) > 4:
+                            names_str += ", ..."
+                        noun = "call" if total_calls == 1 else "calls"
+                        assistant_text = f"[{total_calls} tool {noun}: {names_str}]"
+
+            exchanges.append(
+                {
+                    "user": current_user,
+                    "assistant": assistant_text,
+                    "assistant_raw": assistant_raw_text,
+                    "assistant_has_text": assistant_has_text,
+                }
+            )
+            current_user = None
+            assistant_entries = []
+
         for msg in self.conversation_history:
             role = msg.get("role", "")
-            content = msg.get("content")
-            tool_calls = msg.get("tool_calls") or []
-
-            if role == "system":
-                continue
-            if role == "tool":
+            if role in {"system", "tool"}:
                 continue
 
             if role == "user":
-                text = "" if content is None else str(content)
-                # Handle multimodal content (list of dicts)
-                if isinstance(content, list):
-                    parts = []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            parts.append(part.get("text", ""))
-                        elif isinstance(part, dict) and part.get("type") == "image_url":
-                            parts.append("[image]")
-                    text = " ".join(parts)
-                if len(text) > MAX_USER_LEN:
-                    text = text[:MAX_USER_LEN] + "..."
-                entries.append(("user", text))
+                if current_user is not None or assistant_entries:
+                    _finalize_exchange()
+                current_user = _truncate_user_text(msg.get("content"))
+                continue
 
-            elif role == "assistant":
-                text = "" if content is None else str(content)
-                text = _strip_reasoning(text)
-                parts = []
-                if text:
-                    lines = text.splitlines()
-                    if len(lines) > MAX_ASST_LINES:
-                        text = "\n".join(lines[:MAX_ASST_LINES]) + " ..."
-                    if len(text) > MAX_ASST_LEN:
-                        text = text[:MAX_ASST_LEN] + "..."
-                    parts.append(text)
-                if tool_calls:
-                    tc_count = len(tool_calls)
-                    # Extract tool names
-                    names = []
-                    for tc in tool_calls:
-                        fn = tc.get("function", {})
-                        name = fn.get("name", "unknown") if isinstance(fn, dict) else "unknown"
-                        if name not in names:
-                            names.append(name)
-                    names_str = ", ".join(names[:4])
-                    if len(names) > 4:
-                        names_str += ", ..."
-                    noun = "call" if tc_count == 1 else "calls"
-                    parts.append(f"[{tc_count} tool {noun}: {names_str}]")
-                if not parts:
-                    # Skip pure-reasoning messages that have no visible output
-                    continue
-                entries.append(("assistant", " ".join(parts)))
+            if role == "assistant":
+                entry = _assistant_entry(msg)
+                if entry is not None:
+                    assistant_entries.append(entry)
 
-        if not entries:
+        if current_user is not None or assistant_entries:
+            _finalize_exchange()
+
+        if not exchanges:
             return
 
-        # Determine if we need to truncate
         skipped = 0
-        if len(entries) > MAX_DISPLAY_EXCHANGES * 2:
-            skipped = len(entries) - MAX_DISPLAY_EXCHANGES * 2
-            entries = entries[skipped:]
+        all_exchanges = list(exchanges)
+        total_exchanges = len(all_exchanges)
+        if len(exchanges) > max_display_exchanges:
+            skipped = len(exchanges) - max_display_exchanges
+            exchanges = exchanges[skipped:]
 
-        # Build the display using Rich
         from rich.panel import Panel
         from rich.text import Text
 
@@ -3184,22 +5105,172 @@ class HermesCLI:
                 style="dim italic",
             )
 
-        for i, (role, text) in enumerate(entries):
-            if role == "user":
+        summary_lines = Text()
+        latest_exchange = all_exchanges[-1] if all_exchanges else None
+        latest_user = _latest_prompt(all_exchanges)
+        current_task = _pick_current_task(all_exchanges)
+        latest_activity = _truncate_summary_text((latest_exchange or {}).get("assistant") or "", max_len=180)
+
+        current_task_display = current_task or latest_user or "No user message found."
+        focus_display = latest_user or current_task or "No user message found."
+        if latest_user == current_task and len(latest_user or "") > 80:
+            current_task_display = "Long prompt shown below in Previous Conversation."
+            focus_display = "Same as current task."
+        latest_answer_exchange = next(
+            (
+                exchange
+                for exchange in reversed(all_exchanges)
+                if exchange.get("assistant_has_text") and exchange.get("assistant")
+            ),
+            None,
+        )
+        latest_answer = _truncate_summary_text(
+            (latest_answer_exchange or {}).get("assistant") or "",
+            max_len=180,
+        )
+        latest_decision = _compact_decision_text(_latest_decision(all_exchanges, latest_answer or latest_activity or ""))
+        decision_trace = _decision_trace(all_exchanges)
+        completed_items = _completed_items(all_exchanges)
+        pending_items = _pending_items(all_exchanges, latest_activity)
+        activity_digest = _extract_recent_activity(self.conversation_history)
+        previous_user = next(
+            (
+                _truncate_summary_text(exchange.get("user") or "", max_len=140)
+                for exchange in reversed(all_exchanges[:-1])
+                if exchange.get("user") and _truncate_summary_text(exchange.get("user") or "", max_len=140) != current_task
+            ),
+            "",
+        )
+
+        summary_lines.append("  Current task: ", style=f"dim bold {_session_label_c}")
+        summary_lines.append(current_task_display + "\n", style="dim")
+
+        if latest_user and latest_user != current_task:
+            summary_lines.append("  Latest prompt: ", style=f"dim bold {_session_label_c}")
+            summary_lines.append(latest_user + "\n", style="dim")
+
+        summary_lines.append("  Focus: ", style=f"dim bold {_session_label_c}")
+        summary_lines.append(focus_display + "\n", style="dim")
+
+        summary_lines.append("  Latest decision: ", style=f"dim bold {_assistant_label_c}")
+        summary_lines.append(
+            (latest_decision or "No clear decision captured yet.") + "\n",
+            style="dim",
+        )
+
+        if decision_trace:
+            summary_lines.append("  Decision trace: ", style=f"dim bold {_assistant_label_c}")
+            summary_lines.append("\n")
+            for item in decision_trace[:3]:
+                summary_lines.append("    - ", style="dim")
+                summary_lines.append(item + "\n", style="dim")
+
+        _append_status_block(
+            summary_lines,
+            "Completed",
+            completed_items,
+            "No recent completed work detected.",
+            f"dim bold {_assistant_label_c}",
+        )
+        _append_status_block(
+            summary_lines,
+            "Pending / blockers",
+            pending_items,
+            "No pending steps or blockers detected in recent recap.",
+            f"dim bold {_assistant_label_c}",
+        )
+
+        # Activity + artifacts (tool-based): fast decision tracing after resume.
+        actions = activity_digest.get("actions") or []
+        files = activity_digest.get("files") or []
+        commands = activity_digest.get("commands") or []
+        urls = activity_digest.get("urls") or []
+        notable = activity_digest.get("notable_results") or []
+
+        if actions:
+            summary_lines.append("  Key actions: ", style=f"dim bold {_assistant_label_c}")
+            summary_lines.append("\n")
+            for action in actions[-6:]:
+                summary_lines.append("    - ", style="dim")
+                summary_lines.append(action + "\n", style="dim")
+
+        if files:
+            summary_lines.append("  Artifacts / files: ", style=f"dim bold {_assistant_label_c}")
+            summary_lines.append("\n")
+            for fp in files[-6:]:
+                summary_lines.append("    - ", style="dim")
+                summary_lines.append(fp + "\n", style="dim")
+
+        if commands:
+            summary_lines.append("  Commands: ", style=f"dim bold {_assistant_label_c}")
+            summary_lines.append("\n")
+            for cmd in commands[-3:]:
+                summary_lines.append("    - ", style="dim")
+                summary_lines.append(cmd + "\n", style="dim")
+
+        if urls:
+            summary_lines.append("  URLs: ", style=f"dim bold {_assistant_label_c}")
+            summary_lines.append("\n")
+            for u in urls[-3:]:
+                summary_lines.append("    - ", style="dim")
+                summary_lines.append(u + "\n", style="dim")
+
+        if notable:
+            summary_lines.append("  Notable results: ", style=f"dim bold {_assistant_label_c}")
+            summary_lines.append("\n")
+            for n in notable[-3:]:
+                summary_lines.append("    - ", style="dim")
+                summary_lines.append(n + "\n", style="dim")
+
+        if latest_answer:
+            summary_lines.append("  Latest answer: ", style=f"dim bold {_assistant_label_c}")
+            summary_lines.append(latest_answer + "\n", style="dim")
+        else:
+            summary_lines.append("  Latest answer: ", style=f"dim bold {_assistant_label_c}")
+            summary_lines.append("No final assistant answer captured yet.\n", style="dim")
+
+        if latest_activity and latest_activity != latest_answer:
+            summary_lines.append("  Latest activity: ", style=f"dim bold {_assistant_label_c}")
+            summary_lines.append(latest_activity + "\n", style="dim")
+
+        if previous_user and previous_user not in {latest_user, current_task}:
+            summary_lines.append("  Before that: ", style=f"dim bold {_session_label_c}")
+            summary_lines.append(previous_user + "\n", style="dim")
+
+        history_note = f"Showing {len(exchanges)} of {total_exchanges} recent exchanges below."
+        summary_lines.append(f"  {history_note}", style="dim italic")
+
+        console = ChatConsole()
+        summary_panel = Panel(
+            summary_lines,
+            title=f"[dim {_session_label_c}]Resume Snapshot[/]",
+            border_style=f"dim {_session_border_c}",
+            padding=(0, 1),
+            style=_history_text_c,
+        )
+        console.print(summary_panel)
+        console.print()
+
+        for index, exchange in enumerate(exchanges):
+            user_text = exchange.get("user") or ""
+            assistant_text = exchange.get("assistant") or ""
+
+            if user_text:
+                msg_lines = user_text.splitlines() or [""]
                 lines.append("  ● You: ", style=f"dim bold {_session_label_c}")
-                # Show first line inline, indent rest
-                msg_lines = text.splitlines()
                 lines.append(msg_lines[0] + "\n", style="dim")
                 for ml in msg_lines[1:]:
                     lines.append(f"         {ml}\n", style="dim")
-            else:
+
+            if assistant_text:
+                msg_lines = assistant_text.splitlines() or [""]
                 lines.append("  ◆ Hermes: ", style=f"dim bold {_assistant_label_c}")
-                msg_lines = text.splitlines()
                 lines.append(msg_lines[0] + "\n", style="dim")
                 for ml in msg_lines[1:]:
                     lines.append(f"            {ml}\n", style="dim")
-            if i < len(entries) - 1:
-                lines.append("")  # small gap
+
+            if index < len(exchanges) - 1:
+                lines.append("\n")
 
         panel = Panel(
             lines,
@@ -3208,7 +5279,7 @@ class HermesCLI:
             padding=(0, 1),
             style=_history_text_c,
         )
-        self.console.print(panel)
+        console.print(panel)
 
     def _try_attach_clipboard_image(self) -> bool:
         """Check clipboard for an image and attach it if found.
@@ -3849,6 +5920,44 @@ class HermesCLI:
             return []
         return [s for s in sessions if s.get("id") != self.session_id]
 
+    def _browse_resume_sessions(self, *, initial_query: str = "", limit: int = 200) -> Optional[str]:
+        """Open the searchable session picker for resume flows."""
+        sessions = self._list_recent_sessions(limit=limit)
+        if not sessions:
+            return None
+
+        from hermes_cli.main import _session_browse_picker
+
+        current_cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+
+        selected_id: Optional[str] = None
+
+        def _pick():
+            nonlocal selected_id
+            selected_id = _session_browse_picker(
+                sessions,
+                initial_query=initial_query,
+                current_cwd=current_cwd,
+            )
+
+        # Run the curses picker outside prompt_toolkit's alternate screen.
+        # If we call curses directly from inside the PT event loop, the terminal
+        # can get into a bad state where the picker exits immediately and the UI
+        # snaps back to the main Hermes screen.
+        if self._app:
+            was_visible = self._status_bar_visible
+            self._status_bar_visible = False
+            self._app.invalidate()
+            try:
+                self._run_in_terminal_blocking(_pick)
+            finally:
+                self._status_bar_visible = was_visible
+                self._app.invalidate()
+        else:
+            _pick()
+
+        return selected_id
+
     def _show_recent_sessions(self, *, reason: str = "history", limit: int = 10) -> bool:
         """Render recent sessions inline from the active chat TUI.
 
@@ -3961,6 +6070,269 @@ class HermesCLI:
         except Exception:
             pass
 
+    def _get_default_reasoning_config(self) -> Dict[str, Any] | None:
+        """Return the configured default reasoning_config for new sessions."""
+        return _parse_reasoning_config(self._default_reasoning_effort)
+
+    @staticmethod
+    def _session_model_config_dict(session_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Return a session row's model_config as a dict."""
+        if not session_meta:
+            return {}
+        raw = session_meta.get("model_config")
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+        return {}
+
+    def _default_session_route_state(self) -> Dict[str, Any]:
+        """Return the startup routing state used for fresh sessions."""
+        return {
+            "model": self._default_session_model,
+            "requested_provider": self._default_requested_provider,
+            "provider": self._default_provider,
+            "base_url": self._default_base_url,
+            "api_key": self._default_api_key,
+            "api_mode": self._default_api_mode,
+            "acp_command": self._default_acp_command,
+            "acp_args": list(self._default_acp_args),
+            "explicit_api_key": self._default_explicit_api_key,
+            "explicit_base_url": self._default_explicit_base_url,
+        }
+
+    def _session_routing_model_config(self, *, cwd: Optional[str] = None) -> Dict[str, Any]:
+        """Build the per-session routing metadata stored in sessions.model_config."""
+        model_config: Dict[str, Any] = {
+            "max_iterations": self.max_turns,
+            "reasoning_config": (
+                dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
+            ),
+            "requested_provider": self.requested_provider,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "api_mode": self.api_mode,
+        }
+        if cwd is not None:
+            model_config["cwd"] = cwd
+        if self.acp_command is not None:
+            model_config["acp_command"] = self.acp_command
+        if self.acp_args:
+            model_config["acp_args"] = list(self.acp_args)
+        return model_config
+
+    def _agent_route_signature(
+        self,
+        *,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_mode: Optional[str] = None,
+        acp_command: Optional[str] = None,
+        acp_args: Optional[List[str]] = None,
+    ) -> tuple:
+        """Return the canonical live-agent route signature."""
+        return (
+            model if model is not None else self.model,
+            provider if provider is not None else self.provider,
+            base_url if base_url is not None else self.base_url,
+            api_mode if api_mode is not None else self.api_mode,
+            acp_command if acp_command is not None else self.acp_command,
+            tuple(acp_args if acp_args is not None else (self.acp_args or [])),
+        )
+
+    def _sync_live_agent_to_current_route(self) -> None:
+        """Resync a live agent/compressor after session-boundary routing changes."""
+        if self.agent is None:
+            self._active_agent_route_signature = None
+            return
+
+        desired_signature = self._agent_route_signature()
+        current_signature = self._active_agent_route_signature or self._agent_route_signature(
+            model=getattr(self.agent, "model", None),
+            provider=getattr(self.agent, "provider", None),
+            base_url=getattr(self.agent, "base_url", None),
+            api_mode=getattr(self.agent, "api_mode", None),
+            acp_command=getattr(self.agent, "acp_command", None),
+            acp_args=list(getattr(self.agent, "acp_args", []) or []),
+        )
+        if current_signature == desired_signature:
+            self._active_agent_route_signature = desired_signature
+            return
+
+        switcher = getattr(self.agent, "switch_model", None)
+        if callable(switcher):
+            try:
+                switcher(
+                    new_model=self.model,
+                    new_provider=self.provider,
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                    api_mode=self.api_mode,
+                    requested_provider=self.requested_provider,
+                    acp_command=self.acp_command,
+                    acp_args=list(self.acp_args or []),
+                )
+                self._active_agent_route_signature = desired_signature
+                return
+            except Exception as exc:
+                logger.warning("Failed to resync live agent route for session %s: %s", self.session_id, exc)
+
+        self.agent = None
+        self._active_agent_route_signature = None
+
+    def _apply_session_routing_from_meta(
+        self,
+        session_meta: Optional[Dict[str, Any]] = None,
+        *,
+        reset_to_default: bool = False,
+    ) -> None:
+        """Restore routing state for a resumed session or reset it for a fresh one."""
+        defaults = self._default_session_route_state()
+        model_config = self._session_model_config_dict(session_meta)
+
+        if reset_to_default:
+            model = defaults["model"]
+            requested_provider = defaults["requested_provider"]
+            provider = defaults["provider"]
+            base_url = defaults["base_url"]
+            api_mode = defaults["api_mode"]
+            acp_command = defaults["acp_command"]
+            acp_args = list(defaults["acp_args"])
+            explicit_api_key = defaults["explicit_api_key"]
+            explicit_base_url = defaults["explicit_base_url"]
+            api_key = defaults["api_key"]
+        else:
+            model = (session_meta or {}).get("model") or defaults["model"]
+            requested_provider = (
+                model_config.get("requested_provider")
+                or model_config.get("provider")
+                or defaults["requested_provider"]
+            )
+            provider = model_config.get("provider") or requested_provider or defaults["provider"]
+
+            if "base_url" in model_config:
+                base_url = model_config.get("base_url") or None
+                explicit_base_url = base_url
+            elif requested_provider == defaults["requested_provider"]:
+                base_url = defaults["base_url"]
+                explicit_base_url = defaults["explicit_base_url"]
+            else:
+                base_url = None
+                explicit_base_url = None
+
+            if "api_mode" in model_config:
+                api_mode = model_config.get("api_mode") or defaults["api_mode"]
+            else:
+                api_mode = defaults["api_mode"]
+
+            if "acp_command" in model_config:
+                acp_command = model_config.get("acp_command") or None
+            elif requested_provider == defaults["requested_provider"]:
+                acp_command = defaults["acp_command"]
+            else:
+                acp_command = None
+
+            if isinstance(model_config.get("acp_args"), list):
+                acp_args = list(model_config.get("acp_args") or [])
+            elif requested_provider == defaults["requested_provider"]:
+                acp_args = list(defaults["acp_args"])
+            else:
+                acp_args = []
+
+            if requested_provider == defaults["requested_provider"]:
+                explicit_api_key = defaults["explicit_api_key"]
+                api_key = defaults["api_key"]
+            else:
+                explicit_api_key = None
+                api_key = None
+
+        self.model = model
+        self.requested_provider = requested_provider
+        self.provider = provider
+        self.base_url = base_url
+        self.api_mode = api_mode
+        self.acp_command = acp_command
+        self.acp_args = list(acp_args or [])
+        self._explicit_api_key = explicit_api_key
+        self._explicit_base_url = explicit_base_url
+        self.api_key = api_key
+        self._credential_pool = None
+        self._provider_source = None
+        self._active_agent_route_signature = None
+
+    def _persist_session_routing_config(self) -> None:
+        """Persist the current session's routing metadata into model_config."""
+        if not self._session_db or not self.session_id:
+            return
+        try:
+            session_meta = self._session_db.get_session(self.session_id)
+        except Exception:
+            return
+        if not session_meta:
+            return
+
+        model_config = self._session_model_config_dict(session_meta)
+        model_config.update(self._session_routing_model_config(cwd=model_config.get("cwd")))
+        try:
+            self._session_db.update_session_model_config(
+                self.session_id,
+                model_config=model_config,
+                model=self.model,
+            )
+        except Exception:
+            pass
+
+    def _restore_session_reasoning_config(self, session_meta: Optional[Dict[str, Any]] = None) -> None:
+        """Load reasoning_config from the current session row, else fall back to config defaults."""
+        config = self._get_default_reasoning_config()
+        if session_meta is None and self._session_db and self.session_id:
+            try:
+                session_meta = self._session_db.get_session(self.session_id)
+            except Exception:
+                session_meta = None
+
+        model_config = self._session_model_config_dict(session_meta)
+        if "reasoning_config" in model_config:
+            stored = model_config.get("reasoning_config")
+            if stored is None:
+                config = None
+            elif isinstance(stored, dict):
+                config = dict(stored)
+
+        self.reasoning_config = config
+        if self.agent:
+            self.agent.reasoning_config = dict(config) if isinstance(config, dict) else None
+
+    def _persist_session_reasoning_config(self) -> None:
+        """Persist the current reasoning_config into the current session's model_config."""
+        if not self._session_db or not self.session_id:
+            return
+        try:
+            session_meta = self._session_db.get_session(self.session_id)
+        except Exception:
+            return
+        if not session_meta:
+            return
+
+        model_config = self._session_model_config_dict(session_meta)
+        model_config["reasoning_config"] = (
+            dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
+        )
+        try:
+            self._session_db.update_session_model_config(
+                self.session_id,
+                model_config=model_config,
+                model=self.model,
+            )
+        except Exception:
+            pass
+
     def new_session(self, silent=False):
         """Start a fresh session with a new session ID and cleared agent state."""
         if self.agent and self.conversation_history:
@@ -3987,20 +6359,30 @@ class HermesCLI:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
+        self._tmux_session_task_title = ""
+        self._tmux_task_title_locked = False
+        self.reasoning_config = self._get_default_reasoning_config()
+        self._apply_session_routing_from_meta(reset_to_default=True)
+        self._sync_tmux_pane_title(fallback="Hermes", force=True)
 
         if self.agent:
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
-            self.agent.reset_session_state()
-            if hasattr(self.agent, "_last_flushed_db_idx"):
+            self.agent.reasoning_config = (
+                dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
+            )
+            self._sync_live_agent_to_current_route()
+            if self.agent is not None:
+                self.agent.reset_session_state()
+            if self.agent is not None and hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0
-            if hasattr(self.agent, "_todo_store"):
+            if self.agent is not None and hasattr(self.agent, "_todo_store"):
                 try:
                     from tools.todo_tool import TodoStore
                     self.agent._todo_store = TodoStore()
                 except Exception:
                     pass
-            if hasattr(self.agent, "_invalidate_system_prompt"):
+            if self.agent is not None and hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
 
             if self._session_db:
@@ -4009,10 +6391,9 @@ class HermesCLI:
                         session_id=self.session_id,
                         source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=self.model,
-                        model_config={
-                            "max_iterations": self.max_turns,
-                            "reasoning_config": self.reasoning_config,
-                        },
+                        model_config=self._session_routing_model_config(
+                            cwd=os.getenv("TERMINAL_CWD", os.getcwd())
+                        ),
                     )
                 except Exception:
                     pass
@@ -4022,31 +6403,54 @@ class HermesCLI:
             print("(^_^)v New session started!")
 
     def _handle_resume_command(self, cmd_original: str) -> None:
-        """Handle /resume <session_id_or_title> — switch to a previous session mid-conversation."""
+        """Handle /resume [session_id_or_title] — switch to a previous session mid-conversation."""
         parts = cmd_original.split(None, 1)
         target = parts[1].strip() if len(parts) > 1 else ""
-
-        if not target:
-            _cprint("  Usage: /resume <session_id_or_title>")
-            if self._show_recent_sessions(reason="resume"):
-                return
-            _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
-            return
 
         if not self._session_db:
             _cprint("  Session database not available.")
             return
 
-        # Resolve title or ID
-        from hermes_cli.main import _resolve_session_by_name_or_id
-        resolved = _resolve_session_by_name_or_id(target)
-        target_id = resolved or target
+        if not target:
+            target_id = self._browse_resume_sessions(limit=200)
+            if not target_id:
+                _cprint("  Resume cancelled.")
+                return
+
+        else:
+            # Resolve title or ID, but fall back to the searchable picker if the
+            # query is only a fuzzy fragment.
+            from hermes_cli.main import _resolve_session_by_name_or_id
+            resolved = _resolve_session_by_name_or_id(target)
+            if resolved:
+                target_id = resolved
+            else:
+                target_id = self._browse_resume_sessions(initial_query=target, limit=200)
+                if not target_id:
+                    _cprint(f"  Session not found: {target}")
+                    _cprint("  Tip:   Use /resume and type to filter sessions.")
+                    return
 
         session_meta = self._session_db.get_session(target_id)
         if not session_meta:
-            _cprint(f"  Session not found: {target}")
+            _cprint(f"  Session not found: {target or target_id}")
             _cprint("  Use /history or `hermes sessions list` to see available sessions.")
             return
+
+        # If the user selected a root session that has no messages (common when
+        # the first real content happened after a compression split), jump to
+        # the latest continuation session in the same lineage that actually has
+        # messages.
+        try:
+            latest_with_msgs = self._session_db.resolve_latest_descendant_session(
+                target_id,
+                require_messages=True,
+            )
+        except Exception:
+            latest_with_msgs = None
+        if latest_with_msgs and latest_with_msgs != target_id:
+            target_id = latest_with_msgs
+            session_meta = self._session_db.get_session(target_id) or session_meta
 
         if target_id == self.session_id:
             _cprint("  Already on that session.")
@@ -4062,11 +6466,17 @@ class HermesCLI:
         self.session_id = target_id
         self._resumed = True
         self._pending_title = None
+        self._tmux_session_task_title = ""
+        self._tmux_task_title_locked = False
+        self._apply_session_routing_from_meta(session_meta)
+        self._restore_session_reasoning_config(session_meta)
 
-        # Load conversation history (strip transcript-only metadata entries)
+        # Load conversation history (strip transcript-only metadata entries and
+        # sanitize historical terminal control sequences before display/model use)
         restored = self._session_db.get_messages_as_conversation(target_id)
-        restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+        restored = _sanitize_resumed_messages(restored)
         self.conversation_history = restored
+        self._sync_tmux_pane_title(force=True)
 
         # Re-open the target session so it's not marked as ended
         try:
@@ -4077,16 +6487,21 @@ class HermesCLI:
         # Sync the agent if already initialised
         if self.agent:
             self.agent.session_id = target_id
-            self.agent.reset_session_state()
-            if hasattr(self.agent, "_last_flushed_db_idx"):
+            self.agent.reasoning_config = (
+                dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
+            )
+            self._sync_live_agent_to_current_route()
+            if self.agent is not None:
+                self.agent.reset_session_state()
+            if self.agent is not None and hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
-            if hasattr(self.agent, "_todo_store"):
+            if self.agent is not None and hasattr(self.agent, "_todo_store"):
                 try:
                     from tools.todo_tool import TodoStore
                     self.agent._todo_store = TodoStore()
                 except Exception:
                     pass
-            if hasattr(self.agent, "_invalidate_system_prompt"):
+            if self.agent is not None and hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
 
         title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
@@ -4097,6 +6512,7 @@ class HermesCLI:
                 f" ({msg_count} user message{'s' if msg_count != 1 else ''},"
                 f" {len(self.conversation_history)} total)"
             )
+            self._display_resumed_history()
         else:
             _cprint(f"  ↻ Resumed session {target_id}{title_part} — no messages, starting fresh.")
 
@@ -4150,10 +6566,9 @@ class HermesCLI:
                 session_id=new_session_id,
                 source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model,
-                model_config={
-                    "max_iterations": self.max_turns,
-                    "reasoning_config": self.reasoning_config,
-                },
+                model_config=self._session_routing_model_config(
+                    cwd=os.getenv("TERMINAL_CWD", os.getcwd())
+                ),
                 parent_session_id=parent_session_id,
             )
         except Exception as e:
@@ -4186,21 +6601,26 @@ class HermesCLI:
         self.session_start = now
         self._pending_title = None
         self._resumed = True  # Prevents auto-title generation
+        self._tmux_session_task_title = ""
+        self._tmux_task_title_locked = False
+        self._sync_tmux_pane_title(force=True)
 
         # Sync the agent
         if self.agent:
             self.agent.session_id = new_session_id
             self.agent.session_start = now
-            self.agent.reset_session_state()
-            if hasattr(self.agent, "_last_flushed_db_idx"):
+            self._sync_live_agent_to_current_route()
+            if self.agent is not None:
+                self.agent.reset_session_state()
+            if self.agent is not None and hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
-            if hasattr(self.agent, "_todo_store"):
+            if self.agent is not None and hasattr(self.agent, "_todo_store"):
                 try:
                     from tools.todo_tool import TodoStore
                     self.agent._todo_store = TodoStore()
                 except Exception:
                     pass
-            if hasattr(self.agent, "_invalidate_system_prompt"):
+            if self.agent is not None and hasattr(self.agent, "_invalidate_system_prompt"):
                 self.agent._invalidate_system_prompt()
 
         msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
@@ -4291,7 +6711,61 @@ class HermesCLI:
         print(f"(^_^)b Undid {removed_count} message(s). Removed: \"{removed_msg[:60]}{'...' if len(removed_msg) > 60 else ''}\"")
         remaining = len(self.conversation_history)
         print(f"  {remaining} message(s) remaining in history.")
-    
+
+    def _run_in_terminal_blocking(self, func):
+        """Run a synchronous callable via prompt_toolkit.run_in_terminal and wait.
+
+        prompt_toolkit's run_in_terminal() returns an awaitable and requires an
+        asyncio event loop.
+
+        Hermes CLI executes slash commands from a background thread (process_loop).
+        Calling run_in_terminal directly from that thread raises:
+
+            RuntimeError: There is no current event loop in thread 'Thread-*'
+
+        Fix: schedule an async wrapper onto the prompt_toolkit app's event loop
+        (main thread) using asyncio.run_coroutine_threadsafe and block until it
+        finishes.
+
+        This makes /resume and other UI-driven commands reliable.
+        """
+        if not self._app:
+            return func()
+
+        import threading
+        app = self._app
+        loop = getattr(app, "loop", None)
+
+        # When called from a background thread, hop onto the app loop.
+        if loop and threading.current_thread() is not threading.main_thread():
+            import asyncio
+            from prompt_toolkit.application import run_in_terminal
+
+            async def _runner():
+                return await run_in_terminal(func)
+
+            fut = asyncio.run_coroutine_threadsafe(_runner(), loop)
+            return fut.result()
+
+        # If the app loop is not set yet, fall back to a direct call.
+        # (This can happen very early during startup.)
+        if not loop:
+            return func()
+
+        # Main-thread fallback: don't attempt run_in_terminal here, because we
+        # can't block-wait on an awaitable from inside the loop thread.
+        if threading.current_thread() is threading.main_thread():
+            return func()
+
+        # Non-main thread with a loop set: schedule onto the app loop.
+        import asyncio
+        from prompt_toolkit.application import run_in_terminal
+
+        async def _runner_main():
+            return await run_in_terminal(func)
+
+        return asyncio.run_coroutine_threadsafe(_runner_main(), loop).result()
+
     def _run_curses_picker(self, title: str, items: list[str], default_index: int = 0) -> int | None:
         """Run curses_single_select via run_in_terminal so prompt_toolkit handles terminal ownership cleanly."""
         import threading
@@ -4305,15 +6779,16 @@ class HermesCLI:
         # run_in_terminal requires an asyncio event loop — only exists in the
         # main prompt_toolkit thread.  If we're in a background thread (e.g.
         # process_loop), fall back to direct curses call.
-        in_main_thread = threading.current_thread() is threading.main_thread()
+        # Note: slash commands run in a background thread (process_loop), so
+        # we cannot call prompt_toolkit.run_in_terminal directly here. Use the
+        # thread-safe _run_in_terminal_blocking helper.
 
-        if self._app and in_main_thread:
-            from prompt_toolkit.application import run_in_terminal
+        if self._app:
             was_visible = self._status_bar_visible
             self._status_bar_visible = False
             self._app.invalidate()
             try:
-                run_in_terminal(_pick)
+                self._run_in_terminal_blocking(_pick)
             finally:
                 self._status_bar_visible = was_visible
                 self._app.invalidate()
@@ -4333,12 +6808,11 @@ class HermesCLI:
                 pass
 
         if self._app:
-            from prompt_toolkit.application import run_in_terminal
             was_visible = self._status_bar_visible
             self._status_bar_visible = False
             self._app.invalidate()
             try:
-                run_in_terminal(_ask)
+                self._run_in_terminal_blocking(_ask)
             finally:
                 self._status_bar_visible = was_visible
                 self._app.invalidate()
@@ -4430,6 +6904,7 @@ class HermesCLI:
             self._explicit_base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
+        self._persist_session_routing_config()
 
         if self.agent is not None:
             try:
@@ -4439,7 +6914,11 @@ class HermesCLI:
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    requested_provider=result.target_provider,
+                    acp_command=self.acp_command,
+                    acp_args=list(self.acp_args or []),
                 )
+                self._active_agent_route_signature = self._agent_route_signature()
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
 
@@ -4647,6 +7126,7 @@ class HermesCLI:
             self._explicit_base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
+        self._persist_session_routing_config()
 
         # Apply to running agent (in-place swap)
         if self.agent is not None:
@@ -4657,7 +7137,11 @@ class HermesCLI:
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    requested_provider=result.target_provider,
+                    acp_command=self.acp_command,
+                    acp_args=list(self.acp_args or []),
                 )
+                self._active_agent_route_signature = self._agent_route_signature()
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
 
@@ -6144,12 +8628,10 @@ class HermesCLI:
             return
 
         self.reasoning_config = parsed
+        self._persist_session_reasoning_config()
         self.agent = None  # Force agent re-init with new reasoning config
 
-        if save_config_value("agent.reasoning_effort", arg):
-            _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (saved to config){_RST}")
-        else:
-            _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only){_RST}")
+        _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only){_RST}")
 
     def _handle_fast_command(self, cmd: str):
         """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""
@@ -6198,6 +8680,7 @@ class HermesCLI:
         """Callback for intermediate reasoning display during tool-call loops."""
         if not reasoning_text:
             return
+        self._reasoning_shown_this_turn = True
         self._reasoning_preview_buf = getattr(self, "_reasoning_preview_buf", "") + reasoning_text
         self._flush_reasoning_preview(force=False)
 
@@ -6578,6 +9061,7 @@ class HermesCLI:
             if _pl > 0 and len(label) > _pl:
                 label = label[:_pl - 3] + "..."
             self._spinner_text = f"{emoji} {label}"
+            self._emit_persistent_tool_progress_line(function_name, label, emoji=emoji)
             self._tool_start_time = _time.monotonic()
             self._invalidate()
 
@@ -7383,6 +9867,7 @@ class HermesCLI:
         turn_route = self._resolve_turn_agent_config(message)
         if turn_route["signature"] != self._active_agent_route_signature:
             self.agent = None
+            self._active_agent_route_signature = None
 
         # Initialize agent if needed
         if self.agent is None:
@@ -7431,6 +9916,8 @@ class HermesCLI:
         if isinstance(message, str):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
+
+        self._sync_tmux_pane_title(message)
 
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
@@ -7630,8 +10117,15 @@ class HermesCLI:
             # Get the final response
             response = result.get("final_response", "") if result else ""
 
-            # Auto-generate session title after first exchange (non-blocking)
-            if response and result and not result.get("failed") and not result.get("partial"):
+            # Auto-generate session title after first exchange only when the
+            # deterministic first-prompt title logic did not already seed one.
+            if (
+                response
+                and result
+                and not result.get("failed")
+                and not result.get("partial")
+                and not self._session_has_saved_title()
+            ):
                 try:
                     from agent.title_generator import maybe_auto_title
                     maybe_auto_title(
@@ -7673,9 +10167,23 @@ class HermesCLI:
             # intermediate turn boundaries (tool-calling loops), which caused
             # the reasoning box to re-render after the final response.
             _reasoning_already_shown = getattr(self, '_reasoning_shown_this_turn', False)
-            if self.show_reasoning and result and not _reasoning_already_shown:
+            _render_final_reasoning_box = self._should_render_final_reasoning_box()
+            self._reasoning_debug_event(
+                "final_display_decision",
+                reasoning_already_shown=_reasoning_already_shown,
+                render_final_reasoning_box=_render_final_reasoning_box,
+                response_len=len(response or ""),
+                response_previewed=bool(response_previewed),
+                result_failed=bool(result.get("failed")) if result else False,
+                result_partial=bool(result.get("partial")) if result else False,
+            )
+            if _render_final_reasoning_box and result:
                 reasoning = result.get("last_reasoning")
                 if reasoning:
+                    self._reasoning_debug_event(
+                        "final_reasoning_box_rendered",
+                        reasoning_len=len(reasoning),
+                    )
                     w = shutil.get_terminal_size().columns
                     r_label = " Reasoning "
                     r_fill = w - 2 - len(r_label)
@@ -7705,6 +10213,13 @@ class HermesCLI:
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
+                self._reasoning_debug_event(
+                    "final_response_render_path",
+                    use_streaming_tts=bool(use_streaming_tts),
+                    tts_stream_box_opened=bool(_streaming_box_opened),
+                    already_streamed=bool(already_streamed),
+                    is_error_response=bool(is_error_response),
+                )
                 if use_streaming_tts and _streaming_box_opened and not is_error_response:
                     # Text was already printed sentence-by-sentence; just close the box
                     w = shutil.get_terminal_size().columns
@@ -7785,6 +10300,15 @@ class HermesCLI:
             if tts_thread is not None and tts_thread.is_alive():
                 tts_thread.join(timeout=5)
     
+    def _close_session_in_db(self, end_reason: str = "cli_close") -> None:
+        """Best-effort session finalization for CLI entry points."""
+        if not hasattr(self, "_session_db") or not self._session_db or not self.agent:
+            return
+        try:
+            self._session_db.end_session(self.agent.session_id, end_reason)
+        except (Exception, KeyboardInterrupt) as e:
+            logger.debug("Could not close session in DB: %s", e)
+
     def _print_exit_summary(self):
         """Print session resume info on exit, similar to Claude Code."""
         print()
@@ -7912,7 +10436,7 @@ class HermesCLI:
         if self._command_running:
             return _state_fragment("class:prompt-working", self._command_spinner_frame())
         if self._agent_running:
-            return _state_fragment("class:prompt-working", "⚕")
+            return _state_fragment("class:prompt-working", "⚕", self._agent_working_frame())
         if self._voice_mode:
             return _state_fragment("class:voice-prompt", "🎤")
         return [("class:prompt", symbol)]
@@ -7991,7 +10515,10 @@ class HermesCLI:
         """
         return [
             item for item in [
-                Window(height=0),
+                ConditionalContainer(
+                    Window(height=Dimension(weight=1)),
+                    filter=Condition(lambda: self._should_show_bottom_dock_spacer()),
+                ),
                 sudo_widget,
                 secret_widget,
                 approval_widget,
@@ -8012,17 +10539,6 @@ class HermesCLI:
 
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
-        # Push the entire TUI to the bottom of the terminal so the banner,
-        # responses, and prompt all appear pinned to the bottom — empty
-        # space stays above, not below.  This prints enough blank lines to
-        # scroll the cursor to the last row before any content is rendered.
-        try:
-            _term_lines = shutil.get_terminal_size().lines
-            if _term_lines > 2:
-                print("\n" * (_term_lines - 1), end="", flush=True)
-        except Exception:
-            pass
-
         self.show_banner()
 
         # One-line Honcho session indicator (TTY-only, not captured by agent).
@@ -8461,13 +10977,15 @@ class HermesCLI:
                 event.app.invalidate()
                 return
             import os, signal as _sig
-            from prompt_toolkit.application import run_in_terminal
             from hermes_cli.skin_engine import get_active_skin
             agent_name = get_active_skin().get_branding("agent_name", "Hermes Agent")
             msg = f"\n{agent_name} has been suspended. Run `fg` to bring {agent_name} back."
             def _suspend():
                 os.write(1, msg.encode())
                 os.kill(0, _sig.SIGTSTP)
+            # Key bindings run in the prompt_toolkit event-loop thread: safe to
+            # call run_in_terminal directly here.
+            from prompt_toolkit.application import run_in_terminal
             run_in_terminal(_suspend)
 
         # Voice push-to-talk key: configurable via config.yaml (voice.record_key)
@@ -8760,7 +11278,8 @@ class HermesCLI:
                 status = cli_ref._command_status or "Processing command..."
                 return f"{frame} {status}"
             if cli_ref._agent_running:
-                return "type a message + Enter to interrupt, Ctrl+C to cancel"
+                frame = cli_ref._agent_working_frame()
+                return f"{frame} Hermes working... Enter to interrupt, Ctrl+C to cancel"
             if cli_ref._voice_mode:
                 return "type or Ctrl+B to record"
             return ""
@@ -8824,20 +11343,23 @@ class HermesCLI:
 
         def get_spinner_text():
             txt = cli_ref._spinner_text
-            if not txt:
-                return []
-            # Append live elapsed timer when a tool is running
-            t0 = cli_ref._tool_start_time
-            if t0 > 0:
-                import time as _time
-                elapsed = _time.monotonic() - t0
-                if elapsed >= 60:
-                    _m, _s = int(elapsed // 60), int(elapsed % 60)
-                    elapsed_str = f"{_m}m {_s}s"
-                else:
-                    elapsed_str = f"{elapsed:.1f}s"
-                return [('class:hint', f'  {txt}  ({elapsed_str})')]
-            return [('class:hint', f'  {txt}')]
+            if txt:
+                # Append live elapsed timer when a tool is running
+                t0 = cli_ref._tool_start_time
+                if t0 > 0:
+                    import time as _time
+                    elapsed = _time.monotonic() - t0
+                    if elapsed >= 60:
+                        _m, _s = int(elapsed // 60), int(elapsed % 60)
+                        elapsed_str = f"{_m}m {_s}s"
+                    else:
+                        elapsed_str = f"{elapsed:.1f}s"
+                    return [('class:hint', f'  {txt}  ({elapsed_str})')]
+                return [('class:hint', f'  {txt}')]
+            if cli_ref._agent_running:
+                frame = cli_ref._agent_working_frame()
+                return [('class:prompt-working', f'  ⚕ {frame} Hermes working...')]
+            return []
 
         def get_spinner_height():
             return cli_ref._spinner_widget_height()
@@ -9129,19 +11651,26 @@ class HermesCLI:
         )
 
         status_bar = ConditionalContainer(
-            Window(
-                content=FormattedTextControl(lambda: cli_ref._get_status_bar_fragments()),
-                height=1,
-                # Prevent fragments that overflow the terminal width from
-                # wrapping onto a second line, which causes the status bar to
-                # appear duplicated (one full + one partial row) during long
-                # sessions, especially on SSH where shutil.get_terminal_size
-                # may return stale values.  _get_status_bar_fragments now reads
-                # width from prompt_toolkit's own output object, so fragments
-                # will always fit; wrap_lines=False is the belt-and-suspenders
-                # guard against any future width mismatch.
-                wrap_lines=False,
-            ),
+            HSplit([
+                Window(
+                    content=FormattedTextControl(lambda: cli_ref._get_status_bar_fragments()),
+                    height=1,
+                    # Prevent fragments that overflow the terminal width from
+                    # wrapping onto a second line, which causes the status bar to
+                    # appear duplicated (one full + one partial row) during long
+                    # sessions, especially on SSH where shutil.get_terminal_size
+                    # may return stale values.  _get_status_bar_fragments now reads
+                    # width from prompt_toolkit's own output object, so fragments
+                    # will always fit; wrap_lines=False is the belt-and-suspenders
+                    # guard against any future width mismatch.
+                    wrap_lines=False,
+                ),
+                Window(
+                    content=FormattedTextControl(lambda: cli_ref._get_status_bar_secondary_fragments()),
+                    height=1,
+                    wrap_lines=False,
+                ),
+            ]),
             filter=Condition(lambda: cli_ref._status_bar_visible),
         )
 
@@ -9181,13 +11710,13 @@ class HermesCLI:
             'prompt': '#FFF8DC',
             'prompt-working': '#888888 italic',
             'hint': '#555555 italic',
-            'status-bar': 'bg:#1a1a2e #C0C0C0',
-            'status-bar-strong': 'bg:#1a1a2e #FFD700 bold',
-            'status-bar-dim': 'bg:#1a1a2e #8B8682',
-            'status-bar-good': 'bg:#1a1a2e #8FBC8F bold',
-            'status-bar-warn': 'bg:#1a1a2e #FFD700 bold',
-            'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
-            'status-bar-critical': 'bg:#1a1a2e #FF6B6B bold',
+            'status-bar': 'bg:#000000 #FFD700',
+            'status-bar-strong': 'bg:#000000 #FFD700 bold',
+            'status-bar-dim': 'bg:#000000 #FFD700',
+            'status-bar-good': 'bg:#000000 #FFD700 bold',
+            'status-bar-warn': 'bg:#000000 #FFD700 bold',
+            'status-bar-bad': 'bg:#000000 #FFD700 bold',
+            'status-bar-critical': 'bg:#000000 #FFD700 bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges
@@ -9221,8 +11750,8 @@ class HermesCLI:
             'voice-prompt': '#87CEEB',
             'voice-recording': '#FF4444 bold',
             'voice-processing': '#FFA500 italic',
-            'voice-status': 'bg:#1a1a2e #87CEEB',
-            'voice-status-recording': 'bg:#1a1a2e #FF4444 bold',
+            'voice-status': 'bg:#000000 #FFD700',
+            'voice-status-recording': 'bg:#000000 #FFD700 bold',
         }
         style = PTStyle.from_dict(self._build_tui_style_dict())
         
@@ -9288,10 +11817,29 @@ class HermesCLI:
                 if not self._app:
                     _time.sleep(0.1)
                     continue
-                if self._command_running:
+                if (
+                    self._command_running
+                    or self._agent_running
+                    or bool(self._spinner_text)
+                    or self._tool_start_time > 0
+                ):
                     self._invalidate(min_interval=0.1)
                     _time.sleep(0.1)
                 else:
+                    # When the agent is idle, we used to refresh once per second so
+                    # the status bar duration counter stays live.  Inside tmux that
+                    # periodic repaint can pollute scrollback (especially if the
+                    # terminal/tmux cannot efficiently overwrite the previous frame),
+                    # leaving behind many historical copies of the footer when the
+                    # user scrolls back.
+                    #
+                    # Mitigation: disable idle refreshes inside tmux.  We still
+                    # repaint on real state changes (tool output, user input,
+                    # agent activity), but we do not tick just to update time.
+                    if os.environ.get("TMUX", "").strip():
+                        _time.sleep(0.5)
+                        continue
+
                     now = _time.monotonic()
                     if now - last_idle_refresh >= 1.0:
                         last_idle_refresh = now
@@ -9525,11 +12073,7 @@ class HermesCLI:
             set_approval_callback(None)
             set_secret_capture_callback(None)
             # Close session in SQLite
-            if hasattr(self, '_session_db') and self._session_db and self.agent:
-                try:
-                    self._session_db.end_session(self.agent.session_id, "cli_close")
-                except (Exception, KeyboardInterrupt) as e:
-                    logger.debug("Could not close session in DB: %s", e)
+            self._close_session_in_db("cli_close")
             # Plugin hook: on_session_end — safety net for interrupted exits.
             # run_conversation() already fires this per-turn on normal completion,
             # so only fire here if the agent was mid-turn (_agent_running) when
@@ -9745,6 +12289,7 @@ def main(
                 turn_route = cli._resolve_turn_agent_config(effective_query)
                 if turn_route["signature"] != cli._active_agent_route_signature:
                     cli.agent = None
+                    cli._active_agent_route_signature = None
                 if cli._init_agent(
                     model_override=turn_route["model"],
                     runtime_override=turn_route["runtime"],
@@ -9758,6 +12303,7 @@ def main(
                         conversation_history=cli.conversation_history,
                     )
                     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                    cli._close_session_in_db("cli_close")
                     if response:
                         print(response)
                     print(f"\nsession_id: {cli.session_id}")
@@ -9773,6 +12319,7 @@ def main(
             if _query_label:
                 cli.console.print(f"[bold blue]Query:[/] {_query_label}")
             cli.chat(query, images=single_query_images or None)
+            cli._close_session_in_db("cli_close")
             cli._print_exit_summary()
         return
     

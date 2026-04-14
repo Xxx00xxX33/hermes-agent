@@ -939,6 +939,39 @@ def get_model_context_length(
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
 
+    # 0b. Config-file override (main model context_length)
+    #
+    # Some OpenAI-compatible endpoints do not expose context metadata in /models.
+    # In those cases, Hermes would otherwise fall back to 128K (probe-down),
+    # which triggers noisy warnings (notably in the compression feasibility
+    # check) even when the user explicitly configured a larger context window.
+    #
+    # If the caller did not pass config_context_length but the request targets
+    # the configured main model+endpoint, honour model.context_length from
+    # ~/.hermes/config.yaml.
+    if base_url and model:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            mcfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            if isinstance(mcfg, dict):
+                cfg_ctx = mcfg.get("context_length")
+                cfg_model = (mcfg.get("default") or mcfg.get("model") or "").strip()
+                cfg_base = str(mcfg.get("base_url") or "").strip()
+                if cfg_ctx and cfg_model and cfg_base:
+                    # Compare on normalized base_url and stripped model IDs.
+                    if _normalize_base_url(base_url) == _normalize_base_url(cfg_base):
+                        if _strip_provider_prefix(model).strip().lower() == _strip_provider_prefix(cfg_model).strip().lower():
+                            try:
+                                cfg_ctx_int = int(cfg_ctx)
+                            except (TypeError, ValueError):
+                                cfg_ctx_int = 0
+                            if cfg_ctx_int > 0:
+                                return cfg_ctx_int
+        except Exception:
+            pass
+
     # Normalise provider-prefixed model names (e.g. "local:model-name" →
     # "model-name") so cache lookups and server queries use the bare ID that
     # local servers actually know about.  Ollama "model:tag" colons are preserved.

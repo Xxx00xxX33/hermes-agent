@@ -525,7 +525,9 @@ Reserve terminal for: builds, installs, git, processes, scripts, network, packag
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
 Background: Set background=true to get a session_id. Two patterns:
   (1) Long-lived processes that never exit (servers, watchers).
-  (2) Long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
+  (2) Independent long-running tasks with notify_on_complete=true — you can keep working on other things and the system auto-notifies you when the task finishes. Great for test suites, builds, deployments, or anything that takes more than a minute.
+Use backgrounding with judgment: prefer it when the command is independent and there is other useful work to do, but keep dependency-blocking or short commands in the foreground.
+On RAM-constrained machines, do not stack multiple memory-heavy or resource-heavy jobs in the background just to be proactive.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
@@ -1720,7 +1722,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background. Two patterns: (1) Long-lived processes that never exit (servers, watchers). (2) Long-running tasks paired with notify_on_complete=true — you can keep working and get notified when the task finishes. For short commands, prefer foreground with a generous timeout instead.",
+                "description": "Run the command in the background. Two patterns: (1) Long-lived processes that never exit (servers, watchers). (2) Independent long-running tasks paired with notify_on_complete=true — you can keep working and get notified when the task finishes. Prefer foreground for short commands, dependency-blocking steps, or when the result is needed right away. On RAM-constrained machines, avoid piling up multiple memory-heavy background jobs just to be proactive.",
                 "default": False
             },
             "timeout": {

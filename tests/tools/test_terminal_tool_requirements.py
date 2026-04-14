@@ -27,6 +27,28 @@ class TestTerminalRequirements:
         assert "terminal" in names
         assert {"read_file", "write_file", "patch", "search_files"}.issubset(names)
 
+    def test_terminal_tool_definition_exposes_background_guidance_for_local_backend(self, monkeypatch):
+        monkeypatch.setattr(
+            terminal_tool_module,
+            "_get_env_config",
+            lambda: {"env_type": "local"},
+        )
+
+        tools = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+        terminal_def = next(tool["function"] for tool in tools if tool["function"]["name"] == "terminal")
+        combined = (
+            terminal_def["description"]
+            + "\n"
+            + terminal_def["parameters"]["properties"]["background"]["description"]
+        ).lower()
+
+        assert "independent" in combined
+        assert "notify_on_complete=true" in combined
+        assert "short commands" in combined
+        assert "dependency-blocking" in combined
+        assert "needed right away" in combined
+        assert any(term in combined for term in ("ram-constrained", "memory-heavy", "resource-heavy"))
+
     def test_terminal_and_execute_code_tools_resolve_for_managed_modal(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
         monkeypatch.setenv("HOME", str(tmp_path))

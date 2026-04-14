@@ -269,6 +269,25 @@ class TestTerminalSchema:
         assert props["notify_on_complete"]["type"] == "boolean"
         assert props["notify_on_complete"]["default"] is False
 
+    def test_tool_description_encodes_background_judgment(self):
+        from tools.terminal_tool import TERMINAL_TOOL_DESCRIPTION
+
+        text = TERMINAL_TOOL_DESCRIPTION.lower()
+        assert "independent" in text
+        assert "short commands" in text and "foreground" in text
+        assert "ram" in text or "memory-heavy" in text or "resource-heavy" in text
+
+    def test_background_param_description_encodes_when_not_to_background(self):
+        from tools.terminal_tool import TERMINAL_SCHEMA
+
+        text = TERMINAL_SCHEMA["parameters"]["properties"]["background"]["description"].lower()
+        assert "independent" in text
+        assert "notify_on_complete=true" in text
+        assert "short commands" in text
+        assert "dependency-blocking" in text
+        assert "needed right away" in text
+        assert "ram-constrained" in text or "memory-heavy" in text or "resource-heavy" in text
+
     def test_handler_passes_notify(self):
         """_handle_terminal passes notify_on_complete to terminal_tool."""
         from tools.terminal_tool import _handle_terminal

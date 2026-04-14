@@ -37,6 +37,21 @@ class TestShouldCompress:
         assert compressor.should_compress(prompt_tokens=90000) is True
         assert compressor.should_compress(prompt_tokens=50000) is False
 
+    def test_large_context_models_use_200k_reference_preemptive_threshold(self):
+        """User policy: 200K-context models compact at 85%. For >200K, keep configured percent."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=300000):
+            c = ContextCompressor(model="test/model", threshold_percent=0.50, quiet_mode=True)
+        assert c.threshold_tokens == 150000
+        assert c.should_compress(prompt_tokens=149999) is False
+        assert c.should_compress(prompt_tokens=150000) is True
+
+    def test_smaller_context_models_keep_percentage_threshold(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=128000):
+            c = ContextCompressor(model="test/model", threshold_percent=0.50, quiet_mode=True)
+        assert c.threshold_tokens == 64000
+        assert c.should_compress(prompt_tokens=63999) is False
+        assert c.should_compress(prompt_tokens=64000) is True
+
 
 
 class TestUpdateFromResponse:
@@ -190,6 +205,66 @@ class TestNonStringContent:
 
         kwargs = mock_call.call_args.kwargs
         assert "temperature" not in kwargs
+
+    def test_summary_defaults_to_active_model_and_reasoning_medium(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=300000):
+            c = ContextCompressor(
+                model="primary-model",
+                provider="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                api_key="sk-primary",
+                quiet_mode=True,
+            )
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        kwargs = mock_call.call_args.kwargs
+        assert kwargs["provider"] == "openrouter"
+        assert kwargs["model"] == "primary-model"
+        assert kwargs["base_url"] == "https://openrouter.ai/api/v1"
+        assert kwargs["api_key"] == "sk-primary"
+        assert kwargs["extra_body"] == {"reasoning": {"enabled": True, "effort": "medium"}}
+
+    def test_summary_retries_without_reasoning_when_unsupported(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=300000):
+            c = ContextCompressor(
+                model="primary-model",
+                provider="custom",
+                base_url="https://example.invalid/v1",
+                api_key="sk-primary",
+                quiet_mode=True,
+            )
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[RuntimeError("unsupported_parameter: reasoning"), mock_response],
+        ) as mock_call:
+            c._generate_summary(messages)
+
+        assert mock_call.call_count == 2
+        first_kwargs = mock_call.call_args_list[0].kwargs
+        second_kwargs = mock_call.call_args_list[1].kwargs
+        assert first_kwargs["extra_body"] == {"reasoning": {"enabled": True, "effort": "medium"}}
+        assert "extra_body" not in second_kwargs
 
 
 class TestSummaryFailureCooldown:
@@ -547,8 +622,8 @@ class TestSummaryTargetRatio:
         """Tail token budget should be threshold_tokens * summary_target_ratio."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 200K * 0.50 threshold * 0.40 ratio = 40K
-        assert c.tail_token_budget == 40_000
+        # threshold_tokens = 170K (200K reference * 0.85)
+        assert c.tail_token_budget == 68_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
@@ -583,12 +658,11 @@ class TestSummaryTargetRatio:
         # 50% of 100K = 50K, but the floor is 64K
         assert c.threshold_tokens == 64_000
 
-    def test_threshold_floor_does_not_apply_above_128k(self):
-        """On large-context models the 50% percentage is used directly."""
+    def test_200k_models_use_200k_reference_preemptive_threshold(self):
+        """User policy: 200K-context models compact preemptively at 85% (170K)."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        # 50% of 200K = 100K, which is above the 64K floor
-        assert c.threshold_tokens == 100_000
+        assert c.threshold_tokens == 170_000
 
     def test_default_protect_last_n_is_20(self):
         """Default protect_last_n should be 20."""

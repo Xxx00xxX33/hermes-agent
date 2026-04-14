@@ -227,6 +227,12 @@ class _MemoryPalaceClient:
         self._timeout = timeout
         self._session = requests.Session()
 
+    def close(self) -> None:
+        try:
+            self._session.close()
+        except Exception:
+            logger.debug("Memory Palace session close failed", exc_info=True)
+
     def _read_headers(self) -> dict[str, str]:
         return {"Accept": "application/json"}
 
@@ -561,6 +567,8 @@ class MemoryPalaceMemoryProvider(MemoryProvider):
         for thread in (self._sync_thread, self._summary_thread):
             if thread and thread.is_alive():
                 thread.join(timeout=5.0)
+        if self._client:
+            self._client.close()
         self._sync_thread = None
         self._summary_thread = None
 

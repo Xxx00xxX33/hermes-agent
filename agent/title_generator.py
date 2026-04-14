@@ -17,13 +17,62 @@ _TITLE_PROMPT = (
     "following exchange. The title should capture the main topic or intent. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
+_TITLE_TASK = "title"
+_REASONING_UNSUPPORTED_NEEDLES = (
+    "reasoning",
+    "unsupported_parameter",
+    "unknown parameter",
+    "unexpected keyword",
+    "extra_body",
+    "extra fields not permitted",
+)
+
+
+def _get_title_reasoning_extra_body() -> Optional[dict]:
+    """Return optional extra_body for title generation reasoning overrides.
+
+    Reads auxiliary.title.reasoning_effort from config.yaml. When unset,
+    returns None so title generation uses the provider default. Unknown values
+    are ignored with a warning.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_constants import parse_reasoning_effort
+
+        config = load_config() or {}
+        auxiliary = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+        title_cfg = auxiliary.get(_TITLE_TASK, {}) if isinstance(auxiliary, dict) else {}
+        if not isinstance(title_cfg, dict):
+            return None
+
+        effort = str(title_cfg.get("reasoning_effort", "") or "").strip()
+        if not effort:
+            return None
+
+        parsed = parse_reasoning_effort(effort)
+        if parsed is None:
+            logger.warning(
+                "Title generation: unknown auxiliary.%s.reasoning_effort '%s'; ignoring",
+                _TITLE_TASK,
+                effort,
+            )
+            return None
+        return {"reasoning": parsed}
+    except Exception as exc:
+        logger.debug("Title generation: could not load reasoning override: %s", exc)
+        return None
+
+
+def _is_reasoning_unsupported_error(err: Exception) -> bool:
+    err_str = str(err).lower()
+    return any(needle in err_str for needle in _REASONING_UNSUPPORTED_NEEDLES)
 
 
 def generate_title(user_message: str, assistant_response: str, timeout: float = 30.0) -> Optional[str]:
     """Generate a session title from the first exchange.
 
-    Uses the auxiliary LLM client (cheapest/fastest available model).
-    Returns the title string or None on failure.
+    Uses the auxiliary title task config (auxiliary.title.*). Returns the title
+    string or None on failure.
     """
     # Truncate long messages to keep the request small
     user_snippet = user_message[:500] if user_message else ""
@@ -34,14 +83,30 @@ def generate_title(user_message: str, assistant_response: str, timeout: float = 
         {"role": "user", "content": f"User: {user_snippet}\n\nAssistant: {assistant_snippet}"},
     ]
 
+    call_kwargs = {
+        "task": _TITLE_TASK,
+        "messages": messages,
+        "max_tokens": 30,
+        "temperature": 0.3,
+        "timeout": timeout,
+    }
+    extra_body = _get_title_reasoning_extra_body()
+    if extra_body:
+        call_kwargs["extra_body"] = extra_body
+
     try:
-        response = call_llm(
-            task="compression",  # reuse compression task config (cheap/fast model)
-            messages=messages,
-            max_tokens=30,
-            temperature=0.3,
-            timeout=timeout,
-        )
+        try:
+            response = call_llm(**call_kwargs)
+        except Exception as reasoning_err:
+            if extra_body and _is_reasoning_unsupported_error(reasoning_err):
+                logger.info(
+                    "Title generation: reasoning override unsupported on configured title model (%s); retrying without reasoning",
+                    reasoning_err,
+                )
+                call_kwargs.pop("extra_body", None)
+                response = call_llm(**call_kwargs)
+            else:
+                raise
         title = (response.choices[0].message.content or "").strip()
         # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
         title = title.strip('"\'')

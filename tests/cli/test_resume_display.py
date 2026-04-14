@@ -26,7 +26,12 @@ def _make_cli(config_overrides=None, env_overrides=None, **kwargs):
             "base_url": "https://openrouter.ai/api/v1",
             "provider": "auto",
         },
-        "display": {"compact": False, "tool_progress": "all", "resume_display": "full"},
+        "display": {
+            "compact": False,
+            "tool_progress": "all",
+            "resume_display": "full",
+            "resume_history_exchanges": 20,
+        },
         "agent": {},
         "terminal": {"env_type": "local"},
     }
@@ -89,6 +94,124 @@ def _tool_call_history():
     ]
 
 
+def _tool_heavy_turn_history():
+    """A single user turn that triggers many assistant tool-only messages before a final answer."""
+    return [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "Please debug why /resume is noisy"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"cli.py"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "file content"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "patch", "arguments": '{"path":"cli.py"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_2", "content": "patch result"},
+        {
+            "role": "assistant",
+            "content": "I found the issue: the resume preview is showing raw intermediate tool-only assistant steps instead of the final useful answer.",
+        },
+    ]
+
+
+def _multi_step_exchange_history():
+    """Multiple user turns where one turn contains many intermediate assistant tool steps."""
+    return [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "Question #1"},
+        {"role": "assistant", "content": "Answer #1"},
+        {"role": "user", "content": "Question #2"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "search_files", "arguments": '{"pattern":"resume"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_a", "content": "matches"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_b",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"cli.py"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_b", "content": "lines"},
+        {"role": "assistant", "content": "Answer #2"},
+        {"role": "user", "content": "Question #3"},
+        {"role": "assistant", "content": "Answer #3"},
+    ]
+
+
+def _latest_turn_only_has_tool_activity_history():
+    """Latest turn has tool activity but no final assistant text yet."""
+    return [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "What changed in /resume?"},
+        {"role": "assistant", "content": "It now collapses noisy tool-only steps into useful exchanges."},
+        {"role": "user", "content": "Can you inspect the latest logs too?"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_logs",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": '{"command":"tail -n 50 app.log"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_logs", "content": "tail output"},
+    ]
+
+
+def _status_summary_history():
+    """Recent answer contains structured status details and the latest user prompt is low-signal."""
+    return [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "Please make /resume show task status instead of raw history."},
+        {
+            "role": "assistant",
+            "content": (
+                "Done:\n"
+                "- Added Resume Snapshot above Previous Conversation.\n"
+                "- Updated tests and refreshed the patch artifact.\n"
+                "Decision:\n"
+                "- The snapshot now falls back to the last substantive user request when the latest prompt is just '继续'.\n"
+                "Limitations:\n"
+                "- pytest is unavailable in this environment, so only py_compile and git diff --check ran here.\n"
+                "Next:\n"
+                "- We can further extract pending work and blockers into a status view."
+            ),
+        },
+        {"role": "user", "content": "继续"},
+    ]
+
+
 def _large_history(n_exchanges=15):
     """Build a history with many exchanges to test truncation."""
     msgs = [{"role": "system", "content": "system prompt"}]
@@ -120,10 +243,10 @@ class TestDisplayResumedHistory:
     """_display_resumed_history() renders a Rich panel with conversation recap."""
 
     def _capture_display(self, cli_obj):
-        """Run _display_resumed_history and capture the Rich console output."""
+        """Run _display_resumed_history and capture the rendered output."""
         buf = StringIO()
-        cli_obj.console.file = buf
-        cli_obj._display_resumed_history()
+        with patch("cli._cprint", side_effect=lambda text: buf.write(text + "\n")):
+            cli_obj._display_resumed_history()
         return buf.getvalue()
 
     def test_simple_history_shows_user_and_assistant(self):
@@ -155,12 +278,93 @@ class TestDisplayResumedHistory:
 
     def test_tool_calls_shown_as_summary(self):
         cli = _make_cli()
-        cli.conversation_history = _tool_call_history()
+        cli.conversation_history = [
+            {"role": "user", "content": "Search for Python tutorials"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": '{"query":"python tutorials"}'},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "web_extract", "arguments": '{"urls":["https://example.com"]}'},
+                    },
+                ],
+            },
+        ]
         output = self._capture_display(cli)
 
         assert "2 tool calls" in output
         assert "web_search" in output
         assert "web_extract" in output
+
+    def test_tool_only_steps_collapsed_when_final_answer_exists(self):
+        cli = _make_cli()
+        cli.conversation_history = _tool_heavy_turn_history()
+        output = self._capture_display(cli)
+
+        assert "Please debug why /resume is noisy" in output
+        assert "I found the issue" in output
+        assert "read_file" not in output
+        assert "patch" not in output
+        assert output.count("Hermes:") == 1
+
+    def test_resume_snapshot_surfaces_latest_focus_and_answer(self):
+        cli = _make_cli()
+        cli.conversation_history = _tool_heavy_turn_history()
+        output = self._capture_display(cli)
+
+        assert "Resume Snapshot" in output
+        assert "Focus:" in output
+        assert "Please debug why /resume is noisy" in output
+        assert "Latest answer:" in output
+        assert "final useful answer" in output
+        assert "Showing 1 of 1 recent exchanges below." in output
+
+    def test_resume_snapshot_shows_latest_activity_when_last_turn_has_only_tools(self):
+        cli = _make_cli(config_overrides={"display": {"resume_history_exchanges": 1}})
+        cli.conversation_history = _latest_turn_only_has_tool_activity_history()
+        output = self._capture_display(cli)
+
+        assert "Resume Snapshot" in output
+        assert "Focus:" in output
+        assert "Can you inspect the latest logs too?" in output
+        assert "Latest answer:" in output
+        assert "collapses noisy tool-only steps" in output
+        assert "Latest activity:" in output
+        assert "1 tool call" in output
+        assert "terminal" in output
+        assert "Pending / blockers:" in output
+        assert "In progress:" in output
+        assert "Key actions:" in output
+        assert "terminal:" in output
+        assert "Commands:" in output
+        assert "tail -n 50 app.log" in output
+        assert "Showing 1 of 2 recent exchanges below." in output
+
+    def test_resume_snapshot_extracts_current_task_completed_pending_and_decision(self):
+        cli = _make_cli()
+        cli.conversation_history = _status_summary_history()
+        output = self._capture_display(cli)
+
+        assert "Current task:" in output
+        assert "Please make /resume show task status instead of raw history." in output
+        assert "Latest prompt:" in output
+        assert "继续" in output
+        assert "Latest decision:" in output
+        assert "falls back to the last substantive user request" in output
+        assert "Decision trace:" in output
+        assert "Completed:" in output
+        assert "Added Resume Snapshot above Previous Conversation." in output
+        assert "Updated tests and refreshed the patch artifact." in output
+        assert "Pending / blockers:" in output
+        assert "pytest is unavailable in this environment" in output
+        assert "We can further extract pending work and blockers into a status view." in output
 
     def test_long_user_message_truncated(self):
         cli = _make_cli()
@@ -209,13 +413,38 @@ class TestDisplayResumedHistory:
 
     def test_large_history_shows_truncation_indicator(self):
         cli = _make_cli()
-        cli.conversation_history = _large_history(n_exchanges=15)
+        cli.conversation_history = _large_history(n_exchanges=25)
         output = self._capture_display(cli)
 
         # Should show "earlier messages" indicator
         assert "earlier messages" in output
         # Last question should still be visible
-        assert "Question #15" in output
+        assert "Question #25" in output
+
+    def test_resume_history_exchanges_config_controls_default_length(self):
+        cli = _make_cli(config_overrides={"display": {"resume_history_exchanges": 3}})
+        cli.conversation_history = _large_history(n_exchanges=5)
+        output = self._capture_display(cli)
+
+        assert "earlier messages" in output
+        assert "Question #1" not in output
+        assert "Question #2" not in output
+        assert "Question #3" in output
+        assert "Question #5" in output
+
+    def test_resume_history_exchanges_counts_user_turns_not_intermediate_assistant_steps(self):
+        cli = _make_cli(config_overrides={"display": {"resume_history_exchanges": 2}})
+        cli.conversation_history = _multi_step_exchange_history()
+        output = self._capture_display(cli)
+
+        assert "Question #1" not in output
+        assert "Answer #1" not in output
+        assert "Question #2" in output
+        assert "Answer #2" in output
+        assert "Question #3" in output
+        assert "Answer #3" in output
+        assert "search_files" not in output
+        assert "read_file" not in output
 
     def test_multimodal_content_handled(self):
         cli = _make_cli()
@@ -329,6 +558,22 @@ class TestDisplayResumedHistory:
         assert "1 tool call" in output
         assert "terminal" in output
 
+    def test_resume_display_strips_ansi_sequences(self):
+        cli = _make_cli()
+        cli.conversation_history = [
+            {"role": "user", "content": "Show the last output"},
+            {
+                "role": "assistant",
+                "content": "\x1b[33mwarning\x1b[0m\n\x1b[1;38;5;79mall good\x1b[0m",
+            },
+        ]
+        output = self._capture_display(cli)
+
+        assert "warning" in output
+        assert "all good" in output
+        assert "?[33mwarning" not in output
+        assert "?[1;38;5;79m" not in output
+
 
 # ── Tests for _preload_resumed_session ──────────────────────────────
 
@@ -349,6 +594,7 @@ class TestPreloadResumedSession:
         cli = _make_cli(resume="nonexistent_session")
         mock_db = MagicMock()
         mock_db.get_session.return_value = None
+        mock_db.resolve_latest_descendant_session.return_value = None
         cli._session_db = mock_db
 
         buf = StringIO()
@@ -364,6 +610,9 @@ class TestPreloadResumedSession:
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "empty_session", "title": None}
         mock_db.get_messages_as_conversation.return_value = []
+        # When a session has no messages, the lineage resolver should fall back
+        # to the same ID.
+        mock_db.resolve_latest_descendant_session.return_value = "empty_session"
         cli._session_db = mock_db
 
         buf = StringIO()
@@ -380,6 +629,7 @@ class TestPreloadResumedSession:
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "good_session", "title": "Test Session"}
         mock_db.get_messages_as_conversation.return_value = messages
+        mock_db.resolve_latest_descendant_session.return_value = "good_session"
         cli._session_db = mock_db
 
         buf = StringIO()
@@ -400,6 +650,7 @@ class TestPreloadResumedSession:
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "reopen_session", "title": None}
         mock_db.get_messages_as_conversation.return_value = messages
+        mock_db.resolve_latest_descendant_session.return_value = "reopen_session"
         mock_conn = MagicMock()
         mock_db._conn = mock_conn
         cli._session_db = mock_db
@@ -414,6 +665,26 @@ class TestPreloadResumedSession:
         assert "ended_at = NULL" in call_args[0][0]
         mock_conn.commit.assert_called_once()
 
+    def test_preload_sanitizes_ansi_from_resumed_history(self):
+        cli = _make_cli(resume="ansi_session")
+        messages = [
+            {"role": "session_meta", "content": "ignore me"},
+            {"role": "user", "content": "show it"},
+            {"role": "assistant", "content": "\x1b[33mwarning\x1b[0m"},
+            {"role": "tool", "content": "\x1b[31mtool output\x1b[0m"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "ansi_session", "title": "ANSI Session"}
+        mock_db.get_messages_as_conversation.return_value = messages
+        mock_db.resolve_latest_descendant_session.return_value = "ansi_session"
+        mock_db._conn = MagicMock()
+        cli._session_db = mock_db
+
+        assert cli._preload_resumed_session() is True
+        assert [m["role"] for m in cli.conversation_history] == ["user", "assistant", "tool"]
+        assert cli.conversation_history[1]["content"] == "warning"
+        assert cli.conversation_history[2]["content"] == "tool output"
+
     def test_singular_user_message_grammar(self):
         """1 user message should say 'message' not 'messages'."""
         cli = _make_cli(resume="one_msg_session")
@@ -424,6 +695,7 @@ class TestPreloadResumedSession:
         mock_db = MagicMock()
         mock_db.get_session.return_value = {"id": "one_msg_session", "title": None}
         mock_db.get_messages_as_conversation.return_value = messages
+        mock_db.resolve_latest_descendant_session.return_value = "one_msg_session"
         mock_db._conn = MagicMock()
         cli._session_db = mock_db
 
@@ -472,6 +744,7 @@ class TestResumeDisplayConfig:
         display = DEFAULT_CONFIG.get("display", {})
         assert "resume_display" in display
         assert display["resume_display"] == "full"
+        assert display["resume_history_exchanges"] == 20
 
     def test_cli_defaults_have_resume_display(self):
         """cli.py load_cli_config defaults include resume_display."""
@@ -486,3 +759,4 @@ class TestResumeDisplayConfig:
 
         display = config.get("display", {})
         assert display.get("resume_display") == "full"
+        assert display.get("resume_history_exchanges") == 20

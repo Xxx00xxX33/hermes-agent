@@ -287,3 +287,34 @@ class TestCliBrandingHelpers:
         assert overrides["clarify-title"] == f"{skin.get_color('banner_title')} bold"
         assert overrides["sudo-prompt"] == f"{skin.get_color('ui_error')} bold"
         assert overrides["approval-title"] == f"{skin.get_color('ui_warn')} bold"
+
+    def test_slate_status_bar_uses_bright_gold_high_contrast_palette(self):
+        from hermes_cli.skin_engine import set_active_skin, get_prompt_toolkit_style_overrides
+
+        set_active_skin("slate")
+        overrides = get_prompt_toolkit_style_overrides()
+        assert overrides["status-bar"] == "bg:#000000 #FFD700"
+        assert overrides["status-bar-strong"] == "bg:#000000 #FFD700 bold"
+        assert overrides["status-bar-dim"] == "bg:#000000 #FFD700"
+        assert overrides["status-bar-good"] == "bg:#000000 #FFD700 bold"
+        assert overrides["status-bar-warn"] == "bg:#000000 #FFD700 bold"
+        assert overrides["status-bar-bad"] == "bg:#000000 #FFD700 bold"
+        assert overrides["status-bar-critical"] == "bg:#000000 #FFD700 bold"
+        assert overrides["voice-status"] == "bg:#000000 #FFD700"
+        assert overrides["voice-status-recording"] == "bg:#000000 #FFD700 bold"
+        assert overrides["completion-menu.completion.current"] == "bg:#2A2110 #FFD700"
+
+    def test_default_skin_status_bar_fallbacks_stay_high_contrast(self):
+        from hermes_cli.skin_engine import set_active_skin, get_prompt_toolkit_style_overrides
+
+        set_active_skin("default")
+        overrides = get_prompt_toolkit_style_overrides()
+        assert overrides["status-bar"] == "bg:#000000 #FFD700"
+        assert overrides["status-bar-strong"] == "bg:#000000 #FFD700 bold"
+        assert overrides["status-bar-dim"] == "bg:#000000 #FFD700"
+        assert overrides["status-bar-good"] == "bg:#000000 #FFD700 bold"
+        assert overrides["status-bar-warn"] == "bg:#000000 #FFD700 bold"
+        assert overrides["status-bar-bad"] == "bg:#000000 #FFD700 bold"
+        assert overrides["status-bar-critical"] == "bg:#000000 #FFD700 bold"
+        assert overrides["voice-status"] == "bg:#000000 #FFD700"
+        assert overrides["voice-status-recording"] == "bg:#000000 #FFD700 bold"
