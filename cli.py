@@ -2268,6 +2268,37 @@ class HermesCLI:
 
         return False
 
+    def _try_persist_session_task_title(self, title: str) -> bool:
+        candidate = self._summarize_prompt_task(title, max_len=96)
+        if not candidate or self._is_low_signal_prompt_task(candidate):
+            return False
+
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "session_id", None)
+        if not session_db or not session_id:
+            return False
+
+        try:
+            if session_db.set_session_title(session_id, candidate):
+                return True
+        except Exception:
+            pass
+
+        ensure_session = getattr(session_db, "ensure_session", None)
+        if callable(ensure_session):
+            try:
+                ensure_session(
+                    session_id,
+                    source="cli",
+                    model=getattr(self, "model", None),
+                )
+                if session_db.set_session_title(session_id, candidate):
+                    return True
+            except Exception:
+                pass
+
+        return False
+
     def _persist_session_task_title(self, title: str) -> None:
         candidate = self._summarize_prompt_task(title, max_len=96)
         if not candidate or self._is_low_signal_prompt_task(candidate):
@@ -2275,14 +2306,8 @@ class HermesCLI:
         if self._session_has_saved_title():
             return
 
-        session_db = getattr(self, "_session_db", None)
-        session_id = getattr(self, "session_id", None)
-        if session_db and session_id:
-            try:
-                if session_db.set_session_title(session_id, candidate):
-                    return
-            except Exception:
-                pass
+        if self._try_persist_session_task_title(candidate):
+            return
 
         if not getattr(self, "_pending_title", None):
             self._pending_title = candidate
@@ -2298,6 +2323,8 @@ class HermesCLI:
         if pending_title and not self._is_low_signal_prompt_task(pending_title):
             self._tmux_session_task_title = pending_title
             self._tmux_task_title_locked = True
+            if self._try_persist_session_task_title(pending_title):
+                self._pending_title = None
             return pending_title
 
         session_db = getattr(self, "_session_db", None)
@@ -2322,6 +2349,7 @@ class HermesCLI:
             if candidate and not self._is_low_signal_prompt_task(candidate):
                 self._tmux_session_task_title = candidate
                 self._tmux_task_title_locked = True
+                self._try_persist_session_task_title(candidate)
                 return candidate
 
         fallback_title = self._summarize_prompt_task(fallback, max_len=96)
@@ -4304,12 +4332,11 @@ class HermesCLI:
 
             if self._pending_title and self._session_db:
                 try:
-                    self._session_db.set_session_title(self.session_id, self._pending_title)
-                    _cprint(f"  Session title applied: {self._pending_title}")
-                    self._pending_title = None
+                    if self._try_persist_session_task_title(self._pending_title):
+                        _cprint(f"  Session title applied: {self._pending_title}")
+                        self._pending_title = None
                 except (ValueError, Exception) as e:
                     _cprint(f"  Could not apply pending title: {e}")
-                    self._pending_title = None
             return True
         except Exception as e:
             ChatConsole().print(f"[bold red]Failed to initialize agent: {e}[/]")

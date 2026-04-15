@@ -870,6 +870,40 @@ class TestCLITmuxTaskTitle:
 
         assert cli_obj._get_saved_tmux_task_title() == "检查hermes4实例上下文压缩 #5"
 
+    def test_get_saved_tmux_task_title_backfills_recovered_history_title_to_db(self):
+        cli_obj = _make_cli()
+        cli_obj.conversation_history = [
+            {
+                "role": "user",
+                "content": "tmux在右下角实时显示当前任务标题，不要显示时间和日期",
+            }
+        ]
+        cli_obj._session_db = MagicMock()
+        cli_obj._session_db.get_session_title.return_value = None
+        cli_obj._session_db.set_session_title.return_value = True
+
+        title = cli_obj._get_saved_tmux_task_title()
+
+        assert title == "tmux在右下角实时显示当前任务标题"
+        cli_obj._session_db.set_session_title.assert_called_once_with("session-1", title)
+
+    def test_persist_session_task_title_retries_after_ensure_session_when_row_missing(self):
+        cli_obj = _make_cli()
+        cli_obj.conversation_history = []
+        cli_obj._session_db = MagicMock()
+        cli_obj._session_db.get_session_title.return_value = None
+        cli_obj._session_db.set_session_title.side_effect = [False, True]
+
+        cli_obj._persist_session_task_title("tmux在右下角实时显示当前任务标题，不要显示时间和日期")
+
+        cli_obj._session_db.ensure_session.assert_called_once_with(
+            "session-1",
+            source="cli",
+            model=cli_obj.model,
+        )
+        assert cli_obj._session_db.set_session_title.call_count == 2
+        assert cli_obj._pending_title is None
+
     def test_get_prompt_task_title_locks_to_first_prompt_per_session(self):
         cli_obj = _make_cli()
         cli_obj.conversation_history = []
