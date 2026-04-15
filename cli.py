@@ -2133,11 +2133,29 @@ class HermesCLI:
         return score
 
     @staticmethod
+    def _is_invalid_tmux_task_text(text: Any) -> bool:
+        import re
+
+        raw = " ".join(str(text or "").split()).strip()
+        if not raw:
+            return False
+
+        if re.match(r"^\[\s*context\s+compaction\s*\]", raw, re.IGNORECASE):
+            return True
+        if re.match(r"^<\s*(?:magicmock|mock|asyncmock|noncallablemagicmock)\b", raw, re.IGNORECASE):
+            return True
+        if re.match(r"^<[^>]+\bobject\s+at\s+0x[0-9a-f]+>$", raw, re.IGNORECASE):
+            return True
+        return False
+
+    @staticmethod
     def _summarize_prompt_task(content: Any, *, max_len: int = 96) -> str:
         import re
 
         safe_max_len = max(4, int(max_len or 96))
         raw_text = HermesCLI._extract_prompt_task_text(content)
+        if HermesCLI._is_invalid_tmux_task_text(raw_text):
+            return ""
         clauses = []
         lines = []
         order = 0
@@ -2189,6 +2207,8 @@ class HermesCLI:
 
         text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
         text = " ".join(text.split()).strip()
+        if HermesCLI._is_invalid_tmux_task_text(text):
+            return ""
         if len(text) > safe_max_len:
             text = text[: safe_max_len - 3].rstrip() + "..."
         return text
@@ -2196,6 +2216,9 @@ class HermesCLI:
     @staticmethod
     def _is_low_signal_prompt_task(text: str) -> bool:
         import re
+
+        if HermesCLI._is_invalid_tmux_task_text(text):
+            return True
 
         low_signal_prompts = {
             "continue",
@@ -2406,6 +2429,8 @@ class HermesCLI:
 
         # Normalize and enforce width constraints.
         title = " ".join(title.split()).strip().strip(" \t\r\n,，。！？!?:：;；/|-")
+        if self._is_invalid_tmux_task_text(title):
+            return ""
         title = self._truncate_tmux_task_title(title)
         return title
 

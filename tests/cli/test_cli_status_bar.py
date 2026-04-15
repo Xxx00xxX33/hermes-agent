@@ -837,6 +837,39 @@ class TestCLITmuxTaskTitle:
 
         assert title == "资源回收机制"
 
+    def test_summarize_prompt_task_rejects_context_compaction_summary_prefix(self):
+        cli_obj = _make_cli()
+
+        title = cli_obj._summarize_prompt_task(
+            "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted to save context space. "
+            "The summary below describes work that was already completed, and the current session state may still reflect that work."
+        )
+
+        assert title == ""
+
+    def test_summarize_prompt_task_rejects_python_mock_repr(self):
+        cli_obj = _make_cli()
+
+        title = cli_obj._summarize_prompt_task(
+            "<MagicMock name='_session_title()' id='133736162728528'>"
+        )
+
+        assert title == ""
+
+    def test_get_saved_tmux_task_title_skips_compaction_history_and_prefers_session_title(self):
+        cli_obj = _make_cli()
+        cli_obj.conversation_history = [
+            {
+                "role": "user",
+                "content": "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted to save context space. "
+                "The summary below describes work that was already completed.",
+            }
+        ]
+        cli_obj._session_db = MagicMock()
+        cli_obj._session_db.get_session_title.return_value = "检查hermes4实例上下文压缩 #5"
+
+        assert cli_obj._get_saved_tmux_task_title() == "检查hermes4实例上下文压缩 #5"
+
     def test_get_prompt_task_title_locks_to_first_prompt_per_session(self):
         cli_obj = _make_cli()
         cli_obj.conversation_history = []
