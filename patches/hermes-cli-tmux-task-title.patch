@@ -1,41 +1,5 @@
-diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
-index eabcd0f9..b2cac121 100644
---- a/tests/cli/test_cli_status_bar.py
-+++ b/tests/cli/test_cli_status_bar.py
-@@ -2,15 +2,30 @@ from datetime import datetime, timedelta
- from types import SimpleNamespace
- from unittest.mock import MagicMock, patch
- 
--from cli import HermesCLI
-+import pytest
-+
-+from cli import HermesCLI, _ACCENT, _RST
- 
- 
- def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
-     cli_obj = HermesCLI.__new__(HermesCLI)
-     cli_obj.model = model
-+    cli_obj.provider = "anthropic" if model.startswith("anthropic/") else None
-+    cli_obj.requested_provider = cli_obj.provider
-+    cli_obj._provider_source = ""
-     cli_obj.session_start = datetime.now() - timedelta(minutes=14, seconds=32)
-     cli_obj.conversation_history = [{"role": "user", "content": "hi"}]
-     cli_obj.agent = None
-+    cli_obj.reasoning_config = None
-+    cli_obj._status_bar_visible = False
-+    cli_obj._background_tasks = {}
-+    cli_obj._background_task_counter = 0
-+    cli_obj._pending_title = None
-+    cli_obj._session_db = None
-+    cli_obj.session_id = "session-1"
-+    cli_obj._tmux_pane_title = ""
-+    cli_obj._tmux_session_task_title = ""
-+    cli_obj._tmux_task_title_locked = False
-     return cli_obj
- 
- 
 diff --git a/agent/title_generator.py b/agent/title_generator.py
-index 741fe8b0..80b5386a 100644
+index d6ed9200..80b5386a 100644
 --- a/agent/title_generator.py
 +++ b/agent/title_generator.py
 @@ -17,13 +17,62 @@ _TITLE_PROMPT = (
@@ -120,7 +84,7 @@ index 741fe8b0..80b5386a 100644
 +
      try:
 -        response = call_llm(
--            task="compression",  # reuse compression task config (cheap/fast model)
+-            task="title_generation",
 -            messages=messages,
 -            max_tokens=30,
 -            temperature=0.3,
@@ -141,6 +105,171 @@ index 741fe8b0..80b5386a 100644
          title = (response.choices[0].message.content or "").strip()
          # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
          title = title.strip('"\'')
+diff --git a/cli.py b/cli.py
+index 0ed2d323..9ac4125d 100644
+--- a/cli.py
++++ b/cli.py
+@@ -2075,60 +3294,110 @@ class HermesCLI:
+             # actually renders, causing the fragments to overflow to a second
+             # line and produce duplicated status bar rows over long sessions.
+             width = self._get_tui_terminal_width()
+-            duration_label = snapshot["duration"]
+-
+-            if width < 52:
+-                frags = [
+-                    ("class:status-bar", " ⚕ "),
+-                    ("class:status-bar-strong", snapshot["model_short"]),
+-                    ("class:status-bar-dim", " · "),
+-                    ("class:status-bar-dim", duration_label),
+-                    ("class:status-bar", " "),
+-                ]
++            provider_label = snapshot.get("provider_label") or snapshot.get("provider") or "unknown"
++            reasoning_label, reasoning_style = self._get_status_bar_reasoning_label(
++                getattr(self, "reasoning_config", None),
++                compact=width < 52,
++            )
++            progress_label, progress_style = self._get_status_bar_progress_label(self._get_status_bar_todo_snapshot())
++            background_label, background_style = self._get_status_bar_background_task_label(
++                self._get_status_bar_background_task_snapshot()
++            )
++
++            if width < 76:
++                separator = " · "
+             else:
+-                percent = snapshot["context_percent"]
+-                percent_label = f"{percent}%" if percent is not None else "--"
+-                if width < 76:
+-                    frags = [
+-                        ("class:status-bar", " ⚕ "),
+-                        ("class:status-bar-strong", snapshot["model_short"]),
+-                        ("class:status-bar-dim", " · "),
+-                        (self._status_bar_context_style(percent), percent_label),
+-                        ("class:status-bar-dim", " · "),
+-                        ("class:status-bar-dim", duration_label),
+-                        ("class:status-bar", " "),
+-                    ]
+-                else:
+-                    if snapshot["context_length"]:
+-                        ctx_total = _format_context_length(snapshot["context_length"])
+-                        ctx_used = format_token_count_compact(snapshot["context_tokens"])
+-                        context_label = f"{ctx_used}/{ctx_total}"
+-                    else:
+-                        context_label = "ctx --"
++                separator = " │ "
++
++            frags = [
++                ("class:status-bar", " ⚕ "),
++                ("class:status-bar-strong", snapshot["model_short"]),
++            ]
++            optional_groups = []
++            if progress_label:
++                optional_groups.append([
++                    ("class:status-bar-dim", separator),
++                    (progress_style, progress_label),
++                ])
++            optional_groups.append([
++                ("class:status-bar-dim", separator),
++                ("class:status-bar-dim", provider_label),
++            ])
++            optional_groups.append([
++                ("class:status-bar-dim", separator),
++                (reasoning_style, reasoning_label),
++            ])
++            if background_label:
++                optional_groups.append([
++                    ("class:status-bar-dim", separator),
++                    (background_style, background_label),
++                ])
++            optional_groups.append([("class:status-bar", " ")])
++
++            return self._fit_status_bar_fragments_with_optional_groups(frags, optional_groups, width)
++        except Exception:
++            return [("class:status-bar", f" {self._build_status_bar_text()} ")]
+ 
+-                    bar_style = self._status_bar_context_style(percent)
+-                    frags = [
+-                        ("class:status-bar", " ⚕ "),
+-                        ("class:status-bar-strong", snapshot["model_short"]),
+-                        ("class:status-bar-dim", " │ "),
+-                        ("class:status-bar-dim", context_label),
+-                        ("class:status-bar-dim", " │ "),
+-                        (bar_style, self._build_context_bar(percent)),
+-                        ("class:status-bar-dim", " "),
+-                        (bar_style, percent_label),
+-                        ("class:status-bar-dim", " │ "),
+-                        ("class:status-bar-dim", duration_label),
+-                        ("class:status-bar", " "),
+-                    ]
++    def _get_status_bar_secondary_fragments(self):
++        if not self._status_bar_visible or getattr(self, '_model_picker_state', None):
++            return []
++        try:
++            snapshot = self._get_status_bar_snapshot()
++            width = self._get_tui_terminal_width()
++            percent = snapshot["context_percent"]
++            percent_label = f"{percent}%" if percent is not None else "--"
++            context_label = self._get_status_bar_context_label(snapshot)
++            bar_style = self._status_bar_context_style(percent)
++            todo_items = self._get_status_bar_todo_items()
++            active_todo_items = self._get_status_bar_active_todo_items()
++            saved_task_title = self._get_status_bar_saved_task_title()
++            if active_todo_items:
++                task_fragments = self._get_status_bar_active_task_fragments(
++                    active_todo_items,
++                    compact=width < 76,
++                )
++            elif saved_task_title:
++                task_fragments = [("class:status-bar-strong", saved_task_title)]
++            elif todo_items:
++                task_fragments = self._get_status_bar_named_task_fragments(
++                    self._select_status_bar_fallback_todo_item(todo_items)
++                )
++            else:
++                task_fragments = self._get_status_bar_active_task_fragments(
++                    None,
++                    compact=width < 76,
++                )
+ 
+-            total_width = sum(self._status_bar_display_width(text) for _, text in frags)
+-            if total_width > width:
+-                plain_text = "".join(text for _, text in frags)
+-                trimmed = self._trim_status_bar_text(plain_text, width)
+-                return [("class:status-bar", trimmed)]
+-            return frags
++            primary_frags = [
++                ("class:status-bar", " "),
++                *task_fragments,
++            ]
++            optional_groups = []
++            if width >= 76:
++                optional_groups.append([
++                    ("class:status-bar-dim", " │ "),
++                    ("class:status-bar-dim", context_label),
++                ])
++                optional_groups.append([
++                    ("class:status-bar-dim", " │ "),
++                    (bar_style, self._build_context_bar(percent)),
++                    ("class:status-bar-dim", " "),
++                    (bar_style, percent_label),
++                ])
++                if snapshot["compressions"]:
++                    optional_groups.append([
++                        ("class:status-bar-dim", " │ "),
++                        ("class:status-bar-dim", f"cmp {snapshot['compressions']}"),
++                    ])
++            optional_groups.append([("class:status-bar", " ")])
++
++            return self._fit_status_bar_fragments_with_optional_groups(
++                primary_frags,
++                optional_groups,
++                width,
++            )
+         except Exception:
+-            return [("class:status-bar", f" {self._build_status_bar_text()} ")]
++            return []
+ 
+     def _normalize_model_for_provider(self, resolved_provider: str) -> bool:
+         """Normalize provider-specific model IDs and routing."""
 diff --git a/tests/agent/test_title_generator.py b/tests/agent/test_title_generator.py
 index 98fb8fb2..4497c20f 100644
 --- a/tests/agent/test_title_generator.py
@@ -208,112 +337,39 @@ index 98fb8fb2..4497c20f 100644
      def test_strips_quotes(self):
          mock_response = MagicMock()
          mock_response.choices = [MagicMock()]
-
-diff --git a/cli.py b/cli.py
-index ac6a7632..59864a68 100644
---- a/cli.py
-+++ b/cli.py
-@@ -2132,12 +2132,30 @@ class HermesCLI:
-             score -= 12
-         return score
- 
-+    @staticmethod
-+    def _is_invalid_tmux_task_text(text: Any) -> bool:
-+        import re
-+
-+        raw = " ".join(str(text or "").split()).strip()
-+        if not raw:
-+            return False
-+
-+        if re.match(r"^\[\s*context\s+compaction\s*\]", raw, re.IGNORECASE):
-+            return True
-+        if re.match(r"^<\s*(?:magicmock|mock|asyncmock|noncallablemagicmock)\b", raw, re.IGNORECASE):
-+            return True
-+        if re.match(r"^<[^>]+\bobject\s+at\s+0x[0-9a-f]+>$", raw, re.IGNORECASE):
-+            return True
-+        return False
-+
-     @staticmethod
-     def _summarize_prompt_task(content: Any, *, max_len: int = 96) -> str:
-         import re
- 
-         safe_max_len = max(4, int(max_len or 96))
-         raw_text = HermesCLI._extract_prompt_task_text(content)
-+        if HermesCLI._is_invalid_tmux_task_text(raw_text):
-+            return ""
-         clauses = []
-         lines = []
-         order = 0
-@@ -2189,6 +2207,8 @@ class HermesCLI:
- 
-         text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
-         text = " ".join(text.split()).strip()
-+        if HermesCLI._is_invalid_tmux_task_text(text):
-+            return ""
-         if len(text) > safe_max_len:
-             text = text[: safe_max_len - 3].rstrip() + "..."
-         return text
-@@ -2197,6 +2217,9 @@ class HermesCLI:
-     def _is_low_signal_prompt_task(text: str) -> bool:
-         import re
- 
-+        if HermesCLI._is_invalid_tmux_task_text(text):
-+            return True
-+
-         low_signal_prompts = {
-             "continue",
-             "please continue",
-@@ -2406,6 +2429,8 @@ class HermesCLI:
- 
-         # Normalize and enforce width constraints.
-         title = " ".join(title.split()).strip().strip(" \t\r\n,，。！？!?:：;；/|-")
-+        if self._is_invalid_tmux_task_text(title):
-+            return ""
-         title = self._truncate_tmux_task_title(title)
-         return title
- 
-
 diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
-index ead2dc05..7628434a 100644
+index eabcd0f9..c46d43ea 100644
 --- a/tests/cli/test_cli_status_bar.py
 +++ b/tests/cli/test_cli_status_bar.py
-@@ -837,6 +837,39 @@ class TestCLITmuxTaskTitle:
+@@ -2,15 +2,30 @@ from datetime import datetime, timedelta
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
  
-         assert title == "资源回收机制"
+-from cli import HermesCLI
++import pytest
++
++from cli import HermesCLI, _ACCENT, _RST
  
-+    def test_summarize_prompt_task_rejects_context_compaction_summary_prefix(self):
-+        cli_obj = _make_cli()
-+
-+        title = cli_obj._summarize_prompt_task(
-+            "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted to save context space. "
-+            "The summary below describes work that was already completed, and the current session state may still reflect that work."
-+        )
-+
-+        assert title == ""
-+
-+    def test_summarize_prompt_task_rejects_python_mock_repr(self):
-+        cli_obj = _make_cli()
-+
-+        title = cli_obj._summarize_prompt_task(
-+            "<MagicMock name='_session_title()' id='133736162728528'>"
-+        )
-+
-+        assert title == ""
-+
-+    def test_get_saved_tmux_task_title_skips_compaction_history_and_prefers_session_title(self):
-+        cli_obj = _make_cli()
-+        cli_obj.conversation_history = [
-+            {
-+                "role": "user",
-+                "content": "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted to save context space. "
-+                "The summary below describes work that was already completed.",
-+            }
-+        ]
-+        cli_obj._session_db = MagicMock()
-+        cli_obj._session_db.get_session_title.return_value = "检查hermes4实例上下文压缩 #5"
-+
-+        assert cli_obj._get_saved_tmux_task_title() == "检查hermes4实例上下文压缩 #5"
-+
-     def test_get_prompt_task_title_locks_to_first_prompt_per_session(self):
-         cli_obj = _make_cli()
-         cli_obj.conversation_history = []
+ 
+ def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
+     cli_obj = HermesCLI.__new__(HermesCLI)
+     cli_obj.model = model
++    cli_obj.provider = "anthropic" if model.startswith("anthropic/") else None
++    cli_obj.requested_provider = cli_obj.provider
++    cli_obj._provider_source = ""
+     cli_obj.session_start = datetime.now() - timedelta(minutes=14, seconds=32)
+     cli_obj.conversation_history = [{"role": "user", "content": "hi"}]
+     cli_obj.agent = None
++    cli_obj.reasoning_config = None
++    cli_obj._status_bar_visible = False
++    cli_obj._background_tasks = {}
++    cli_obj._background_task_counter = 0
++    cli_obj._pending_title = None
++    cli_obj._session_db = None
++    cli_obj.session_id = "session-1"
++    cli_obj._tmux_pane_title = ""
++    cli_obj._tmux_session_task_title = ""
++    cli_obj._tmux_task_title_locked = False
+     return cli_obj
+ 
+ 
