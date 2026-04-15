@@ -4,7 +4,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-BASE_REF="${HERMES_LOCAL_CUSTOMIZATION_BASE_REF:-upstream/main}"
+if [[ -n "${HERMES_LOCAL_CUSTOMIZATION_BASE_REF:-}" ]]; then
+  BASE_REF="$HERMES_LOCAL_CUSTOMIZATION_BASE_REF"
+else
+  BASE_REF="$(python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" resolve-base-ref)"
+fi
 
 MODE="apply"
 STRICT_CHECK=0

@@ -41,17 +41,21 @@ index 00000000..c3060a20
 +fi
 diff --git a/patches/apply-hermes-local-customizations.sh b/patches/apply-hermes-local-customizations.sh
 new file mode 100755
-index 00000000..d9ff6c14
+index 00000000..d884bfc2
 --- /dev/null
 +++ b/patches/apply-hermes-local-customizations.sh
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,159 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
 +REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 +cd "$REPO_ROOT"
 +
-+BASE_REF="${HERMES_LOCAL_CUSTOMIZATION_BASE_REF:-upstream/main}"
++if [[ -n "${HERMES_LOCAL_CUSTOMIZATION_BASE_REF:-}" ]]; then
++  BASE_REF="$HERMES_LOCAL_CUSTOMIZATION_BASE_REF"
++else
++  BASE_REF="$(python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" resolve-base-ref)"
++fi
 +
 +MODE="apply"
 +STRICT_CHECK=0
@@ -331,10 +335,10 @@ index 00000000..5e07239a
 +echo "Ensured tmux scroll/history keys and task-title status-right in $TMUX_CONF"
 diff --git a/patches/local_customization_manifest.py b/patches/local_customization_manifest.py
 new file mode 100644
-index 00000000..512648a0
+index 00000000..bd0c8909
 --- /dev/null
 +++ b/patches/local_customization_manifest.py
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,338 @@
 +from __future__ import annotations
 +
 +import argparse
@@ -469,6 +473,43 @@ index 00000000..512648a0
 +    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 +
 +
++def git_ref_exists(repo_root: Path, ref: str) -> bool:
++    proc = subprocess.run(
++        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
++        cwd=repo_root,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    return proc.returncode == 0
++
++
++def resolve_base_ref(repo_root: Path, preferred: str = "upstream/main") -> str:
++    candidates: list[str] = []
++
++    def add_candidate(ref: str) -> None:
++        if ref and ref not in candidates:
++            candidates.append(ref)
++
++    add_candidate(preferred)
++    remote, sep, branch = preferred.partition("/")
++    if sep:
++        if remote != "upstream":
++            add_candidate(f"upstream/{branch}")
++        if remote != "origin":
++            add_candidate(f"origin/{branch}")
++
++    for candidate in candidates:
++        if git_ref_exists(repo_root, candidate):
++            return candidate
++
++    joined = ", ".join(candidates) or preferred
++    raise RuntimeError(
++        f"Unable to resolve base ref from available candidates: {joined}. "
++        "Set HERMES_LOCAL_CUSTOMIZATION_BASE_REF explicitly if needed."
++    )
++
++
 +def tracked_modified_files(repo_root: Path) -> list[str]:
 +    unstaged = _git_lines(repo_root, "diff", "--name-only", "--")
 +    staged = _git_lines(repo_root, "diff", "--name-only", "--cached", "--")
@@ -568,6 +609,15 @@ index 00000000..512648a0
 +    subparsers = parser.add_subparsers(dest="command", required=True)
 +
 +    subparsers.add_parser("bundle-lines", help="Print bundle entries as id|path lines")
++    resolve_base_ref_parser = subparsers.add_parser(
++        "resolve-base-ref",
++        help="Resolve the preferred git base ref, falling back only when it is unavailable",
++    )
++    resolve_base_ref_parser.add_argument(
++        "--prefer",
++        default="upstream/main",
++        help="Preferred git base ref (default: upstream/main)",
++    )
 +    verify_parser = subparsers.add_parser("verify", help="Validate manifest and coverage")
 +    verify_parser.add_argument(
 +        "--strict",
@@ -589,6 +639,14 @@ index 00000000..512648a0
 +
 +    if args.command == "bundle-lines":
 +        _print_lines(bundle_lines(repo_root))
++        return 0
++
++    if args.command == "resolve-base-ref":
++        try:
++            print(resolve_base_ref(repo_root, preferred=args.prefer))
++        except RuntimeError as exc:
++            print(str(exc), file=sys.stderr)
++            return 1
 +        return 0
 +
 +    if args.command == "verify":
@@ -619,12 +677,211 @@ index 00000000..512648a0
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+diff --git a/patches/rehearse-upstream-update.sh b/patches/rehearse-upstream-update.sh
+new file mode 100755
+index 00000000..51a13776
+--- /dev/null
++++ b/patches/rehearse-upstream-update.sh
+@@ -0,0 +1,193 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$REPO_ROOT"
++
++KEEP_TEMP=0
++FETCH_REMOTE=1
++
++usage() {
++  cat <<'EOF'
++Usage: patches/rehearse-upstream-update.sh [--keep-temp] [--no-fetch]
++
++Verify the local customization bundle, then rehearse patch applicability
++against a clean clone of the configured upstream baseline.
++
++Options:
++  --keep-temp  Keep the temporary clean clone for inspection.
++  --no-fetch   Skip 'git fetch --all --prune' in the source repo.
++EOF
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --keep-temp)
++      KEEP_TEMP=1
++      shift
++      ;;
++    --no-fetch)
++      FETCH_REMOTE=0
++      shift
++      ;;
++    -h|--help)
++      usage
++      exit 0
++      ;;
++    *)
++      usage >&2
++      exit 2
++      ;;
++  esac
++done
++
++resolve_base_ref() {
++  if [[ -n "${HERMES_LOCAL_CUSTOMIZATION_BASE_REF:-}" ]]; then
++    printf '%s\n' "$HERMES_LOCAL_CUSTOMIZATION_BASE_REF"
++  else
++    python3 -m patches.local_customization_manifest --repo-root "$1" resolve-base-ref
++  fi
++}
++
++resolve_rehearsal_remote_url() {
++  if [[ -n "${HERMES_LOCAL_CUSTOMIZATION_UPSTREAM_URL:-}" ]]; then
++    printf '%s\n' "$HERMES_LOCAL_CUSTOMIZATION_UPSTREAM_URL"
++    return 0
++  fi
++
++  if [[ -f "$REPO_ROOT/metadata.json" ]]; then
++    local metadata_url
++    metadata_url="$(python3 - <<'PY' "$REPO_ROOT/metadata.json"
++import json
++import sys
++from pathlib import Path
++path = Path(sys.argv[1])
++try:
++    data = json.loads(path.read_text(encoding='utf-8'))
++except Exception:
++    print('', end='')
++    raise SystemExit(0)
++print(str(data.get('upstream_remote') or ''), end='')
++PY
++)"
++    if [[ -n "$metadata_url" ]]; then
++      printf '%s\n' "$metadata_url"
++      return 0
++    fi
++  fi
++
++  git remote get-url "$SOURCE_REMOTE"
++}
++
++patch_state_in_repo() {
++  local repo_root="$1"
++  local patch_file="$2"
++
++  if git -C "$repo_root" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
++    printf 'already-applied'
++  elif git -C "$repo_root" apply --check --3way "$patch_file" >/dev/null 2>&1; then
++    printf 'applicable'
++  else
++    printf 'conflict'
++  fi
++}
++
++SOURCE_BASE_REF="$(resolve_base_ref "$REPO_ROOT")"
++if [[ "$SOURCE_BASE_REF" != */* ]]; then
++  echo "Expected a remote-tracking base ref such as upstream/main or origin/main; got: $SOURCE_BASE_REF" >&2
++  exit 2
++fi
++SOURCE_REMOTE="${SOURCE_BASE_REF%%/*}"
++SOURCE_BRANCH="${SOURCE_BASE_REF#*/}"
++REMOTE_URL="$(resolve_rehearsal_remote_url)"
++OVERLAY_EXPORT_REPO=0
++if [[ -f "$REPO_ROOT/metadata.json" ]]; then
++  OVERLAY_EXPORT_REPO=1
++fi
++
++if (( FETCH_REMOTE == 1 )); then
++  git fetch --all --prune
++fi
++
++TMPDIR="$(mktemp -d /tmp/hermes-upstream-rehearsal.XXXXXX)"
++CLEAN_REPO="$TMPDIR/upstream"
++cleanup() {
++  if (( KEEP_TEMP == 0 )); then
++    rm -rf "$TMPDIR"
++  fi
++}
++trap cleanup EXIT
++
++echo "Hermes local customization upstream rehearsal"
++echo " - source repo: $REPO_ROOT"
++echo " - source base ref: $SOURCE_BASE_REF"
++echo " - rehearsal remote URL: $REMOTE_URL"
++echo " - temp clone: $CLEAN_REPO"
++echo
++
++echo "Verifying local customization governance in source repo..."
++if (( OVERLAY_EXPORT_REPO == 1 )); then
++  echo "Detected sanitized overlay export; skipping source-repo strict/ahead gates."
++else
++  python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" verify --strict
++  python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" verify-ahead --base-ref "$SOURCE_BASE_REF"
++fi
++
++echo
++echo "Cloning clean upstream baseline..."
++git clone --quiet --origin origin --branch "$SOURCE_BRANCH" --single-branch "$REMOTE_URL" "$CLEAN_REPO"
++CLEAN_BASE_REF="$(python3 -m patches.local_customization_manifest --repo-root "$CLEAN_REPO" resolve-base-ref --prefer "origin/$SOURCE_BRANCH")"
++
++echo "Resolved clean-clone base ref: $CLEAN_BASE_REF"
++echo
++echo "Patch applicability against clean upstream:"
++
++already_applied_count=0
++applicable_count=0
++conflict_count=0
++conflicts=()
++
++while IFS='|' read -r patch_id patch_rel; do
++  patch_file="$REPO_ROOT/$patch_rel"
++  state="$(patch_state_in_repo "$CLEAN_REPO" "$patch_file")"
++  printf ' - %-32s %s\n' "$patch_id" "$state"
++
++  case "$state" in
++    already-applied)
++      already_applied_count=$((already_applied_count + 1))
++      ;;
++    applicable)
++      applicable_count=$((applicable_count + 1))
++      ;;
++    conflict)
++      conflict_count=$((conflict_count + 1))
++      conflicts+=("$patch_id:$patch_rel")
++      git -C "$CLEAN_REPO" apply --check --verbose "$patch_file" 2>&1 \
++        | grep -E '^(Checking patch|error:)' \
++        | sed 's/^/     /' || true
++      ;;
++  esac
++done < <(python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" bundle-lines)
++
++echo
++echo "Summary:"
++echo " - already-applied: $already_applied_count"
++echo " - applicable:      $applicable_count"
++echo " - conflict:        $conflict_count"
++
++if (( conflict_count > 0 )); then
++  echo
++  echo "Conflicting patch artifacts need refresh before an upstream update:" >&2
++  printf ' - %s\n' "${conflicts[@]}" >&2
++  if (( KEEP_TEMP == 1 )); then
++    echo "Temporary clone preserved at: $CLEAN_REPO" >&2
++  fi
++  exit 1
++fi
++
++echo
++if (( KEEP_TEMP == 1 )); then
++  echo "Rehearsal completed successfully. Temporary clone preserved at: $CLEAN_REPO"
++else
++  echo "Rehearsal completed successfully."
++fi
 diff --git a/tests/patches/test_local_customization_manifest.py b/tests/patches/test_local_customization_manifest.py
 new file mode 100644
-index 00000000..6f8c57b9
+index 00000000..8c8f1a9d
 --- /dev/null
 +++ b/tests/patches/test_local_customization_manifest.py
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,366 @@
 +from __future__ import annotations
 +
 +import subprocess
@@ -636,6 +893,7 @@ index 00000000..6f8c57b9
 +    find_uncovered_ahead_modifications,
 +    find_uncovered_tracked_modifications,
 +    load_manifest,
++    resolve_base_ref,
 +    validate_manifest,
 +)
 +
@@ -649,6 +907,10 @@ index 00000000..6f8c57b9
 +def _commit_all(repo_root: Path, message: str) -> None:
 +    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
 +    subprocess.run(["git", "commit", "-m", message], cwd=repo_root, check=True, capture_output=True, text=True)
++
++
++def _set_remote_ref(repo_root: Path, ref: str) -> None:
++    subprocess.run(["git", "update-ref", ref, "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True)
 +
 +
 +def test_bundle_entries_follow_manifest_order(tmp_path: Path) -> None:
@@ -697,6 +959,50 @@ index 00000000..6f8c57b9
 +    errors = validate_manifest(tmp_path)
 +
 +    assert any("patches/missing.patch" in error for error in errors)
++
++
++def test_resolve_base_ref_prefers_upstream_main_when_available(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
++    _commit_all(tmp_path, "initial")
++    _set_remote_ref(tmp_path, "refs/remotes/origin/main")
++    _set_remote_ref(tmp_path, "refs/remotes/upstream/main")
++
++    assert resolve_base_ref(tmp_path) == "upstream/main"
++
++
++def test_resolve_base_ref_falls_back_to_origin_main_when_upstream_missing(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
++    _commit_all(tmp_path, "initial")
++    _set_remote_ref(tmp_path, "refs/remotes/origin/main")
++
++    assert resolve_base_ref(tmp_path) == "origin/main"
++
++
++def test_resolve_base_ref_cli_reports_origin_fallback(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
++    _commit_all(tmp_path, "initial")
++    _set_remote_ref(tmp_path, "refs/remotes/origin/main")
++
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-m",
++            "patches.local_customization_manifest",
++            "--repo-root",
++            str(tmp_path),
++            "resolve-base-ref",
++        ],
++        cwd=Path(__file__).resolve().parents[2],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++
++    assert result.returncode == 0
++    assert result.stdout.strip() == "origin/main"
 +
 +
 +def test_uncovered_tracked_modifications_ignore_patch_bundle_artifacts_and_report_real_gaps(

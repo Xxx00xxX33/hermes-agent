@@ -9,6 +9,7 @@ from patches.local_customization_manifest import (
     find_uncovered_ahead_modifications,
     find_uncovered_tracked_modifications,
     load_manifest,
+    resolve_base_ref,
     validate_manifest,
 )
 
@@ -22,6 +23,10 @@ def _init_git_repo(repo_root: Path) -> None:
 def _commit_all(repo_root: Path, message: str) -> None:
     subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
     subprocess.run(["git", "commit", "-m", message], cwd=repo_root, check=True, capture_output=True, text=True)
+
+
+def _set_remote_ref(repo_root: Path, ref: str) -> None:
+    subprocess.run(["git", "update-ref", ref, "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True)
 
 
 def test_bundle_entries_follow_manifest_order(tmp_path: Path) -> None:
@@ -70,6 +75,50 @@ bundle:
     errors = validate_manifest(tmp_path)
 
     assert any("patches/missing.patch" in error for error in errors)
+
+
+def test_resolve_base_ref_prefers_upstream_main_when_available(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    _commit_all(tmp_path, "initial")
+    _set_remote_ref(tmp_path, "refs/remotes/origin/main")
+    _set_remote_ref(tmp_path, "refs/remotes/upstream/main")
+
+    assert resolve_base_ref(tmp_path) == "upstream/main"
+
+
+def test_resolve_base_ref_falls_back_to_origin_main_when_upstream_missing(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    _commit_all(tmp_path, "initial")
+    _set_remote_ref(tmp_path, "refs/remotes/origin/main")
+
+    assert resolve_base_ref(tmp_path) == "origin/main"
+
+
+def test_resolve_base_ref_cli_reports_origin_fallback(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    _commit_all(tmp_path, "initial")
+    _set_remote_ref(tmp_path, "refs/remotes/origin/main")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "patches.local_customization_manifest",
+            "--repo-root",
+            str(tmp_path),
+            "resolve-base-ref",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "origin/main"
 
 
 def test_uncovered_tracked_modifications_ignore_patch_bundle_artifacts_and_report_real_gaps(

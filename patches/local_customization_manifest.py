@@ -132,6 +132,43 @@ def _git_lines(repo_root: Path, *args: str) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
+def git_ref_exists(repo_root: Path, ref: str) -> bool:
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def resolve_base_ref(repo_root: Path, preferred: str = "upstream/main") -> str:
+    candidates: list[str] = []
+
+    def add_candidate(ref: str) -> None:
+        if ref and ref not in candidates:
+            candidates.append(ref)
+
+    add_candidate(preferred)
+    remote, sep, branch = preferred.partition("/")
+    if sep:
+        if remote != "upstream":
+            add_candidate(f"upstream/{branch}")
+        if remote != "origin":
+            add_candidate(f"origin/{branch}")
+
+    for candidate in candidates:
+        if git_ref_exists(repo_root, candidate):
+            return candidate
+
+    joined = ", ".join(candidates) or preferred
+    raise RuntimeError(
+        f"Unable to resolve base ref from available candidates: {joined}. "
+        "Set HERMES_LOCAL_CUSTOMIZATION_BASE_REF explicitly if needed."
+    )
+
+
 def tracked_modified_files(repo_root: Path) -> list[str]:
     unstaged = _git_lines(repo_root, "diff", "--name-only", "--")
     staged = _git_lines(repo_root, "diff", "--name-only", "--cached", "--")
@@ -231,6 +268,15 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("bundle-lines", help="Print bundle entries as id|path lines")
+    resolve_base_ref_parser = subparsers.add_parser(
+        "resolve-base-ref",
+        help="Resolve the preferred git base ref, falling back only when it is unavailable",
+    )
+    resolve_base_ref_parser.add_argument(
+        "--prefer",
+        default="upstream/main",
+        help="Preferred git base ref (default: upstream/main)",
+    )
     verify_parser = subparsers.add_parser("verify", help="Validate manifest and coverage")
     verify_parser.add_argument(
         "--strict",
@@ -252,6 +298,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "bundle-lines":
         _print_lines(bundle_lines(repo_root))
+        return 0
+
+    if args.command == "resolve-base-ref":
+        try:
+            print(resolve_base_ref(repo_root, preferred=args.prefer))
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         return 0
 
     if args.command == "verify":
