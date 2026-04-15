@@ -470,9 +470,14 @@ def switch_model(
 
         target_provider = pdef.id
 
-        # If no model specified, try auto-detect from endpoint
+        # If no model specified, prefer the provider's configured default model
+        # (named custom providers in config.yaml may pin a specific model). Fall
+        # back to endpoint auto-detection only when no configured model exists.
         if not new_model:
-            if pdef.base_url:
+            configured_model = str(getattr(pdef, "configured_model", "") or "").strip()
+            if configured_model:
+                new_model = configured_model
+            elif pdef.base_url:
                 from hermes_cli.runtime_provider import _auto_detect_local_model
                 detected = _auto_detect_local_model(pdef.base_url)
                 if detected:

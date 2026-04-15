@@ -4052,6 +4052,9 @@ class HermesCLI:
             ChatConsole().print(f"[bold red]{message}[/]")
             return False
 
+        previous_model = self.model
+        previous_base_url = str(self.base_url or "").strip().rstrip("/")
+
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")
         resolved_provider = runtime.get("provider", "openrouter")
@@ -4106,10 +4109,27 @@ class HermesCLI:
         runtime_model = runtime.get("model")
         if runtime_model and isinstance(runtime_model, str):
             self.model = runtime_model
+        elif resolved_provider == "custom":
+            model_cfg = self.config.get("model", {}) if isinstance(self.config, dict) else {}
+            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+            cfg_default_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+            resolved_base_url = str(base_url or "").strip().rstrip("/")
+            requested_provider = str(getattr(self, "requested_provider", "") or "").strip().lower()
+            if (
+                requested_provider == "custom"
+                and cfg_provider == "custom"
+                and cfg_default_model
+                and cfg_base_url
+                and resolved_base_url == cfg_base_url
+                and resolved_base_url != previous_base_url
+            ):
+                self.model = cfg_default_model
 
         # Normalize model for the resolved provider (e.g. swap non-Codex
         # models when provider is openai-codex).  Fixes #651.
-        model_changed = self._normalize_model_for_provider(resolved_provider)
+        normalized_model_changed = self._normalize_model_for_provider(resolved_provider)
+        model_changed = normalized_model_changed or self.model != previous_model
 
         # AIAgent/OpenAI client holds auth at init time, so rebuild if key,
         # routing, or the effective model changed.
@@ -6134,6 +6154,7 @@ class HermesCLI:
     def _session_routing_model_config(self, *, cwd: Optional[str] = None) -> Dict[str, Any]:
         """Build the per-session routing metadata stored in sessions.model_config."""
         model_config: Dict[str, Any] = {
+            "model": self.model,
             "max_iterations": self.max_turns,
             "reasoning_config": (
                 dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
@@ -6233,7 +6254,11 @@ class HermesCLI:
             explicit_base_url = defaults["explicit_base_url"]
             api_key = defaults["api_key"]
         else:
-            model = (session_meta or {}).get("model") or defaults["model"]
+            persisted_model = model_config.get("model")
+            if isinstance(persisted_model, str) and persisted_model.strip():
+                model = persisted_model.strip()
+            else:
+                model = (session_meta or {}).get("model") or defaults["model"]
             requested_provider = (
                 model_config.get("requested_provider")
                 or model_config.get("provider")
@@ -6276,6 +6301,25 @@ class HermesCLI:
             else:
                 explicit_api_key = None
                 api_key = None
+
+            # Backward compatibility for sessions persisted before routing metadata
+            # stored the model explicitly. Generic custom endpoints can change the
+            # effective model with config.yaml, so if the restored route matches the
+            # current default custom endpoint exactly, prefer the current default
+            # model over the stale top-level session.model.
+            defaults_requested = str(defaults["requested_provider"] or "").strip().lower()
+            restored_requested = str(requested_provider or "").strip().lower()
+            defaults_base_url = str(defaults["base_url"] or "").strip().rstrip("/")
+            restored_base_url = str(base_url or "").strip().rstrip("/")
+            if (
+                not (isinstance(persisted_model, str) and persisted_model.strip())
+                and defaults_requested == "custom"
+                and restored_requested == defaults_requested
+                and defaults_base_url
+                and restored_base_url == defaults_base_url
+                and defaults["model"]
+            ):
+                model = defaults["model"]
 
         self.model = model
         self.requested_provider = requested_provider
@@ -7077,6 +7121,12 @@ class HermesCLI:
 
         user_provs = None
         custom_provs = None
+        try:
+            user_provs = CLI_CONFIG.get("providers")
+            custom_provs = CLI_CONFIG.get("custom_providers")
+        except Exception:
+            user_provs = None
+            custom_provs = None
 
         # No args at all: open prompt_toolkit-native picker modal
         if not model_input and not explicit_provider:

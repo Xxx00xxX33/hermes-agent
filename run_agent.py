@@ -1525,8 +1525,8 @@ class AIAgent:
         self.requested_provider = requested_provider or new_provider
         self.base_url = base_url or self.base_url
         self.api_mode = api_mode
-        self.acp_command = acp_command if acp_command is not None else self.acp_command
-        self.acp_args = list(acp_args) if acp_args is not None else list(self.acp_args or [])
+        self.acp_command = acp_command if acp_command is not None else getattr(self, "acp_command", None)
+        self.acp_args = list(acp_args) if acp_args is not None else list(getattr(self, "acp_args", []) or [])
         if api_key:
             self.api_key = api_key
 
