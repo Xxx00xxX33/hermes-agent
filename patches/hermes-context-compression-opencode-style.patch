@@ -1,570 +1,528 @@
-diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
-index 6b7bf19668968d0d7dc50864c318be031bfb469c..ebc43efd4f1905229d8f3d01d25878df32c827ba 100644
---- a/agent/auxiliary_client.py
-+++ b/agent/auxiliary_client.py
-@@ -2155,6 +2155,7 @@ def call_llm(
-     tools: list = None,
-     timeout: float = None,
-     extra_body: dict = None,
-+    allow_provider_fallback: bool = False,
- ) -> Any:
-     """Centralized synchronous LLM call.
- 
-@@ -2291,7 +2292,8 @@ def call_llm(
-         # configure this task's provider.  Explicit provider = hard constraint;
-         # auto (the default) = best-effort fallback chain.  (#7559)
-         is_auto = resolved_provider in ("auto", "", None)
--        if should_fallback and is_auto:
-+        fallback_allowed = is_auto or allow_provider_fallback
-+        if should_fallback and fallback_allowed:
-             reason = "payment error" if _is_payment_error(first_err) else "connection error"
-             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                         task or "call", reason, resolved_provider, first_err)
 diff --git a/agent/context_compressor.py b/agent/context_compressor.py
-index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c11c0222be 100644
 --- a/agent/context_compressor.py
 +++ b/agent/context_compressor.py
-@@ -1,8 +1,9 @@
- """Automatic context window compression for long conversations.
- 
--Self-contained class with its own OpenAI client for summarization.
--Uses auxiliary model (cheap/fast) to summarize middle turns while
--protecting head and tail context.
-+Self-contained class for summarization.
-+By default it uses the current active model/provider to summarize middle turns
-+while protecting head and tail context, with an optional explicit summary-model
-+override retained for advanced configuration.
- 
- Improvements over v1:
-   - Structured summary template (Goal, Progress, Decisions, Files, Next Steps)
-@@ -15,7 +16,8 @@ Improvements over v1:
- 
+@@ -17,6 +17,7 @@
  import logging
  import time
--from typing import Any, Dict, List, Optional
-+import json
-+from typing import Any, Dict, List, Optional, Callable
+ import json
++import re
+ from typing import Any, Dict, List, Optional, Callable
  
  from agent.auxiliary_client import call_llm
- from agent.context_engine import ContextEngine
-@@ -44,8 +46,14 @@ _SUMMARY_RATIO = 0.20
- # Absolute ceiling for summary tokens (even on very large context windows)
- _SUMMARY_TOKENS_CEILING = 12_000
- 
-+# Preemptive compaction trigger: compact before failure instead of waiting
-+# for 100% of the context window. Mirrors a high-discipline long-running
-+# coding agent mindset (~85% of context usage).
-+_PREEMPTIVE_COMPACTION_RATIO = 0.85
-+
- # Placeholder used when pruning old tool results
- _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
-+_PRUNED_TOOL_SUMMARY_PREFIX = "[Tool result summary]"
+@@ -57,7 +58,9 @@
  
  # Chars per token rough estimate
  _CHARS_PER_TOKEN = 4
-@@ -88,10 +96,47 @@ class ContextCompressor(ContextEngine):
-         self.api_key = api_key
-         self.provider = provider
-         self.context_length = context_length
--        self.threshold_tokens = max(
--            int(context_length * self.threshold_percent),
--            MINIMUM_CONTEXT_LENGTH,
--        )
-+        self.threshold_tokens = self._compute_threshold_tokens(context_length)
-+
-+    def _resolve_summary_runtime(self) -> Dict[str, Any]:
-+        """Return the live runtime route to use for summary generation."""
-+        route: Dict[str, Any] = {}
-+        getter = getattr(self, "_runtime_route_getter", None)
-+        if callable(getter):
-+            try:
-+                resolved = getter()
-+            except Exception:
-+                resolved = None
-+            if isinstance(resolved, dict):
-+                route = dict(resolved)
-+
-+        return {
-+            "model": route.get("model") or self.model,
-+            "provider": route.get("provider") or self.provider or None,
-+            "base_url": route.get("base_url") or self.base_url or None,
-+            "api_key": route.get("api_key") or self.api_key or None,
-+        }
-+
-+    def _compute_threshold_tokens(self, context_length: int) -> int:
-+        """Return the effective auto-compaction trigger for this model.
-+
-+        High-discipline policy:
-+        - Compact preemptively at ~85% context usage to avoid failure.
-+        - Still honor the user's configured threshold_percent *as an upper bound*
-+          (never later than config), but allow earlier compaction when config is
-+          set too aggressively (e.g. 1.0).
-+        - Never compress below MINIMUM_CONTEXT_LENGTH.
-+        """
-+        # User expectation:
-+        # - For 200K-context models, start compaction at 85% (170K).
-+        # - For models with >200K context, keep their configured percentage.
-+        # - For smaller-context models, keep the configured percentage.
-+        if context_length == 200_000:
-+            threshold = int(200_000 * _PREEMPTIVE_COMPACTION_RATIO)
-+        else:
-+            threshold = int(context_length * self.threshold_percent)
-+        threshold = max(threshold, MINIMUM_CONTEXT_LENGTH)
-+        return threshold
+-_SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
++_SUMMARY_RETRY_INITIAL_DELAY_SECONDS = 1.0
++_SUMMARY_RETRY_MAX_DELAY_SECONDS = 30.0
++_SUMMARY_MAX_LLM_ATTEMPTS = 3
  
-     def __init__(
-         self,
-@@ -106,6 +151,7 @@ class ContextCompressor(ContextEngine):
-         api_key: str = "",
-         config_context_length: int | None = None,
-         provider: str = "",
-+        runtime_route_getter: Optional[Callable[[], Dict[str, Any]]] = None,
-     ):
-         self.model = model
-         self.base_url = base_url
-@@ -123,13 +169,10 @@ class ContextCompressor(ContextEngine):
-             provider=provider,
-         )
-         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
--        # the percentage would suggest a lower value.  This prevents premature
--        # compression on large-context models at 50% while keeping the % sane
--        # for models right at the minimum.
--        self.threshold_tokens = max(
--            int(self.context_length * threshold_percent),
--            MINIMUM_CONTEXT_LENGTH,
--        )
-+        # the percentage would suggest a lower value. On >=200k-context models,
-+        # also avoid automatic compaction before 200k prompt tokens so the
-+        # active conversation can use more of the available context first.
-+        self.threshold_tokens = self._compute_threshold_tokens(self.context_length)
-         self.compression_count = 0
  
-         # Derive token budgets: ratio is relative to the threshold, not total context
-@@ -155,6 +198,7 @@ class ContextCompressor(ContextEngine):
-         self.last_completion_tokens = 0
+ class ContextCompressor(ContextEngine):
+@@ -453,7 +456,164 @@
  
-         self.summary_model = summary_model_override or ""
-+        self._runtime_route_getter = runtime_route_getter
+         return "\n\n".join(parts)
  
-         # Stores the previous compaction summary for iterative updates
-         self._previous_summary: Optional[str] = None
-@@ -180,6 +224,11 @@ class ContextCompressor(ContextEngine):
-     ) -> tuple[List[Dict[str, Any]], int]:
-         """Replace old tool result contents with a short placeholder.
- 
-+        Each pruned tool result keeps a one-line semantic note (derived from
-+        the tool name + arguments + minimal inspection of the payload) so future
-+        compactions preserve *what happened* without keeping the full output.
-+        This is purely heuristic and does not make extra LLM calls.
-+
-         Walks backward from the end, protecting the most recent messages that
-         fall within ``protect_tail_tokens`` (when provided) OR the last
-         ``protect_tail_count`` messages (backward-compatible default).
-@@ -194,6 +243,25 @@ class ContextCompressor(ContextEngine):
-         result = [m.copy() for m in messages]
-         pruned = 0
- 
-+        # Index assistant tool_calls so we can attach a one-line semantic note to each
-+        # pruned tool result (instead of a generic placeholder only).
-+        tool_call_index: Dict[str, tuple[str, str]] = {}
-+        for m in result:
-+            if m.get("role") != "assistant":
-+                continue
-+            for tc in m.get("tool_calls") or []:
-+                if isinstance(tc, dict):
-+                    cid = tc.get("id") or ""
-+                    fn = (tc.get("function") or {}).get("name") or ""
-+                    args = (tc.get("function") or {}).get("arguments") or ""
-+                else:
-+                    cid = getattr(tc, "id", "") or ""
-+                    fn_obj = getattr(tc, "function", None)
-+                    fn = getattr(fn_obj, "name", "") if fn_obj else ""
-+                    args = getattr(fn_obj, "arguments", "") if fn_obj else ""
-+                if cid:
-+                    tool_call_index[cid] = (str(fn or ""), str(args or ""))
-+
-         # Determine the prune boundary
-         if protect_tail_tokens is not None and protect_tail_tokens > 0:
-             # Token-budget approach: walk backward accumulating tokens
-@@ -222,15 +290,94 @@ class ContextCompressor(ContextEngine):
-             if msg.get("role") != "tool":
-                 continue
-             content = msg.get("content", "")
--            if not content or content == _PRUNED_TOOL_PLACEHOLDER:
-+            # Already pruned
-+            if not content or (_PRUNED_TOOL_PLACEHOLDER in str(content)):
-                 continue
-             # Only prune if the content is substantial (>200 chars)
-             if len(content) > 200:
--                result[i] = {**msg, "content": _PRUNED_TOOL_PLACEHOLDER}
-+                cid = str(msg.get("tool_call_id") or "")
-+                tool_name, tool_args = tool_call_index.get(cid, ("", ""))
-+                summary = self._summarize_tool_result_one_line(tool_name, tool_args, str(content))
-+                result[i] = {
-+                    **msg,
-+                    "content": f"{_PRUNED_TOOL_SUMMARY_PREFIX} {summary}\n{_PRUNED_TOOL_PLACEHOLDER}",
+-    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
++    def _build_summary_call_kwargs(self, prompt: str, summary_budget: int) -> Dict[str, Any]:
++        """Build the LLM request kwargs for context-summary generation."""
++        call_kwargs: Dict[str, Any] = {
++            "task": "compression",
++            "messages": [{"role": "user", "content": prompt}],
++            "max_tokens": summary_budget * 2,
++            # timeout resolved from auxiliary.compression.timeout config by call_llm
++            "extra_body": {
++                "reasoning": {
++                    "enabled": True,
++                    "effort": "medium",
 +                }
-                 pruned += 1
- 
-         return result, pruned
- 
-+    @staticmethod
-+    def _safe_parse_json_maybe(text: str) -> Optional[dict]:
-+        """Best-effort parse for tool args/result payloads."""
-+        if not text or not isinstance(text, str):
-+            return None
-+        s = text.strip()
-+        if not s:
-+            return None
-+        if not (s.startswith("{") and s.endswith("}")):
-+            return None
++            },
++        }
++        if self.summary_model:
++            # Respect explicit compression-summary override when configured.
++            call_kwargs["model"] = self.summary_model
++        else:
++            # Default: summarize with the current active runtime model.
++            runtime_route = self._resolve_summary_runtime()
++            call_kwargs.update({
++                "provider": runtime_route["provider"],
++                "model": runtime_route["model"],
++                "base_url": runtime_route["base_url"],
++                "api_key": runtime_route["api_key"],
++                "allow_provider_fallback": True,
++            })
++        return call_kwargs
++
++    def _call_summary_llm(self, call_kwargs: Dict[str, Any]):
++        """Call the summary LLM, retrying once without reasoning hints if needed."""
 +        try:
-+            return json.loads(s)
-+        except Exception:
-+            return None
++            return call_llm(**call_kwargs)
++        except Exception as reasoning_err:
++            err_str = str(reasoning_err).lower()
++            if any(
++                needle in err_str
++                for needle in (
++                    "reasoning",
++                    "unsupported_parameter",
++                    "unknown parameter",
++                    "unexpected keyword",
++                    "extra_body",
++                    "extra fields not permitted",
++                )
++            ):
++                logger.info(
++                    "Context compression summary: reasoning=medium unsupported on %s (%s); retrying without reasoning",
++                    call_kwargs.get("model") or self.summary_model or self.model,
++                    reasoning_err,
++                )
++                retry_kwargs = dict(call_kwargs)
++                retry_kwargs.pop("extra_body", None)
++                return call_llm(**retry_kwargs)
++            raise
 +
-+    def _summarize_tool_result_one_line(self, tool_name: str, tool_args: str, tool_content: str) -> str:
-+        """Generate one-sentence semantic note for a pruned tool result.
++    @staticmethod
++    def _extract_summary_body(response: Any) -> str:
++        """Extract the meaningful summary body from an LLM response."""
++        content = response.choices[0].message.content
++        if not isinstance(content, str):
++            content = str(content) if content else ""
++        text = content.strip()
++        for prefix in (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX):
++            if text.startswith(prefix):
++                text = text[len(prefix):].lstrip()
++                break
++        return text
 +
-+        No extra LLM call: heuristics only (fast + deterministic).
-+        """
-+        name = (tool_name or "tool").strip()
-+        args_obj = self._safe_parse_json_maybe(tool_args) or {}
-+        content_obj = self._safe_parse_json_maybe(tool_content) or {}
++    @staticmethod
++    def _summary_retry_delay_seconds(attempt: int) -> float:
++        """Return capped exponential backoff for summary-generation retries."""
++        if attempt <= 0:
++            return 0.0
++        delay = _SUMMARY_RETRY_INITIAL_DELAY_SECONDS * (2 ** (attempt - 1))
++        return min(delay, _SUMMARY_RETRY_MAX_DELAY_SECONDS)
 +
-+        def _clip(s: str, n: int = 160) -> str:
-+            s = " ".join((s or "").strip().split())
-+            if len(s) <= n:
-+                return s
-+            return s[: n - 3] + "..."
++    @staticmethod
++    def _strip_ansi(text: str) -> str:
++        """Remove ANSI escape sequences so fallback summaries stay readable."""
++        return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text or "")
 +
-+        path = args_obj.get("path") if isinstance(args_obj, dict) else None
-+        url = args_obj.get("url") if isinstance(args_obj, dict) else None
-+        command = args_obj.get("command") if isinstance(args_obj, dict) else None
++    def _build_deterministic_fallback_summary(
++        self,
++        turns_to_summarize: List[Dict[str, Any]],
++        *,
++        focus_topic: str | None = None,
++        failure_reason: str = "",
++    ) -> str:
++        """Generate a readable local fallback summary when the LLM path fails."""
++        user_points: list[str] = []
++        assistant_points: list[str] = []
++        tool_points: list[str] = []
++        references: list[str] = []
 +
-+        if name in ("read_file", "mcp_alphavps_ssh_read_file", "mcp_netcupde_ssh_read_file"):
-+            total_lines = content_obj.get("total_lines") if isinstance(content_obj, dict) else None
-+            truncated = content_obj.get("truncated") if isinstance(content_obj, dict) else None
-+            if path:
-+                extra = []
-+                if isinstance(total_lines, int):
-+                    extra.append(f"lines={total_lines}")
-+                if truncated is True:
-+                    extra.append("truncated")
-+                extra_s = (", " + ", ".join(extra)) if extra else ""
-+                return _clip(f"read_file path={path}{extra_s}.")
-+            return _clip("read_file completed.")
++        def _clip(text: str, limit: int = 220) -> str:
++            clean = " ".join(self._strip_ansi(text).split())
++            if len(clean) <= limit:
++                return clean
++            return clean[: limit - 3] + "..."
 +
-+        if name == "search_files":
-+            total = content_obj.get("total_count") if isinstance(content_obj, dict) else None
-+            if isinstance(total, int):
-+                return _clip(f"search_files returned total_count={total}.")
-+            return _clip("search_files completed.")
++        ref_pattern = re.compile(r"(?:~?/[^\s\]\[\)\(]+|https?://\S+|\b\d{2,5}\b)")
 +
-+        if name in ("terminal", "mcp_alphavps_ssh_run_shell_command", "mcp_netcupde_ssh_run_shell_command"):
-+            exit_code = content_obj.get("exit_code") if isinstance(content_obj, dict) else None
-+            if command:
-+                cmd = _clip(str(command), 90)
-+                if isinstance(exit_code, int):
-+                    return _clip(f"terminal ran `{cmd}` (exit_code={exit_code}).")
-+                return _clip(f"terminal ran `{cmd}`.")
-+            if isinstance(exit_code, int):
-+                return _clip(f"terminal completed (exit_code={exit_code}).")
-+            return _clip("terminal completed.")
++        for msg in turns_to_summarize:
++            role = str(msg.get("role") or "")
++            content = _clip(str(msg.get("content") or ""))
++            if role == "user" and content:
++                user_points.append(content)
++            elif role == "assistant" and content:
++                assistant_points.append(content)
++            elif role == "tool":
++                tool_id = str(msg.get("tool_call_id") or "").strip()
++                tool_summary = f"tool result {tool_id}: {content}" if tool_id else f"tool result: {content}"
++                if content:
++                    tool_points.append(tool_summary)
 +
-+        if name == "browser_navigate" and url:
-+            return _clip(f"browser_navigate loaded url={url}.")
++            for match in ref_pattern.findall(str(msg.get("content") or "")):
++                cleaned = self._strip_ansi(match).strip().rstrip('.,:;')
++                if cleaned and cleaned not in references:
++                    references.append(cleaned)
++                if len(references) >= 8:
++                    break
++            if len(references) >= 8:
++                continue
 +
-+        if isinstance(tool_content, str) and tool_content.strip():
-+            first_line = tool_content.strip().splitlines()[0]
-+            return _clip(f"{name}: {first_line}")
-+        return _clip(f"{name} completed.")
++        objective = user_points[0] if user_points else "Continue the in-progress conversation after compaction."
++        current_state = assistant_points[-2:] or user_points[-2:] or ["Recent turns were compacted with a deterministic local fallback summary."]
++        next_actions = []
++        if focus_topic:
++            next_actions.append(f"Prioritize the focus topic during continuation: {focus_topic}")
++        next_actions.append("Resume from the preserved recent turns and current file/tool state.")
++        if tool_points:
++            next_actions.append("Re-check any important tool outputs against live state before acting on them.")
 +
-     # ------------------------------------------------------------------
-     # Summarization
-     # ------------------------------------------------------------------
-@@ -344,38 +491,34 @@ PREVIOUS SUMMARY:
- NEW TURNS TO INCORPORATE:
- {content_to_summarize}
++        hard_constraints = []
++        if failure_reason:
++            hard_constraints.append(f"Remote summary generation failed: {failure_reason}")
++        hard_constraints.append("This fallback summary was generated locally to avoid losing continuity.")
++
++        critical_refs = references[:8] or ["Use the preserved tail messages and current workspace state as ground truth."]
++        dropped_details = [
++            "Verbose middle-turn history was compressed mechanically after summary-generation failures.",
++            "Older raw tool outputs may have been truncated or replaced by shorter notes.",
++        ]
++
++        sections = [
++            "1. Objective\n- " + objective,
++            "2. Current state\n" + "\n".join(f"- {item}" for item in current_state),
++            "3. Hard constraints\n" + "\n".join(f"- {item}" for item in hard_constraints),
++            "4. Key decisions made\n- Continue from current repo/tool state rather than replaying dropped turns.",
++            "5. Open issues / uncertainties\n- Some details were reconstructed locally because the remote summarizer was unavailable.",
++            "6. Next actions\n" + "\n".join(f"- {item}" for item in next_actions),
++            "7. Critical references\n" + "\n".join(f"- {item}" for item in critical_refs),
++            "8. Dropped details\n" + "\n".join(f"- {item}" for item in dropped_details),
++        ]
++        return "\n\n".join(sections)
++
++    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> str:
+         """Generate a structured summary of conversation turns.
  
--Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new progress. Move items from "In Progress" to "Done" when completed. Remove information only if it is clearly obsolete.
-+Update the summary using this exact structure. Preserve what is still relevant, add new progress, and delete only what is clearly obsolete.
+         Uses a structured template (Goal, Progress, Decisions, Files, Next Steps)
+@@ -466,18 +626,10 @@
+                 related to this topic and is more aggressive about compressing
+                 everything else.  Inspired by Claude Code's ``/compact``.
  
--## Goal
--[What the user is trying to accomplish — preserve from previous summary, update if goal evolved]
-+1. Objective
-+- What the user ultimately wants
+-        Returns None if all attempts fail — the caller should drop
+-        the middle turns without a summary rather than inject a useless
+-        placeholder.
++        Retries the remote summarizer up to a bounded number of times. If the
++        LLM path still fails, return a deterministic local handoff summary so
++        compaction never deletes history without leaving a usable summary.
+         """
+-        now = time.monotonic()
+-        if now < self._summary_failure_cooldown_until:
+-            logger.debug(
+-                "Skipping context summary during cooldown (%.0fs remaining)",
+-                self._summary_failure_cooldown_until - now,
+-            )
+-            return None
+-
+         summary_budget = self._compute_summary_budget(turns_to_summarize)
+         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
  
--## Constraints & Preferences
--[User preferences, coding style, constraints, important decisions — accumulate across compactions]
-+2. Current state
-+- What has already been completed
-+- What is currently true
+@@ -567,81 +719,71 @@
+ FOCUS TOPIC: "{focus_topic}"
+ The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget."""
  
--## Progress
--### Done
--[Completed work — include specific file paths, commands run, results obtained]
--### In Progress
--[Work currently underway]
--### Blocked
--[Any blockers or issues encountered]
-+3. Hard constraints
-+- Non-negotiable rules, preferences, boundaries, and environment constraints
- 
--## Key Decisions
--[Important technical decisions and why they were made]
-+4. Key decisions made
-+- Decisions that future steps must respect
- 
--## Relevant Files
--[Files read, modified, or created — with brief note on each. Accumulate across compactions.]
-+5. Open issues / uncertainties
-+- What is unresolved and why it matters
- 
--## Next Steps
--[What needs to happen next to continue the work]
-+6. Next actions
-+- Ordered list of immediate next steps
- 
--## Critical Context
--[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
-+7. Critical references
-+- File paths, commands, URLs, identifiers, APIs, services, ports, schemas, or entities that must remain available
- 
--## Tools & Patterns
--[Which tools were used, how they were used effectively, and any tool-specific discoveries. Accumulate across compactions.]
-+8. Dropped details
-+- Briefly note what categories were intentionally omitted or compressed
- 
--Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions.
-+Target ~{summary_budget} tokens. Preserve continuity + constraints; discard verbose history.
- 
- Write only the summary body. Do not include any preamble or prefix."""
-         else:
-@@ -387,36 +530,32 @@ TURNS TO SUMMARIZE:
- 
- Use this exact structure:
- 
--## Goal
--[What the user is trying to accomplish]
-+1. Objective
-+- What the user ultimately wants
- 
--## Constraints & Preferences
--[User preferences, coding style, constraints, important decisions]
-+2. Current state
-+- What has already been completed
-+- What is currently true
- 
--## Progress
--### Done
--[Completed work — include specific file paths, commands run, results obtained]
--### In Progress
--[Work currently underway]
--### Blocked
--[Any blockers or issues encountered]
-+3. Hard constraints
-+- Non-negotiable rules, preferences, boundaries, and environment constraints
- 
--## Key Decisions
--[Important technical decisions and why they were made]
-+4. Key decisions made
-+- Decisions that future steps must respect
- 
--## Relevant Files
--[Files read, modified, or created — with brief note on each]
-+5. Open issues / uncertainties
-+- What is unresolved and why it matters
- 
--## Next Steps
--[What needs to happen next to continue the work]
-+6. Next actions
-+- Ordered list of immediate next steps
- 
--## Critical Context
--[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
-+7. Critical references
-+- File paths, commands, URLs, identifiers, APIs, services, ports, schemas, or entities that must remain available
- 
--## Tools & Patterns
--[Which tools were used, how they were used effectively, and any tool-specific discoveries (e.g., preferred flags, working invocations, successful command patterns)]
-+8. Dropped details
-+- Briefly note what categories were intentionally omitted or compressed
- 
--Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions. The goal is to prevent the next assistant from repeating work or losing important details.
-+Target ~{summary_budget} tokens. Preserve task continuity and hard constraints; discard verbose history. Be specific (file paths, commands, identifiers) where precision matters.
- 
- Write only the summary body. Do not include any preamble or prefix."""
- 
-@@ -434,10 +573,50 @@ The user has requested that this compaction PRIORITISE preserving all informatio
-                 "messages": [{"role": "user", "content": prompt}],
-                 "max_tokens": summary_budget * 2,
-                 # timeout resolved from auxiliary.compression.timeout config by call_llm
-+                "extra_body": {
-+                    "reasoning": {
-+                        "enabled": True,
-+                        "effort": "medium",
-+                    }
-+                },
-             }
-             if self.summary_model:
-+                # Respect explicit compression-summary override when configured.
-                 call_kwargs["model"] = self.summary_model
--            response = call_llm(**call_kwargs)
-+            else:
-+                # Default: summarize with the current active runtime model.
-+                runtime_route = self._resolve_summary_runtime()
-+                call_kwargs.update({
-+                    "provider": runtime_route["provider"],
-+                    "model": runtime_route["model"],
-+                    "base_url": runtime_route["base_url"],
-+                    "api_key": runtime_route["api_key"],
-+                    "allow_provider_fallback": True,
-+                })
-+            try:
-+                response = call_llm(**call_kwargs)
-+            except Exception as reasoning_err:
-+                err_str = str(reasoning_err).lower()
-+                if any(
-+                    needle in err_str
-+                    for needle in (
-+                        "reasoning",
-+                        "unsupported_parameter",
-+                        "unknown parameter",
-+                        "unexpected keyword",
-+                        "extra_body",
-+                        "extra fields not permitted",
-+                    )
-+                ):
+-        try:
+-            call_kwargs = {
+-                "task": "compression",
+-                "messages": [{"role": "user", "content": prompt}],
+-                "max_tokens": summary_budget * 2,
+-                # timeout resolved from auxiliary.compression.timeout config by call_llm
+-                "extra_body": {
+-                    "reasoning": {
+-                        "enabled": True,
+-                        "effort": "medium",
+-                    }
+-                },
+-            }
+-            if self.summary_model:
+-                # Respect explicit compression-summary override when configured.
+-                call_kwargs["model"] = self.summary_model
+-            else:
+-                # Default: summarize with the current active runtime model.
+-                runtime_route = self._resolve_summary_runtime()
+-                call_kwargs.update({
+-                    "provider": runtime_route["provider"],
+-                    "model": runtime_route["model"],
+-                    "base_url": runtime_route["base_url"],
+-                    "api_key": runtime_route["api_key"],
+-                    "allow_provider_fallback": True,
+-                })
++        attempt = 0
++        last_error: Exception | None = None
++        while attempt < _SUMMARY_MAX_LLM_ATTEMPTS:
++            attempt += 1
+             try:
+-                response = call_llm(**call_kwargs)
+-            except Exception as reasoning_err:
+-                err_str = str(reasoning_err).lower()
+-                if any(
+-                    needle in err_str
+-                    for needle in (
+-                        "reasoning",
+-                        "unsupported_parameter",
+-                        "unknown parameter",
+-                        "unexpected keyword",
+-                        "extra_body",
+-                        "extra fields not permitted",
++                call_kwargs = self._build_summary_call_kwargs(prompt, summary_budget)
++                response = self._call_summary_llm(call_kwargs)
++                summary = self._extract_summary_body(response)
++                if not summary:
++                    raise ValueError("Summary LLM returned empty content")
++
++                # Store for iterative updates on next compaction
++                self._previous_summary = summary
++                self._summary_failure_cooldown_until = 0.0
++                if attempt > 1:
 +                    logger.info(
-+                        "Context compression summary: reasoning=medium unsupported on %s (%s); retrying without reasoning",
-+                        self.summary_model or self.model,
-+                        reasoning_err,
++                        "Context compression summary succeeded after %d attempts",
++                        attempt,
+                     )
+-                ):
+-                    logger.info(
+-                        "Context compression summary: reasoning=medium unsupported on %s (%s); retrying without reasoning",
+-                        self.summary_model or self.model,
+-                        reasoning_err,
++                return self._with_summary_prefix(summary)
++            except RuntimeError as e:
++                last_error = e
++                if attempt < _SUMMARY_MAX_LLM_ATTEMPTS:
++                    delay = self._summary_retry_delay_seconds(attempt)
++                    logger.warning(
++                        "Context compression summary unavailable on attempt %d/%d: %s. Retrying in %.1fs.",
++                        attempt,
++                        _SUMMARY_MAX_LLM_ATTEMPTS,
++                        e,
++                        delay,
+                     )
+-                    call_kwargs.pop("extra_body", None)
+-                    response = call_llm(**call_kwargs)
+-                else:
+-                    raise
+-            content = response.choices[0].message.content
+-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
+-            if not isinstance(content, str):
+-                content = str(content) if content else ""
+-            summary = content.strip()
+-            # Store for iterative updates on next compaction
+-            self._previous_summary = summary
+-            self._summary_failure_cooldown_until = 0.0
+-            return self._with_summary_prefix(summary)
+-        except RuntimeError:
+-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+-            logging.warning("Context compression: no provider available for "
+-                            "summary. Middle turns will be dropped without summary "
+-                            "for %d seconds.",
+-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
+-            return None
+-        except Exception as e:
+-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+-            logging.warning(
+-                "Failed to generate context summary: %s. "
+-                "Further summary attempts paused for %d seconds.",
+-                e,
+-                _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+-            )
+-            return None
++                    time.sleep(delay)
++                    continue
++                logger.warning(
++                    "Context compression summary unavailable after %d attempts: %s. Using deterministic local fallback summary.",
++                    attempt,
++                    e,
++                )
++            except Exception as e:
++                last_error = e
++                if attempt < _SUMMARY_MAX_LLM_ATTEMPTS:
++                    delay = self._summary_retry_delay_seconds(attempt)
++                    logger.warning(
++                        "Failed to generate context summary on attempt %d/%d: %s. Retrying in %.1fs.",
++                        attempt,
++                        _SUMMARY_MAX_LLM_ATTEMPTS,
++                        e,
++                        delay,
 +                    )
-+                    call_kwargs.pop("extra_body", None)
-+                    response = call_llm(**call_kwargs)
-+                else:
-+                    raise
-             content = response.choices[0].message.content
-             # Handle cases where content is not a string (e.g., dict from llama.cpp)
-             if not isinstance(content, str):
++                    time.sleep(delay)
++                    continue
++                logger.warning(
++                    "Failed to generate context summary after %d attempts: %s. Using deterministic local fallback summary.",
++                    attempt,
++                    e,
++                )
++
++        fallback_summary = self._build_deterministic_fallback_summary(
++            turns_to_summarize,
++            focus_topic=focus_topic,
++            failure_reason=str(last_error or "summary generation failed"),
++        )
++        self._previous_summary = fallback_summary
++        self._summary_failure_cooldown_until = 0.0
++        return self._with_summary_prefix(fallback_summary)
+ 
+     @staticmethod
+     def _with_summary_prefix(summary: str) -> str:
+@@ -912,18 +1054,17 @@
+                 )
+             compressed.append(msg)
+ 
+-        # If LLM summary failed, insert a static fallback so the model
+-        # knows context was lost rather than silently dropping everything.
++        # _generate_summary should already guarantee a usable handoff summary,
++        # but keep a local deterministic fallback here as a final safety net.
+         if not summary:
+             if not self.quiet_mode:
+-                logger.warning("Summary generation failed — inserting static fallback context marker")
+-            n_dropped = compress_end - compress_start
+-            summary = (
+-                f"{SUMMARY_PREFIX}\n"
+-                f"Summary generation was unavailable. {n_dropped} conversation turns were "
+-                f"removed to free context space but could not be summarized. The removed "
+-                f"turns contained earlier work in this session. Continue based on the "
+-                f"recent messages below and the current state of any files or resources."
++                logger.warning("Summary generation returned empty output — inserting deterministic local fallback summary")
++            summary = self._with_summary_prefix(
++                self._build_deterministic_fallback_summary(
++                    turns_to_summarize,
++                    focus_topic=focus_topic,
++                    failure_reason="summary generation returned empty output",
++                )
+             )
+ 
+         _merge_summary_into_tail = False
 diff --git a/tests/agent/test_context_compressor.py b/tests/agent/test_context_compressor.py
-index f4cf19666f63875be318c60867ecb0a796c5919d..1e3a1b1404e10f3d100b651c4f2f180723d55107 100644
 --- a/tests/agent/test_context_compressor.py
 +++ b/tests/agent/test_context_compressor.py
-@@ -37,6 +37,21 @@ class TestShouldCompress:
-         assert compressor.should_compress(prompt_tokens=90000) is True
-         assert compressor.should_compress(prompt_tokens=50000) is False
+@@ -168,10 +168,14 @@
+         assert isinstance(summary, str)
+         assert summary.startswith(SUMMARY_PREFIX)
  
-+    def test_large_context_models_use_200k_reference_preemptive_threshold(self):
-+        """User policy: 200K-context models compact at 85%. For >200K, keep configured percent."""
-+        with patch("agent.context_compressor.get_model_context_length", return_value=300000):
-+            c = ContextCompressor(model="test/model", threshold_percent=0.50, quiet_mode=True)
-+        assert c.threshold_tokens == 150000
-+        assert c.should_compress(prompt_tokens=149999) is False
-+        assert c.should_compress(prompt_tokens=150000) is True
+-    def test_none_content_coerced_to_empty(self):
+-        mock_response = MagicMock()
+-        mock_response.choices = [MagicMock()]
+-        mock_response.choices[0].message.content = None
++    def test_none_content_retries_until_meaningful_summary(self):
++        empty_response = MagicMock()
++        empty_response.choices = [MagicMock()]
++        empty_response.choices[0].message.content = None
 +
-+    def test_smaller_context_models_keep_percentage_threshold(self):
-+        with patch("agent.context_compressor.get_model_context_length", return_value=128000):
-+            c = ContextCompressor(model="test/model", threshold_percent=0.50, quiet_mode=True)
-+        assert c.threshold_tokens == 64000
-+        assert c.should_compress(prompt_tokens=63999) is False
-+        assert c.should_compress(prompt_tokens=64000) is True
++        ok_response = MagicMock()
++        ok_response.choices = [MagicMock()]
++        ok_response.choices[0].message.content = "real summary"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(model="test", quiet_mode=True)
+@@ -181,11 +185,15 @@
+             {"role": "assistant", "content": "ok"},
+         ]
+ 
+-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
++        with patch(
++            "agent.context_compressor.call_llm",
++            side_effect=[empty_response, ok_response],
++        ) as mock_call, patch("agent.context_compressor.time.sleep") as mock_sleep:
+             summary = c._generate_summary(messages)
+-        # None content → empty string → standardized compaction handoff prefix added
+-        assert summary is not None
+-        assert summary == SUMMARY_PREFIX
 +
++        assert summary == f"{SUMMARY_PREFIX}\nreal summary"
++        assert mock_call.call_count == 2
++        mock_sleep.assert_called_once()
+ 
+     def test_summary_call_does_not_force_temperature(self):
+         mock_response = MagicMock()
+@@ -267,8 +275,8 @@
+         assert "extra_body" not in second_kwargs
  
  
- class TestUpdateFromResponse:
-@@ -191,6 +206,66 @@ class TestNonStringContent:
-         kwargs = mock_call.call_args.kwargs
-         assert "temperature" not in kwargs
+-class TestSummaryFailureCooldown:
+-    def test_summary_failure_enters_cooldown_and_skips_retry(self):
++class TestSummaryRetryLoop:
++    def test_summary_failure_retries_until_success(self):
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(model="test", quiet_mode=True)
  
-+    def test_summary_defaults_to_active_model_and_reasoning_medium(self):
-+        mock_response = MagicMock()
-+        mock_response.choices = [MagicMock()]
-+        mock_response.choices[0].message.content = "ok"
-+
-+        with patch("agent.context_compressor.get_model_context_length", return_value=300000):
-+            c = ContextCompressor(
-+                model="primary-model",
-+                provider="openrouter",
-+                base_url="https://openrouter.ai/api/v1",
-+                api_key="sk-primary",
-+                quiet_mode=True,
-+            )
-+
-+        messages = [
-+            {"role": "user", "content": "do something"},
-+            {"role": "assistant", "content": "ok"},
-+        ]
-+
-+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
-+            c._generate_summary(messages)
-+
-+        kwargs = mock_call.call_args.kwargs
-+        assert kwargs["provider"] == "openrouter"
-+        assert kwargs["model"] == "primary-model"
-+        assert kwargs["base_url"] == "https://openrouter.ai/api/v1"
-+        assert kwargs["api_key"] == "sk-primary"
-+        assert kwargs["extra_body"] == {"reasoning": {"enabled": True, "effort": "medium"}}
-+
-+    def test_summary_retries_without_reasoning_when_unsupported(self):
-+        mock_response = MagicMock()
-+        mock_response.choices = [MagicMock()]
-+        mock_response.choices[0].message.content = "ok"
-+
-+        with patch("agent.context_compressor.get_model_context_length", return_value=300000):
-+            c = ContextCompressor(
-+                model="primary-model",
-+                provider="custom",
-+                base_url="https://example.invalid/v1",
-+                api_key="sk-primary",
-+                quiet_mode=True,
-+            )
-+
-+        messages = [
-+            {"role": "user", "content": "do something"},
-+            {"role": "assistant", "content": "ok"},
-+        ]
+@@ -277,13 +285,85 @@
+             {"role": "assistant", "content": "ok"},
+         ]
+ 
+-        with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")) as mock_call:
+-            first = c._generate_summary(messages)
+-            second = c._generate_summary(messages)
+-
+-        assert first is None
+-        assert second is None
+-        assert mock_call.call_count == 1
++        ok_response = MagicMock()
++        ok_response.choices = [MagicMock()]
++        ok_response.choices[0].message.content = "stable summary"
 +
 +        with patch(
 +            "agent.context_compressor.call_llm",
-+            side_effect=[RuntimeError("unsupported_parameter: reasoning"), mock_response],
-+        ) as mock_call:
-+            c._generate_summary(messages)
++            side_effect=[Exception("boom"), ok_response],
++        ) as mock_call, patch("agent.context_compressor.time.sleep") as mock_sleep:
++            summary = c._generate_summary(messages)
 +
++        assert summary == f"{SUMMARY_PREFIX}\nstable summary"
 +        assert mock_call.call_count == 2
-+        first_kwargs = mock_call.call_args_list[0].kwargs
-+        second_kwargs = mock_call.call_args_list[1].kwargs
-+        assert first_kwargs["extra_body"] == {"reasoning": {"enabled": True, "effort": "medium"}}
-+        assert "extra_body" not in second_kwargs
++        assert c._summary_failure_cooldown_until == 0.0
++        mock_sleep.assert_called_once()
 +
++    def test_summary_failure_returns_deterministic_fallback_after_max_attempts(self):
++        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
++            c = ContextCompressor(model="test", quiet_mode=True)
++
++        messages = [
++            {"role": "user", "content": "investigate cliproxy summary failures"},
++            {"role": "assistant", "content": "checking current compression code"},
++            {"role": "tool", "content": "/root/.hermes/hermes-agent/agent/context_compressor.py"},
++        ]
++
++        def _sleep_guard(*_args, **_kwargs):
++            _sleep_guard.calls += 1
++            if _sleep_guard.calls > 2:
++                raise AssertionError("summary retry loop exceeded bounded retry budget")
++
++        _sleep_guard.calls = 0
++
++        with patch(
++            "agent.context_compressor.call_llm",
++            side_effect=RuntimeError("No LLM provider configured for task=compression provider=auto"),
++        ) as mock_call, patch("agent.context_compressor.time.sleep", side_effect=_sleep_guard):
++            summary = c._generate_summary(messages)
++
++        assert mock_call.call_count == 3
++        assert _sleep_guard.calls == 2
++        assert summary.startswith(f"{SUMMARY_PREFIX}\n1. Objective")
++        assert "Remote summary generation failed:" in summary
++        assert "Summary generation was unavailable" not in summary
++        assert c._previous_summary.startswith("1. Objective")
++
++    def test_compress_uses_structured_fallback_instead_of_static_marker(self):
++        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
++            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
++
++        msgs = [
++            {"role": "user", "content": "msg 0"},
++            {"role": "assistant", "content": "msg 1"},
++            {"role": "user", "content": "msg 2"},
++            {"role": "assistant", "content": "msg 3"},
++            {"role": "tool", "content": "/root/.hermes/hermes-agent/tests/agent/test_context_compressor.py"},
++            {"role": "assistant", "content": "msg 5"},
++            {"role": "user", "content": "msg 6"},
++            {"role": "assistant", "content": "msg 7"},
++        ]
++
++        def _sleep_guard(*_args, **_kwargs):
++            _sleep_guard.calls += 1
++            if _sleep_guard.calls > 2:
++                raise AssertionError("compress() summary retry loop exceeded bounded retry budget")
++
++        _sleep_guard.calls = 0
++
++        with patch(
++            "agent.context_compressor.call_llm",
++            side_effect=Exception("Request timed out."),
++        ), patch("agent.context_compressor.time.sleep", side_effect=_sleep_guard):
++            result = c.compress(msgs)
++
++        summary_messages = [m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)]
++        assert len(summary_messages) == 1
++        summary_text = summary_messages[0]["content"]
++        assert "1. Objective" in summary_text
++        assert "Summary generation was unavailable" not in summary_text
++        assert c.compression_count == 1
  
- class TestSummaryFailureCooldown:
-     def test_summary_failure_enters_cooldown_and_skips_retry(self):
-@@ -547,8 +622,8 @@ class TestSummaryTargetRatio:
-         """Tail token budget should be threshold_tokens * summary_target_ratio."""
-         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
-             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
--        # 200K * 0.50 threshold * 0.40 ratio = 40K
--        assert c.tail_token_budget == 40_000
-+        # threshold_tokens = 170K (200K reference * 0.85)
-+        assert c.tail_token_budget == 68_000
  
-         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
-             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-@@ -583,12 +658,11 @@ class TestSummaryTargetRatio:
-         # 50% of 100K = 50K, but the floor is 64K
-         assert c.threshold_tokens == 64_000
- 
--    def test_threshold_floor_does_not_apply_above_128k(self):
--        """On large-context models the 50% percentage is used directly."""
-+    def test_200k_models_use_200k_reference_preemptive_threshold(self):
-+        """User policy: 200K-context models compact preemptively at 85% (170K)."""
-         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
-             c = ContextCompressor(model="test", quiet_mode=True)
--        # 50% of 200K = 100K, which is above the 64K floor
--        assert c.threshold_tokens == 100_000
-+        assert c.threshold_tokens == 170_000
- 
-     def test_default_protect_last_n_is_20(self):
-         """Default protect_last_n should be 20."""
+ class TestSummaryPrefixNormalization:

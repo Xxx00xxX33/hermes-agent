@@ -1,5 +1,4 @@
 diff --git a/agent/context_compressor.py b/agent/context_compressor.py
-index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c11c0222be 100644
 --- a/agent/context_compressor.py
 +++ b/agent/context_compressor.py
 @@ -1,8 +1,9 @@
@@ -15,17 +14,18 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
  
  Improvements over v1:
    - Structured summary template (Goal, Progress, Decisions, Files, Next Steps)
-@@ -15,7 +16,8 @@ Improvements over v1:
+@@ -15,7 +16,9 @@
  
  import logging
  import time
 -from typing import Any, Dict, List, Optional
 +import json
++import re
 +from typing import Any, Dict, List, Optional, Callable
  
  from agent.auxiliary_client import call_llm
  from agent.context_engine import ContextEngine
-@@ -44,8 +46,14 @@ _SUMMARY_RATIO = 0.20
+@@ -44,12 +47,20 @@
  # Absolute ceiling for summary tokens (even on very large context windows)
  _SUMMARY_TOKENS_CEILING = 12_000
  
@@ -40,7 +40,14 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
  
  # Chars per token rough estimate
  _CHARS_PER_TOKEN = 4
-@@ -88,10 +96,47 @@ class ContextCompressor(ContextEngine):
+-_SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
++_SUMMARY_RETRY_INITIAL_DELAY_SECONDS = 1.0
++_SUMMARY_RETRY_MAX_DELAY_SECONDS = 30.0
++_SUMMARY_MAX_LLM_ATTEMPTS = 3
+ 
+ 
+ class ContextCompressor(ContextEngine):
+@@ -88,10 +99,47 @@
          self.api_key = api_key
          self.provider = provider
          self.context_length = context_length
@@ -92,7 +99,7 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
  
      def __init__(
          self,
-@@ -106,6 +151,7 @@ class ContextCompressor(ContextEngine):
+@@ -106,6 +154,7 @@
          api_key: str = "",
          config_context_length: int | None = None,
          provider: str = "",
@@ -100,7 +107,7 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
      ):
          self.model = model
          self.base_url = base_url
-@@ -123,13 +169,10 @@ class ContextCompressor(ContextEngine):
+@@ -123,13 +172,10 @@
              provider=provider,
          )
          # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
@@ -118,7 +125,7 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
          self.compression_count = 0
  
          # Derive token budgets: ratio is relative to the threshold, not total context
-@@ -155,6 +198,7 @@ class ContextCompressor(ContextEngine):
+@@ -155,6 +201,7 @@
          self.last_completion_tokens = 0
  
          self.summary_model = summary_model_override or ""
@@ -126,7 +133,7 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
  
          # Stores the previous compaction summary for iterative updates
          self._previous_summary: Optional[str] = None
-@@ -180,6 +224,11 @@ class ContextCompressor(ContextEngine):
+@@ -180,6 +227,11 @@
      ) -> tuple[List[Dict[str, Any]], int]:
          """Replace old tool result contents with a short placeholder.
  
@@ -138,10 +145,11 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
          Walks backward from the end, protecting the most recent messages that
          fall within ``protect_tail_tokens`` (when provided) OR the last
          ``protect_tail_count`` messages (backward-compatible default).
-@@ -194,6 +243,25 @@ class ContextCompressor(ContextEngine):
+@@ -193,6 +245,25 @@
+ 
          result = [m.copy() for m in messages]
          pruned = 0
- 
++
 +        # Index assistant tool_calls so we can attach a one-line semantic note to each
 +        # pruned tool result (instead of a generic placeholder only).
 +        tool_call_index: Dict[str, tuple[str, str]] = {}
@@ -160,11 +168,10 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
 +                    args = getattr(fn_obj, "arguments", "") if fn_obj else ""
 +                if cid:
 +                    tool_call_index[cid] = (str(fn or ""), str(args or ""))
-+
+ 
          # Determine the prune boundary
          if protect_tail_tokens is not None and protect_tail_tokens > 0:
-             # Token-budget approach: walk backward accumulating tokens
-@@ -222,15 +290,94 @@ class ContextCompressor(ContextEngine):
+@@ -222,14 +293,93 @@
              if msg.get("role") != "tool":
                  continue
              content = msg.get("content", "")
@@ -185,7 +192,7 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
                  pruned += 1
  
          return result, pruned
- 
++
 +    @staticmethod
 +    def _safe_parse_json_maybe(text: str) -> Optional[dict]:
 +        """Best-effort parse for tool args/result payloads."""
@@ -257,28 +264,209 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
 +            first_line = tool_content.strip().splitlines()[0]
 +            return _clip(f"{name}: {first_line}")
 +        return _clip(f"{name} completed.")
-+
+ 
      # ------------------------------------------------------------------
      # Summarization
-     # ------------------------------------------------------------------
-@@ -344,38 +491,34 @@ PREVIOUS SUMMARY:
+@@ -306,7 +456,164 @@
+ 
+         return "\n\n".join(parts)
+ 
+-    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
++    def _build_summary_call_kwargs(self, prompt: str, summary_budget: int) -> Dict[str, Any]:
++        """Build the LLM request kwargs for context-summary generation."""
++        call_kwargs: Dict[str, Any] = {
++            "task": "compression",
++            "messages": [{"role": "user", "content": prompt}],
++            "max_tokens": summary_budget * 2,
++            # timeout resolved from auxiliary.compression.timeout config by call_llm
++            "extra_body": {
++                "reasoning": {
++                    "enabled": True,
++                    "effort": "medium",
++                }
++            },
++        }
++        if self.summary_model:
++            # Respect explicit compression-summary override when configured.
++            call_kwargs["model"] = self.summary_model
++        else:
++            # Default: summarize with the current active runtime model.
++            runtime_route = self._resolve_summary_runtime()
++            call_kwargs.update({
++                "provider": runtime_route["provider"],
++                "model": runtime_route["model"],
++                "base_url": runtime_route["base_url"],
++                "api_key": runtime_route["api_key"],
++                "allow_provider_fallback": True,
++            })
++        return call_kwargs
++
++    def _call_summary_llm(self, call_kwargs: Dict[str, Any]):
++        """Call the summary LLM, retrying once without reasoning hints if needed."""
++        try:
++            return call_llm(**call_kwargs)
++        except Exception as reasoning_err:
++            err_str = str(reasoning_err).lower()
++            if any(
++                needle in err_str
++                for needle in (
++                    "reasoning",
++                    "unsupported_parameter",
++                    "unknown parameter",
++                    "unexpected keyword",
++                    "extra_body",
++                    "extra fields not permitted",
++                )
++            ):
++                logger.info(
++                    "Context compression summary: reasoning=medium unsupported on %s (%s); retrying without reasoning",
++                    call_kwargs.get("model") or self.summary_model or self.model,
++                    reasoning_err,
++                )
++                retry_kwargs = dict(call_kwargs)
++                retry_kwargs.pop("extra_body", None)
++                return call_llm(**retry_kwargs)
++            raise
++
++    @staticmethod
++    def _extract_summary_body(response: Any) -> str:
++        """Extract the meaningful summary body from an LLM response."""
++        content = response.choices[0].message.content
++        if not isinstance(content, str):
++            content = str(content) if content else ""
++        text = content.strip()
++        for prefix in (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX):
++            if text.startswith(prefix):
++                text = text[len(prefix):].lstrip()
++                break
++        return text
++
++    @staticmethod
++    def _summary_retry_delay_seconds(attempt: int) -> float:
++        """Return capped exponential backoff for summary-generation retries."""
++        if attempt <= 0:
++            return 0.0
++        delay = _SUMMARY_RETRY_INITIAL_DELAY_SECONDS * (2 ** (attempt - 1))
++        return min(delay, _SUMMARY_RETRY_MAX_DELAY_SECONDS)
++
++    @staticmethod
++    def _strip_ansi(text: str) -> str:
++        """Remove ANSI escape sequences so fallback summaries stay readable."""
++        return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text or "")
++
++    def _build_deterministic_fallback_summary(
++        self,
++        turns_to_summarize: List[Dict[str, Any]],
++        *,
++        focus_topic: str | None = None,
++        failure_reason: str = "",
++    ) -> str:
++        """Generate a readable local fallback summary when the LLM path fails."""
++        user_points: list[str] = []
++        assistant_points: list[str] = []
++        tool_points: list[str] = []
++        references: list[str] = []
++
++        def _clip(text: str, limit: int = 220) -> str:
++            clean = " ".join(self._strip_ansi(text).split())
++            if len(clean) <= limit:
++                return clean
++            return clean[: limit - 3] + "..."
++
++        ref_pattern = re.compile(r"(?:~?/[^\s\]\[\)\(]+|https?://\S+|\b\d{2,5}\b)")
++
++        for msg in turns_to_summarize:
++            role = str(msg.get("role") or "")
++            content = _clip(str(msg.get("content") or ""))
++            if role == "user" and content:
++                user_points.append(content)
++            elif role == "assistant" and content:
++                assistant_points.append(content)
++            elif role == "tool":
++                tool_id = str(msg.get("tool_call_id") or "").strip()
++                tool_summary = f"tool result {tool_id}: {content}" if tool_id else f"tool result: {content}"
++                if content:
++                    tool_points.append(tool_summary)
++
++            for match in ref_pattern.findall(str(msg.get("content") or "")):
++                cleaned = self._strip_ansi(match).strip().rstrip('.,:;')
++                if cleaned and cleaned not in references:
++                    references.append(cleaned)
++                if len(references) >= 8:
++                    break
++            if len(references) >= 8:
++                continue
++
++        objective = user_points[0] if user_points else "Continue the in-progress conversation after compaction."
++        current_state = assistant_points[-2:] or user_points[-2:] or ["Recent turns were compacted with a deterministic local fallback summary."]
++        next_actions = []
++        if focus_topic:
++            next_actions.append(f"Prioritize the focus topic during continuation: {focus_topic}")
++        next_actions.append("Resume from the preserved recent turns and current file/tool state.")
++        if tool_points:
++            next_actions.append("Re-check any important tool outputs against live state before acting on them.")
++
++        hard_constraints = []
++        if failure_reason:
++            hard_constraints.append(f"Remote summary generation failed: {failure_reason}")
++        hard_constraints.append("This fallback summary was generated locally to avoid losing continuity.")
++
++        critical_refs = references[:8] or ["Use the preserved tail messages and current workspace state as ground truth."]
++        dropped_details = [
++            "Verbose middle-turn history was compressed mechanically after summary-generation failures.",
++            "Older raw tool outputs may have been truncated or replaced by shorter notes.",
++        ]
++
++        sections = [
++            "1. Objective\n- " + objective,
++            "2. Current state\n" + "\n".join(f"- {item}" for item in current_state),
++            "3. Hard constraints\n" + "\n".join(f"- {item}" for item in hard_constraints),
++            "4. Key decisions made\n- Continue from current repo/tool state rather than replaying dropped turns.",
++            "5. Open issues / uncertainties\n- Some details were reconstructed locally because the remote summarizer was unavailable.",
++            "6. Next actions\n" + "\n".join(f"- {item}" for item in next_actions),
++            "7. Critical references\n" + "\n".join(f"- {item}" for item in critical_refs),
++            "8. Dropped details\n" + "\n".join(f"- {item}" for item in dropped_details),
++        ]
++        return "\n\n".join(sections)
++
++    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> str:
+         """Generate a structured summary of conversation turns.
+ 
+         Uses a structured template (Goal, Progress, Decisions, Files, Next Steps)
+@@ -319,18 +626,10 @@
+                 related to this topic and is more aggressive about compressing
+                 everything else.  Inspired by Claude Code's ``/compact``.
+ 
+-        Returns None if all attempts fail — the caller should drop
+-        the middle turns without a summary rather than inject a useless
+-        placeholder.
++        Retries the remote summarizer up to a bounded number of times. If the
++        LLM path still fails, return a deterministic local handoff summary so
++        compaction never deletes history without leaving a usable summary.
+         """
+-        now = time.monotonic()
+-        if now < self._summary_failure_cooldown_until:
+-            logger.debug(
+-                "Skipping context summary during cooldown (%.0fs remaining)",
+-                self._summary_failure_cooldown_until - now,
+-            )
+-            return None
+-
+         summary_budget = self._compute_summary_budget(turns_to_summarize)
+         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+ 
+@@ -344,38 +643,34 @@
  NEW TURNS TO INCORPORATE:
  {content_to_summarize}
  
 -Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new progress. Move items from "In Progress" to "Done" when completed. Remove information only if it is clearly obsolete.
-+Update the summary using this exact structure. Preserve what is still relevant, add new progress, and delete only what is clearly obsolete.
- 
+-
 -## Goal
 -[What the user is trying to accomplish — preserve from previous summary, update if goal evolved]
-+1. Objective
-+- What the user ultimately wants
- 
+-
 -## Constraints & Preferences
 -[User preferences, coding style, constraints, important decisions — accumulate across compactions]
-+2. Current state
-+- What has already been completed
-+- What is currently true
- 
+-
 -## Progress
 -### Done
 -[Completed work — include specific file paths, commands run, results obtained]
@@ -286,54 +474,64 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
 -[Work currently underway]
 -### Blocked
 -[Any blockers or issues encountered]
-+3. Hard constraints
-+- Non-negotiable rules, preferences, boundaries, and environment constraints
- 
+-
 -## Key Decisions
 -[Important technical decisions and why they were made]
-+4. Key decisions made
-+- Decisions that future steps must respect
- 
+-
 -## Relevant Files
 -[Files read, modified, or created — with brief note on each. Accumulate across compactions.]
-+5. Open issues / uncertainties
-+- What is unresolved and why it matters
- 
+-
 -## Next Steps
 -[What needs to happen next to continue the work]
-+6. Next actions
-+- Ordered list of immediate next steps
- 
+-
 -## Critical Context
 -[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
-+7. Critical references
-+- File paths, commands, URLs, identifiers, APIs, services, ports, schemas, or entities that must remain available
- 
+-
 -## Tools & Patterns
 -[Which tools were used, how they were used effectively, and any tool-specific discoveries. Accumulate across compactions.]
+-
+-Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions.
++Update the summary using this exact structure. Preserve what is still relevant, add new progress, and delete only what is clearly obsolete.
++
++1. Objective
++- What the user ultimately wants
++
++2. Current state
++- What has already been completed
++- What is currently true
++
++3. Hard constraints
++- Non-negotiable rules, preferences, boundaries, and environment constraints
++
++4. Key decisions made
++- Decisions that future steps must respect
++
++5. Open issues / uncertainties
++- What is unresolved and why it matters
++
++6. Next actions
++- Ordered list of immediate next steps
++
++7. Critical references
++- File paths, commands, URLs, identifiers, APIs, services, ports, schemas, or entities that must remain available
++
 +8. Dropped details
 +- Briefly note what categories were intentionally omitted or compressed
- 
--Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions.
++
 +Target ~{summary_budget} tokens. Preserve continuity + constraints; discard verbose history.
  
  Write only the summary body. Do not include any preamble or prefix."""
          else:
-@@ -387,36 +530,32 @@ TURNS TO SUMMARIZE:
+@@ -387,36 +682,32 @@
  
  Use this exact structure:
  
 -## Goal
 -[What the user is trying to accomplish]
-+1. Objective
-+- What the user ultimately wants
- 
+-
 -## Constraints & Preferences
 -[User preferences, coding style, constraints, important decisions]
-+2. Current state
-+- What has already been completed
-+- What is currently true
- 
+-
 -## Progress
 -### Done
 -[Completed work — include specific file paths, commands run, results obtained]
@@ -341,99 +539,195 @@ index 0fa056b61ca2666a4284fddc089d9fad9a43d428..f0cdb716de62946896a77cffb54420c1
 -[Work currently underway]
 -### Blocked
 -[Any blockers or issues encountered]
-+3. Hard constraints
-+- Non-negotiable rules, preferences, boundaries, and environment constraints
- 
+-
 -## Key Decisions
 -[Important technical decisions and why they were made]
-+4. Key decisions made
-+- Decisions that future steps must respect
- 
+-
 -## Relevant Files
 -[Files read, modified, or created — with brief note on each]
-+5. Open issues / uncertainties
-+- What is unresolved and why it matters
- 
+-
 -## Next Steps
 -[What needs to happen next to continue the work]
-+6. Next actions
-+- Ordered list of immediate next steps
- 
+-
 -## Critical Context
 -[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
-+7. Critical references
-+- File paths, commands, URLs, identifiers, APIs, services, ports, schemas, or entities that must remain available
- 
+-
 -## Tools & Patterns
 -[Which tools were used, how they were used effectively, and any tool-specific discoveries (e.g., preferred flags, working invocations, successful command patterns)]
+-
+-Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions. The goal is to prevent the next assistant from repeating work or losing important details.
++1. Objective
++- What the user ultimately wants
++
++2. Current state
++- What has already been completed
++- What is currently true
++
++3. Hard constraints
++- Non-negotiable rules, preferences, boundaries, and environment constraints
++
++4. Key decisions made
++- Decisions that future steps must respect
++
++5. Open issues / uncertainties
++- What is unresolved and why it matters
++
++6. Next actions
++- Ordered list of immediate next steps
++
++7. Critical references
++- File paths, commands, URLs, identifiers, APIs, services, ports, schemas, or entities that must remain available
++
 +8. Dropped details
 +- Briefly note what categories were intentionally omitted or compressed
- 
--Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions. The goal is to prevent the next assistant from repeating work or losing important details.
++
 +Target ~{summary_budget} tokens. Preserve task continuity and hard constraints; discard verbose history. Be specific (file paths, commands, identifiers) where precision matters.
  
  Write only the summary body. Do not include any preamble or prefix."""
  
-@@ -434,10 +573,50 @@ The user has requested that this compaction PRIORITISE preserving all informatio
-                 "messages": [{"role": "user", "content": prompt}],
-                 "max_tokens": summary_budget * 2,
-                 # timeout resolved from auxiliary.compression.timeout config by call_llm
-+                "extra_body": {
-+                    "reasoning": {
-+                        "enabled": True,
-+                        "effort": "medium",
-+                    }
-+                },
-             }
-             if self.summary_model:
-+                # Respect explicit compression-summary override when configured.
-                 call_kwargs["model"] = self.summary_model
+@@ -428,41 +719,71 @@
+ FOCUS TOPIC: "{focus_topic}"
+ The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget."""
+ 
+-        try:
+-            call_kwargs = {
+-                "task": "compression",
+-                "messages": [{"role": "user", "content": prompt}],
+-                "max_tokens": summary_budget * 2,
+-                # timeout resolved from auxiliary.compression.timeout config by call_llm
+-            }
+-            if self.summary_model:
+-                call_kwargs["model"] = self.summary_model
 -            response = call_llm(**call_kwargs)
-+            else:
-+                # Default: summarize with the current active runtime model.
-+                runtime_route = self._resolve_summary_runtime()
-+                call_kwargs.update({
-+                    "provider": runtime_route["provider"],
-+                    "model": runtime_route["model"],
-+                    "base_url": runtime_route["base_url"],
-+                    "api_key": runtime_route["api_key"],
-+                    "allow_provider_fallback": True,
-+                })
+-            content = response.choices[0].message.content
+-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
+-            if not isinstance(content, str):
+-                content = str(content) if content else ""
+-            summary = content.strip()
+-            # Store for iterative updates on next compaction
+-            self._previous_summary = summary
+-            self._summary_failure_cooldown_until = 0.0
+-            return self._with_summary_prefix(summary)
+-        except RuntimeError:
+-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+-            logging.warning("Context compression: no provider available for "
+-                            "summary. Middle turns will be dropped without summary "
+-                            "for %d seconds.",
+-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
+-            return None
+-        except Exception as e:
+-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+-            logging.warning(
+-                "Failed to generate context summary: %s. "
+-                "Further summary attempts paused for %d seconds.",
+-                e,
+-                _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+-            )
+-            return None
++        attempt = 0
++        last_error: Exception | None = None
++        while attempt < _SUMMARY_MAX_LLM_ATTEMPTS:
++            attempt += 1
 +            try:
-+                response = call_llm(**call_kwargs)
-+            except Exception as reasoning_err:
-+                err_str = str(reasoning_err).lower()
-+                if any(
-+                    needle in err_str
-+                    for needle in (
-+                        "reasoning",
-+                        "unsupported_parameter",
-+                        "unknown parameter",
-+                        "unexpected keyword",
-+                        "extra_body",
-+                        "extra fields not permitted",
-+                    )
-+                ):
++                call_kwargs = self._build_summary_call_kwargs(prompt, summary_budget)
++                response = self._call_summary_llm(call_kwargs)
++                summary = self._extract_summary_body(response)
++                if not summary:
++                    raise ValueError("Summary LLM returned empty content")
++
++                # Store for iterative updates on next compaction
++                self._previous_summary = summary
++                self._summary_failure_cooldown_until = 0.0
++                if attempt > 1:
 +                    logger.info(
-+                        "Context compression summary: reasoning=medium unsupported on %s (%s); retrying without reasoning",
-+                        self.summary_model or self.model,
-+                        reasoning_err,
++                        "Context compression summary succeeded after %d attempts",
++                        attempt,
 +                    )
-+                    call_kwargs.pop("extra_body", None)
-+                    response = call_llm(**call_kwargs)
-+                else:
-+                    raise
-             content = response.choices[0].message.content
-             # Handle cases where content is not a string (e.g., dict from llama.cpp)
-             if not isinstance(content, str):
++                return self._with_summary_prefix(summary)
++            except RuntimeError as e:
++                last_error = e
++                if attempt < _SUMMARY_MAX_LLM_ATTEMPTS:
++                    delay = self._summary_retry_delay_seconds(attempt)
++                    logger.warning(
++                        "Context compression summary unavailable on attempt %d/%d: %s. Retrying in %.1fs.",
++                        attempt,
++                        _SUMMARY_MAX_LLM_ATTEMPTS,
++                        e,
++                        delay,
++                    )
++                    time.sleep(delay)
++                    continue
++                logger.warning(
++                    "Context compression summary unavailable after %d attempts: %s. Using deterministic local fallback summary.",
++                    attempt,
++                    e,
++                )
++            except Exception as e:
++                last_error = e
++                if attempt < _SUMMARY_MAX_LLM_ATTEMPTS:
++                    delay = self._summary_retry_delay_seconds(attempt)
++                    logger.warning(
++                        "Failed to generate context summary on attempt %d/%d: %s. Retrying in %.1fs.",
++                        attempt,
++                        _SUMMARY_MAX_LLM_ATTEMPTS,
++                        e,
++                        delay,
++                    )
++                    time.sleep(delay)
++                    continue
++                logger.warning(
++                    "Failed to generate context summary after %d attempts: %s. Using deterministic local fallback summary.",
++                    attempt,
++                    e,
++                )
++
++        fallback_summary = self._build_deterministic_fallback_summary(
++            turns_to_summarize,
++            focus_topic=focus_topic,
++            failure_reason=str(last_error or "summary generation failed"),
++        )
++        self._previous_summary = fallback_summary
++        self._summary_failure_cooldown_until = 0.0
++        return self._with_summary_prefix(fallback_summary)
+ 
+     @staticmethod
+     def _with_summary_prefix(summary: str) -> str:
+@@ -733,18 +1054,17 @@
+                 )
+             compressed.append(msg)
+ 
+-        # If LLM summary failed, insert a static fallback so the model
+-        # knows context was lost rather than silently dropping everything.
++        # _generate_summary should already guarantee a usable handoff summary,
++        # but keep a local deterministic fallback here as a final safety net.
+         if not summary:
+             if not self.quiet_mode:
+-                logger.warning("Summary generation failed — inserting static fallback context marker")
+-            n_dropped = compress_end - compress_start
+-            summary = (
+-                f"{SUMMARY_PREFIX}\n"
+-                f"Summary generation was unavailable. {n_dropped} conversation turns were "
+-                f"removed to free context space but could not be summarized. The removed "
+-                f"turns contained earlier work in this session. Continue based on the "
+-                f"recent messages below and the current state of any files or resources."
++                logger.warning("Summary generation returned empty output — inserting deterministic local fallback summary")
++            summary = self._with_summary_prefix(
++                self._build_deterministic_fallback_summary(
++                    turns_to_summarize,
++                    focus_topic=focus_topic,
++                    failure_reason="summary generation returned empty output",
++                )
+             )
+ 
+         _merge_summary_into_tail = False
 diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
-index 26d913a029827842544ab67b1548d9a560966c30..bcf1c280bbf87a9bfbdd7a752830681cd35e57ff 100644
 --- a/agent/prompt_builder.py
 +++ b/agent/prompt_builder.py
-@@ -235,6 +235,14 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
+@@ -234,6 +234,14 @@
+     "- Do not skip prerequisite steps just because the final action seems obvious.\n"
      "- If a task depends on output from a prior step, resolve that dependency first.\n"
      "</prerequisite_checks>\n"
-     "\n"
++    "\n"
 +    "<background_task_strategy>\n"
 +    "- When a shell command is independent and likely to be long-running or take more than a minute, prefer terminal(background=true, notify_on_complete=true) instead of blocking in foreground.\n"
 +    "- Use this especially for tests, builds, deployments, downloads, servers, watchers, and deliberate waits like sleep when there is other work you can continue.\n"
@@ -441,15 +735,13 @@ index 26d913a029827842544ab67b1548d9a560966c30..bcf1c280bbf87a9bfbdd7a752830681c
 +    "- Keep short commands or dependency-blocking steps in the foreground when their result is needed right away.\n"
 +    "- On RAM-constrained machines, do not stack multiple memory-heavy or resource-heavy jobs in the background just to be proactive.\n"
 +    "</background_task_strategy>\n"
-+    "\n"
+     "\n"
      "<verification>\n"
      "Before finalizing your response:\n"
-     "- Correctness: does the output satisfy every stated requirement?\n"
 diff --git a/agent/title_generator.py b/agent/title_generator.py
-index 741fe8b09c58bcc50f6fd9ccfe5cb0a818051014..80b5386acf857f63071dd99567b538d15fe721f0 100644
 --- a/agent/title_generator.py
 +++ b/agent/title_generator.py
-@@ -17,13 +17,62 @@ _TITLE_PROMPT = (
+@@ -17,13 +17,62 @@
      "following exchange. The title should capture the main topic or intent. "
      "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
  )
@@ -514,7 +806,7 @@ index 741fe8b09c58bcc50f6fd9ccfe5cb0a818051014..80b5386acf857f63071dd99567b538d1
      """
      # Truncate long messages to keep the request small
      user_snippet = user_message[:500] if user_message else ""
-@@ -34,14 +83,30 @@ def generate_title(user_message: str, assistant_response: str, timeout: float =
+@@ -34,14 +83,30 @@
          {"role": "user", "content": f"User: {user_snippet}\n\nAssistant: {assistant_snippet}"},
      ]
  
@@ -553,10 +845,9 @@ index 741fe8b09c58bcc50f6fd9ccfe5cb0a818051014..80b5386acf857f63071dd99567b538d1
          # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
          title = title.strip('"\'')
 diff --git a/cli.py b/cli.py
-index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019a58782ef 100644
 --- a/cli.py
 +++ b/cli.py
-@@ -66,6 +66,8 @@ from agent.usage_pricing import (
+@@ -66,6 +66,8 @@
  from hermes_cli.banner import _format_context_length, format_banner_version_label
  
  _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
@@ -565,7 +856,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
  
  # Load .env from ~/.hermes/.env first, then project root as dev fallback.
-@@ -273,6 +275,7 @@ def load_cli_config() -> Dict[str, Any]:
+@@ -273,6 +275,7 @@
          "display": {
              "compact": False,
              "resume_display": "full",
@@ -573,7 +864,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              "show_reasoning": False,
              "streaming": True,
              "busy_input_mode": "interrupt",
-@@ -1059,6 +1062,57 @@ def _rich_text_from_ansi(text: str) -> _RichText:
+@@ -1059,6 +1062,57 @@
      return _RichText.from_ansi(text or "")
  
  
@@ -631,7 +922,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  def _cprint(text: str):
      """Print ANSI-colored text through prompt_toolkit's native renderer.
  
-@@ -1618,6 +1672,13 @@ class HermesCLI:
+@@ -1618,6 +1672,13 @@
          self.tool_progress_mode = "off" if _raw_tp is False else str(_raw_tp)
          # resume_display: "full" (show history) | "minimal" (one-liner only)
          self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
@@ -645,7 +936,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          # bell_on_complete: play terminal bell (\a) when agent finishes a response
          self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
          # show_reasoning: display model thinking/reasoning before the response
-@@ -1670,6 +1731,8 @@ class HermesCLI:
+@@ -1670,6 +1731,8 @@
  
          self._explicit_api_key = api_key
          self._explicit_base_url = base_url
@@ -654,7 +945,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
          # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
          self.requested_provider = (
-@@ -1695,6 +1758,14 @@ class HermesCLI:
+@@ -1695,6 +1758,14 @@
              self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
          else:
              self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
@@ -669,7 +960,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          # Max turns priority: CLI arg > config file > env var > default
          if max_turns is not None:  # CLI arg was explicitly set
              self.max_turns = max_turns
-@@ -1739,9 +1810,8 @@ class HermesCLI:
+@@ -1739,9 +1810,8 @@
          )
          
          # Reasoning config (OpenRouter reasoning effort level)
@@ -681,7 +972,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          self.service_tier = _parse_service_tier_config(
              CLI_CONFIG["agent"].get("service_tier", "")
          )
-@@ -1794,7 +1864,9 @@ class HermesCLI:
+@@ -1794,7 +1864,9 @@
              timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
              short_uuid = uuid.uuid4().hex[:6]
              self.session_id = f"{timestamp_str}_{short_uuid}"
@@ -692,7 +983,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          # History file for persistent input recall across sessions
          self._history_file = _hermes_home / ".hermes_history"
          self._last_invalidate: float = 0.0  # throttle UI repaints
-@@ -1846,6 +1918,23 @@ class HermesCLI:
+@@ -1846,6 +1918,23 @@
          # Background task tracking: {task_id: threading.Thread}
          self._background_tasks: Dict[str, threading.Thread] = {}
          self._background_task_counter = 0
@@ -716,10 +1007,11 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
      def _invalidate(self, min_interval: float = 0.25) -> None:
          """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
-@@ -1871,6 +1960,1005 @@ class HermesCLI:
+@@ -1870,6 +1959,1030 @@
+         safe_percent = max(0, min(100, percent_used or 0))
          filled = round((safe_percent / 100) * width)
          return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
- 
++
 +    def _get_status_bar_todo_items(self) -> List[Dict[str, str]] | None:
 +        """Return normalized todo items for status bar rendering.
 +
@@ -893,11 +1185,29 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +        return score
 +
 +    @staticmethod
++    def _is_invalid_tmux_task_text(text: Any) -> bool:
++        import re
++
++        raw = " ".join(str(text or "").split()).strip()
++        if not raw:
++            return False
++
++        if re.match(r"^\[\s*context\s+compaction\s*\]", raw, re.IGNORECASE):
++            return True
++        if re.match(r"^<\s*(?:magicmock|mock|asyncmock|noncallablemagicmock)\b", raw, re.IGNORECASE):
++            return True
++        if re.match(r"^<[^>]+\bobject\s+at\s+0x[0-9a-f]+>$", raw, re.IGNORECASE):
++            return True
++        return False
++
++    @staticmethod
 +    def _summarize_prompt_task(content: Any, *, max_len: int = 96) -> str:
 +        import re
 +
 +        safe_max_len = max(4, int(max_len or 96))
 +        raw_text = HermesCLI._extract_prompt_task_text(content)
++        if HermesCLI._is_invalid_tmux_task_text(raw_text):
++            return ""
 +        clauses = []
 +        lines = []
 +        order = 0
@@ -949,6 +1259,8 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +
 +        text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
 +        text = " ".join(text.split()).strip()
++        if HermesCLI._is_invalid_tmux_task_text(text):
++            return ""
 +        if len(text) > safe_max_len:
 +            text = text[: safe_max_len - 3].rstrip() + "..."
 +        return text
@@ -956,6 +1268,9 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +    @staticmethod
 +    def _is_low_signal_prompt_task(text: str) -> bool:
 +        import re
++
++        if HermesCLI._is_invalid_tmux_task_text(text):
++            return True
 +
 +        low_signal_prompts = {
 +            "continue",
@@ -1166,6 +1481,8 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +
 +        # Normalize and enforce width constraints.
 +        title = " ".join(title.split()).strip().strip(" \t\r\n,，。！？!?:：;；/|-")
++        if self._is_invalid_tmux_task_text(title):
++            return ""
 +        title = self._truncate_tmux_task_title(title)
 +        return title
 +
@@ -1718,11 +2035,10 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                return title
 +
 +        return ""
-+
+ 
      def _get_status_bar_snapshot(self) -> Dict[str, Any]:
          # Prefer the agent's model name — it updates on fallback.
-         # self.model reflects the originally configured model and never
-@@ -1888,6 +2976,8 @@ class HermesCLI:
+@@ -1888,6 +3001,8 @@
          snapshot = {
              "model_name": model_name,
              "model_short": model_short,
@@ -1731,7 +2047,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              "duration": format_duration_compact(elapsed_seconds),
              "context_tokens": 0,
              "context_length": None,
-@@ -2004,9 +3094,31 @@ class HermesCLI:
+@@ -2004,9 +3119,31 @@
              return 0
          return 0 if self._use_minimal_tui_chrome(width=width) else 1
  
@@ -1764,11 +2080,15 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              return 0
          return 0 if self._use_minimal_tui_chrome(width=width) else 1
  
-@@ -2036,29 +3148,88 @@ class HermesCLI:
+@@ -2036,28 +3173,87 @@
                  width = self._get_tui_terminal_width()
              percent = snapshot["context_percent"]
              percent_label = f"{percent}%" if percent is not None else "--"
 -            duration_label = snapshot["duration"]
+-
+-            if width < 52:
+-                text = f"⚕ {snapshot['model_short']} · {duration_label}"
+-                return self._trim_status_bar_text(text, width)
 +            provider_label = snapshot.get("provider_label") or snapshot.get("provider") or "unknown"
 +            reasoning_label, _ = self._get_status_bar_reasoning_label(
 +                getattr(self, "reasoning_config", None),
@@ -1778,10 +2098,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +            background_label, _ = self._get_status_bar_background_task_label(
 +                self._get_status_bar_background_task_snapshot()
 +            )
- 
--            if width < 52:
--                text = f"⚕ {snapshot['model_short']} · {duration_label}"
--                return self._trim_status_bar_text(text, width)
++
              if width < 76:
 -                parts = [f"⚕ {snapshot['model_short']}", percent_label]
 -                parts.append(duration_label)
@@ -1830,7 +2147,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +            return self._trim_status_bar_text(current, width)
          except Exception:
              return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
- 
++
 +    def _fit_status_bar_fragments(self, frags, width: int, fallback_style: str = "class:status-bar"):
 +        total_width = sum(self._status_bar_display_width(text) for _, text in frags)
 +        if total_width > width:
@@ -1866,11 +2183,10 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +            ctx_used = format_token_count_compact(snapshot["context_tokens"])
 +            return f"{ctx_used}/{ctx_total}"
 +        return "ctx --"
-+
+ 
      def _get_status_bar_fragments(self):
          if not self._status_bar_visible or getattr(self, '_model_picker_state', None):
-             return []
-@@ -2070,60 +3241,110 @@ class HermesCLI:
+@@ -2070,60 +3266,110 @@
              # actually renders, causing the fragments to overflow to a second
              # line and produce duplicated status bar rows over long sessions.
              width = self._get_tui_terminal_width()
@@ -1916,6 +2232,28 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 -                        context_label = f"{ctx_used}/{ctx_total}"
 -                    else:
 -                        context_label = "ctx --"
+-
+-                    bar_style = self._status_bar_context_style(percent)
+-                    frags = [
+-                        ("class:status-bar", " ⚕ "),
+-                        ("class:status-bar-strong", snapshot["model_short"]),
+-                        ("class:status-bar-dim", " │ "),
+-                        ("class:status-bar-dim", context_label),
+-                        ("class:status-bar-dim", " │ "),
+-                        (bar_style, self._build_context_bar(percent)),
+-                        ("class:status-bar-dim", " "),
+-                        (bar_style, percent_label),
+-                        ("class:status-bar-dim", " │ "),
+-                        ("class:status-bar-dim", duration_label),
+-                        ("class:status-bar", " "),
+-                    ]
+-
+-            total_width = sum(self._status_bar_display_width(text) for _, text in frags)
+-            if total_width > width:
+-                plain_text = "".join(text for _, text in frags)
+-                trimmed = self._trim_status_bar_text(plain_text, width)
+-                return [("class:status-bar", trimmed)]
+-            return frags
 +                separator = " │ "
 +
 +            frags = [
@@ -1944,23 +2282,9 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +            optional_groups.append([("class:status-bar", " ")])
 +
 +            return self._fit_status_bar_fragments_with_optional_groups(frags, optional_groups, width)
-+        except Exception:
-+            return [("class:status-bar", f" {self._build_status_bar_text()} ")]
- 
--                    bar_style = self._status_bar_context_style(percent)
--                    frags = [
--                        ("class:status-bar", " ⚕ "),
--                        ("class:status-bar-strong", snapshot["model_short"]),
--                        ("class:status-bar-dim", " │ "),
--                        ("class:status-bar-dim", context_label),
--                        ("class:status-bar-dim", " │ "),
--                        (bar_style, self._build_context_bar(percent)),
--                        ("class:status-bar-dim", " "),
--                        (bar_style, percent_label),
--                        ("class:status-bar-dim", " │ "),
--                        ("class:status-bar-dim", duration_label),
--                        ("class:status-bar", " "),
--                    ]
+         except Exception:
+             return [("class:status-bar", f" {self._build_status_bar_text()} ")]
++
 +    def _get_status_bar_secondary_fragments(self):
 +        if not self._status_bar_visible or getattr(self, '_model_picker_state', None):
 +            return []
@@ -1990,13 +2314,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                    None,
 +                    compact=width < 76,
 +                )
- 
--            total_width = sum(self._status_bar_display_width(text) for _, text in frags)
--            if total_width > width:
--                plain_text = "".join(text for _, text in frags)
--                trimmed = self._trim_status_bar_text(plain_text, width)
--                return [("class:status-bar", trimmed)]
--            return frags
++
 +            primary_frags = [
 +                ("class:status-bar", " "),
 +                *task_fragments,
@@ -2025,13 +2343,12 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                optional_groups,
 +                width,
 +            )
-         except Exception:
--            return [("class:status-bar", f" {self._build_status_bar_text()} ")]
++        except Exception:
 +            return []
  
      def _normalize_model_for_provider(self, resolved_provider: str) -> bool:
          """Normalize provider-specific model IDs and routing."""
-@@ -2238,14 +3459,65 @@ class HermesCLI:
+@@ -2238,13 +3484,64 @@
  
      # ── Streaming display ────────────────────────────────────────────────
  
@@ -2061,7 +2378,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          if self.verbose and not self.show_reasoning:
              return self._on_reasoning
          return None
- 
++
 +    def _reasoning_debug_enabled(self) -> bool:
 +        """Return True when temporary reasoning/stream instrumentation is enabled."""
 +        flag = str(os.getenv("HERMES_REASONING_DEBUG", "")).strip().lower()
@@ -2093,11 +2410,10 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 +        except Exception:
 +            logger.debug("Failed to write reasoning debug event", exc_info=True)
-+
+ 
      def _emit_reasoning_preview(self, reasoning_text: str) -> None:
          """Render a buffered reasoning preview as a single [thinking] block."""
-         import re
-@@ -2347,6 +3619,11 @@ class HermesCLI:
+@@ -2347,6 +3644,11 @@
          if not text:
              return
          self._reasoning_shown_this_turn = True
@@ -2109,7 +2425,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          if getattr(self, "_stream_box_opened", False):
              return
  
-@@ -2357,6 +3634,7 @@ class HermesCLI:
+@@ -2357,6 +3659,7 @@
              r_label = " Reasoning "
              r_fill = w - 2 - len(r_label)
              _cprint(f"\n{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}")
@@ -2117,7 +2433,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
          self._reasoning_buf = getattr(self, "_reasoning_buf", "") + text
  
-@@ -2372,6 +3650,10 @@ class HermesCLI:
+@@ -2372,6 +3675,10 @@
      def _close_reasoning_box(self) -> None:
          """Close the live reasoning box if it's open."""
          if getattr(self, "_reasoning_box_opened", False):
@@ -2128,7 +2444,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              # Flush remaining reasoning buffer
              buf = getattr(self, "_reasoning_buf", "")
              if buf:
-@@ -2386,6 +3668,7 @@ class HermesCLI:
+@@ -2386,6 +3693,7 @@
              if deferred:
                  self._deferred_content = ""
                  self._emit_stream_text(deferred)
@@ -2136,7 +2452,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
      def _stream_delta(self, text) -> None:
          """Line-buffered streaming callback for real-time token rendering.
-@@ -2532,11 +3815,21 @@ class HermesCLI:
+@@ -2532,11 +3840,21 @@
          if not text:
              return
  
@@ -2158,7 +2474,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              return
  
          # Close the live reasoning box before opening the response box
-@@ -2569,6 +3862,7 @@ class HermesCLI:
+@@ -2569,6 +3887,7 @@
              w = shutil.get_terminal_size().columns
              fill = w - 2 - len(label)
              _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
@@ -2166,7 +2482,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
          self._stream_buf += text
  
-@@ -2580,6 +3874,12 @@ class HermesCLI:
+@@ -2580,6 +3899,12 @@
  
      def _flush_stream(self) -> None:
          """Emit any remaining partial line from the stream buffer and close the box."""
@@ -2179,7 +2495,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          # If we're still inside a "reasoning block" at end-of-stream, it was
          # a false positive — the model mentioned a tag like <think> in prose
          # but never closed it.  Recover the buffered content as regular text.
-@@ -2603,6 +3903,12 @@ class HermesCLI:
+@@ -2603,6 +3928,12 @@
  
      def _reset_stream_state(self) -> None:
          """Reset streaming state before each agent invocation."""
@@ -2192,7 +2508,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          self._stream_buf = ""
          self._stream_started = False
          self._stream_box_opened = False
-@@ -2641,6 +3947,49 @@ class HermesCLI:
+@@ -2641,6 +3972,49 @@
          frame_idx = int(_time.monotonic() * 10) % len(_COMMAND_SPINNER_FRAMES)
          return _COMMAND_SPINNER_FRAMES[frame_idx]
  
@@ -2242,7 +2558,46 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
      @contextmanager
      def _busy_command(self, status: str):
          """Expose a temporary busy state in the TUI while a slash command runs."""
-@@ -2809,10 +4158,13 @@ class HermesCLI:
+@@ -2677,6 +4051,9 @@
+             message = format_runtime_provider_error(exc)
+             ChatConsole().print(f"[bold red]{message}[/]")
+             return False
++
++        previous_model = self.model
++        previous_base_url = str(self.base_url or "").strip().rstrip("/")
+ 
+         api_key = runtime.get("api_key")
+         base_url = runtime.get("base_url")
+@@ -2732,10 +4109,27 @@
+         runtime_model = runtime.get("model")
+         if runtime_model and isinstance(runtime_model, str):
+             self.model = runtime_model
++        elif resolved_provider == "custom":
++            model_cfg = self.config.get("model", {}) if isinstance(self.config, dict) else {}
++            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
++            cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
++            cfg_default_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
++            resolved_base_url = str(base_url or "").strip().rstrip("/")
++            requested_provider = str(getattr(self, "requested_provider", "") or "").strip().lower()
++            if (
++                requested_provider == "custom"
++                and cfg_provider == "custom"
++                and cfg_default_model
++                and cfg_base_url
++                and resolved_base_url == cfg_base_url
++                and resolved_base_url != previous_base_url
++            ):
++                self.model = cfg_default_model
+ 
+         # Normalize model for the resolved provider (e.g. swap non-Codex
+         # models when provider is openai-codex).  Fixes #651.
+-        model_changed = self._normalize_model_for_provider(resolved_provider)
++        normalized_model_changed = self._normalize_model_for_provider(resolved_provider)
++        model_changed = normalized_model_changed or self.model != previous_model
+ 
+         # AIAgent/OpenAI client holds auth at init time, so rebuild if key,
+         # routing, or the effective model changed.
+@@ -2809,10 +4203,13 @@
                  _cprint(f"\033[1;31mSession not found: {self.session_id}{_RST}")
                  _cprint(f"{_DIM}Use a session ID from a previous CLI run (hermes sessions list).{_RST}")
                  return False
@@ -2257,7 +2612,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  msg_count = len([m for m in restored if m.get("role") == "user"])
                  title_part = ""
                  if session_meta.get("title"):
-@@ -2853,6 +4205,7 @@ class HermesCLI:
+@@ -2853,6 +4250,7 @@
                  api_key=runtime.get("api_key"),
                  base_url=runtime.get("base_url"),
                  provider=runtime.get("provider"),
@@ -2265,7 +2620,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  api_mode=runtime.get("api_mode"),
                  acp_command=runtime.get("command"),
                  acp_args=runtime.get("args"),
-@@ -2895,13 +4248,13 @@ class HermesCLI:
+@@ -2895,13 +4293,13 @@
              # Route agent status output through prompt_toolkit so ANSI escape
              # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
              self.agent._print_fn = _cprint
@@ -2286,7 +2641,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              )
  
              if self._pending_title and self._session_db:
-@@ -3023,10 +4376,28 @@ class HermesCLI:
+@@ -3023,10 +4421,28 @@
              )
              return False
  
@@ -2316,27 +2671,31 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              msg_count = len([m for m in restored if m.get("role") == "user"])
              title_part = ""
              if session_meta.get("title"):
-@@ -3059,108 +4430,658 @@ class HermesCLI:
+@@ -3062,105 +4478,655 @@
+     def _display_resumed_history(self):
+         """Render a compact recap of previous conversation messages.
  
-         return True
- 
--    def _display_resumed_history(self):
--        """Render a compact recap of previous conversation messages.
-+    def _display_resumed_history(self):
-+        """Render a compact recap of previous conversation messages.
-+
+-        Uses Rich markup with dim/muted styling so the recap is visually
+-        distinct from the active conversation.  Caps the display at the
+-        last ``MAX_DISPLAY_EXCHANGES`` user/assistant exchanges and shows
+-        an indicator for earlier hidden messages.
 +        Resumed sessions often contain many raw assistant tool-call steps between
 +        each user request and the final useful answer. Collapse those raw
 +        intermediate assistant messages into user/assistant exchanges so the
 +        recap surfaces the last meaningful answer for each user turn instead of
 +        flooding the panel with tool-call noise.
-+        """
-+        if not self.conversation_history:
-+            return
-+
-+        if self.resume_display == "minimal":
-+            return
-+
+         """
+         if not self.conversation_history:
+             return
+ 
+-        # Check config: resume_display setting
+         if self.resume_display == "minimal":
+             return
+ 
+-        MAX_DISPLAY_EXCHANGES = 10   # max user+assistant pairs to show
+-        MAX_USER_LEN = 300           # truncate user messages
+-        MAX_ASST_LEN = 200           # truncate assistant text
+-        MAX_ASST_LINES = 3           # max lines of assistant text
 +        max_display_exchanges = self.resume_history_exchanges
 +        MAX_USER_LEN = 300
 +        MAX_ASST_LEN = 200
@@ -2501,24 +2860,31 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                "urls": urls,
 +                "notable_results": notable_results,
 +            }
-+
-+        def _strip_reasoning(text: str) -> str:
+ 
+         def _strip_reasoning(text: str) -> str:
+-            """Remove <REASONING_SCRATCHPAD>...</REASONING_SCRATCHPAD> blocks
+-            from displayed text (reasoning model internal thoughts)."""
 +            """Remove <REASONING_SCRATCHPAD>...</REASONING_SCRATCHPAD> blocks."""
-+            import re
-+            cleaned = re.sub(
-+                r"<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>\s*",
+             import re
+             cleaned = re.sub(
+                 r"<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>\s*",
+-                "", text, flags=re.DOTALL,
 +                "",
 +                text,
 +                flags=re.DOTALL,
-+            )
-+            cleaned = re.sub(
-+                r"<REASONING_SCRATCHPAD>.*$",
+             )
+-            # Also strip unclosed reasoning tags at the end
+             cleaned = re.sub(
+                 r"<REASONING_SCRATCHPAD>.*$",
+-                "", cleaned, flags=re.DOTALL,
 +                "",
 +                cleaned,
 +                flags=re.DOTALL,
-+            )
-+            return cleaned.strip()
-+
+             )
+             return cleaned.strip()
+ 
+-        # Collect displayable entries (skip system, tool-result messages)
+-        entries = []  # list of (role, display_text)
 +        def _format_tool_summary(tool_calls: list[dict]) -> tuple[str, int, list[str]]:
 +            tc_count = len(tool_calls or [])
 +            names = []
@@ -2780,14 +3146,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                "下一步",
 +                "总结",
 +            }
- 
--        Uses Rich markup with dim/muted styling so the recap is visually
--        distinct from the active conversation.  Caps the display at the
--        last ``MAX_DISPLAY_EXCHANGES`` user/assistant exchanges and shows
--        an indicator for earlier hidden messages.
--        """
--        if not self.conversation_history:
--            return
++
 +            normalized_lines: list[str] = []
 +            for line in raw.splitlines():
 +                line = " ".join(line.strip().split())
@@ -2798,17 +3157,10 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                if line.rstrip(":：").strip().lower() in section_headers:
 +                    continue
 +                normalized_lines.append(line)
- 
--        # Check config: resume_display setting
--        if self.resume_display == "minimal":
--            return
++
 +            base_text = "\n".join(normalized_lines).strip() or raw
 +            fragments = normalized_lines if len(normalized_lines) > 1 else re.split(r"(?<=[.!?。！？])\s+", base_text)
- 
--        MAX_DISPLAY_EXCHANGES = 10   # max user+assistant pairs to show
--        MAX_USER_LEN = 300           # truncate user messages
--        MAX_ASST_LEN = 200           # truncate assistant text
--        MAX_ASST_LINES = 3           # max lines of assistant text
++
 +            cleaned: list[str] = []
 +            for fragment in fragments:
 +                fragment = " ".join(fragment.strip().split())
@@ -2887,14 +3239,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                and not _matches_any(fragment, _PENDING_CUES)
 +                and not _matches_any(fragment, _OFFER_CUES),
 +            )
- 
--        def _strip_reasoning(text: str) -> str:
--            """Remove <REASONING_SCRATCHPAD>...</REASONING_SCRATCHPAD> blocks
--            from displayed text (reasoning model internal thoughts)."""
--            import re
--            cleaned = re.sub(
--                r"<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>\s*",
--                "", text, flags=re.DOTALL,
++
 +        def _pending_items(exchanges_data: list[dict[str, Any]], latest_activity_text: str) -> list[str]:
 +            items: list[str] = []
 +            latest_exchange_data = exchanges_data[-1] if exchanges_data else {}
@@ -2906,11 +3251,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                lambda fragment: _matches_any(fragment, _PENDING_CUES)
 +                or _matches_any(fragment, _BLOCKER_CUES)
 +                or _matches_any(fragment, _OFFER_CUES),
-             )
--            # Also strip unclosed reasoning tags at the end
--            cleaned = re.sub(
--                r"<REASONING_SCRATCHPAD>.*$",
--                "", cleaned, flags=re.DOTALL,
++            )
 +            for fragment in extracted:
 +                if fragment not in items:
 +                    items.append(fragment)
@@ -2966,25 +3307,27 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +                    "assistant_raw": assistant_raw_text,
 +                    "assistant_has_text": assistant_has_text,
 +                }
-             )
--            return cleaned.strip()
++            )
 +            current_user = None
 +            assistant_entries = []
- 
--        # Collect displayable entries (skip system, tool-result messages)
--        entries = []  # list of (role, display_text)
++
          for msg in self.conversation_history:
              role = msg.get("role", "")
 -            content = msg.get("content")
 -            tool_calls = msg.get("tool_calls") or []
 -
 -            if role == "system":
--                continue
--            if role == "tool":
 +            if role in {"system", "tool"}:
                  continue
+-            if role == "tool":
++
++            if role == "user":
++                if current_user is not None or assistant_entries:
++                    _finalize_exchange()
++                current_user = _truncate_user_text(msg.get("content"))
+                 continue
  
-             if role == "user":
+-            if role == "user":
 -                text = "" if content is None else str(content)
 -                # Handle multimodal content (list of dicts)
 -                if isinstance(content, list):
@@ -3028,17 +3371,13 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 -                    # Skip pure-reasoning messages that have no visible output
 -                    continue
 -                entries.append(("assistant", " ".join(parts)))
-+                if current_user is not None or assistant_entries:
-+                    _finalize_exchange()
-+                current_user = _truncate_user_text(msg.get("content"))
-+                continue
-+
+-
+-        if not entries:
 +            if role == "assistant":
 +                entry = _assistant_entry(msg)
 +                if entry is not None:
 +                    assistant_entries.append(entry)
- 
--        if not entries:
++
 +        if current_user is not None or assistant_entries:
 +            _finalize_exchange()
 +
@@ -3050,17 +3389,18 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 -        if len(entries) > MAX_DISPLAY_EXCHANGES * 2:
 -            skipped = len(entries) - MAX_DISPLAY_EXCHANGES * 2
 -            entries = entries[skipped:]
+-
+-        # Build the display using Rich
 +        all_exchanges = list(exchanges)
 +        total_exchanges = len(all_exchanges)
 +        if len(exchanges) > max_display_exchanges:
 +            skipped = len(exchanges) - max_display_exchanges
 +            exchanges = exchanges[skipped:]
- 
--        # Build the display using Rich
++
          from rich.panel import Panel
          from rich.text import Text
  
-@@ -3184,22 +5105,172 @@ class HermesCLI:
+@@ -3184,22 +5150,172 @@
                  style="dim italic",
              )
  
@@ -3241,7 +3581,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
          panel = Panel(
              lines,
-@@ -3208,7 +5279,7 @@ class HermesCLI:
+@@ -3208,7 +5324,7 @@
              padding=(0, 1),
              style=_history_text_c,
          )
@@ -3250,7 +3590,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
      def _try_attach_clipboard_image(self) -> bool:
          """Check clipboard for an image and attach it if found.
-@@ -3849,6 +5920,44 @@ class HermesCLI:
+@@ -3849,6 +5965,44 @@
              return []
          return [s for s in sessions if s.get("id") != self.session_id]
  
@@ -3295,7 +3635,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
      def _show_recent_sessions(self, *, reason: str = "history", limit: int = 10) -> bool:
          """Render recent sessions inline from the active chat TUI.
  
-@@ -3961,6 +6070,269 @@ class HermesCLI:
+@@ -3961,6 +6115,293 @@
          except Exception:
              pass
  
@@ -3338,6 +3678,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +    def _session_routing_model_config(self, *, cwd: Optional[str] = None) -> Dict[str, Any]:
 +        """Build the per-session routing metadata stored in sessions.model_config."""
 +        model_config: Dict[str, Any] = {
++            "model": self.model,
 +            "max_iterations": self.max_turns,
 +            "reasoning_config": (
 +                dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
@@ -3437,7 +3778,11 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +            explicit_base_url = defaults["explicit_base_url"]
 +            api_key = defaults["api_key"]
 +        else:
-+            model = (session_meta or {}).get("model") or defaults["model"]
++            persisted_model = model_config.get("model")
++            if isinstance(persisted_model, str) and persisted_model.strip():
++                model = persisted_model.strip()
++            else:
++                model = (session_meta or {}).get("model") or defaults["model"]
 +            requested_provider = (
 +                model_config.get("requested_provider")
 +                or model_config.get("provider")
@@ -3480,6 +3825,25 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +            else:
 +                explicit_api_key = None
 +                api_key = None
++
++            # Backward compatibility for sessions persisted before routing metadata
++            # stored the model explicitly. Generic custom endpoints can change the
++            # effective model with config.yaml, so if the restored route matches the
++            # current default custom endpoint exactly, prefer the current default
++            # model over the stale top-level session.model.
++            defaults_requested = str(defaults["requested_provider"] or "").strip().lower()
++            restored_requested = str(requested_provider or "").strip().lower()
++            defaults_base_url = str(defaults["base_url"] or "").strip().rstrip("/")
++            restored_base_url = str(base_url or "").strip().rstrip("/")
++            if (
++                not (isinstance(persisted_model, str) and persisted_model.strip())
++                and defaults_requested == "custom"
++                and restored_requested == defaults_requested
++                and defaults_base_url
++                and restored_base_url == defaults_base_url
++                and defaults["model"]
++            ):
++                model = defaults["model"]
 +
 +        self.model = model
 +        self.requested_provider = requested_provider
@@ -3565,7 +3929,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
      def new_session(self, silent=False):
          """Start a fresh session with a new session ID and cleared agent state."""
          if self.agent and self.conversation_history:
-@@ -3987,20 +6359,30 @@ class HermesCLI:
+@@ -3987,20 +6428,30 @@
          self.conversation_history = []
          self._pending_title = None
          self._resumed = False
@@ -3600,7 +3964,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  self.agent._invalidate_system_prompt()
  
              if self._session_db:
-@@ -4009,10 +6391,9 @@ class HermesCLI:
+@@ -4009,10 +6460,9 @@
                          session_id=self.session_id,
                          source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                          model=self.model,
@@ -3614,7 +3978,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                      )
                  except Exception:
                      pass
-@@ -4022,32 +6403,55 @@ class HermesCLI:
+@@ -4022,31 +6472,54 @@
              print("(^_^)v New session started!")
  
      def _handle_resume_command(self, cmd_original: str) -> None:
@@ -3622,14 +3986,14 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +        """Handle /resume [session_id_or_title] — switch to a previous session mid-conversation."""
          parts = cmd_original.split(None, 1)
          target = parts[1].strip() if len(parts) > 1 else ""
- 
+-
 -        if not target:
 -            _cprint("  Usage: /resume <session_id_or_title>")
 -            if self._show_recent_sessions(reason="resume"):
 -                return
 -            _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
 -            return
--
+ 
          if not self._session_db:
              _cprint("  Session database not available.")
              return
@@ -3664,7 +4028,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +            _cprint(f"  Session not found: {target or target_id}")
              _cprint("  Use /history or `hermes sessions list` to see available sessions.")
              return
- 
++
 +        # If the user selected a root session that has no messages (common when
 +        # the first real content happened after a compression split), jump to
 +        # the latest continuation session in the same lineage that actually has
@@ -3679,20 +4043,20 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
 +        if latest_with_msgs and latest_with_msgs != target_id:
 +            target_id = latest_with_msgs
 +            session_meta = self._session_db.get_session(target_id) or session_meta
-+
+ 
          if target_id == self.session_id:
              _cprint("  Already on that session.")
-             return
-@@ -4062,11 +6466,17 @@ class HermesCLI:
+@@ -4062,11 +6535,17 @@
          self.session_id = target_id
          self._resumed = True
          self._pending_title = None
+-
+-        # Load conversation history (strip transcript-only metadata entries)
 +        self._tmux_session_task_title = ""
 +        self._tmux_task_title_locked = False
 +        self._apply_session_routing_from_meta(session_meta)
 +        self._restore_session_reasoning_config(session_meta)
- 
--        # Load conversation history (strip transcript-only metadata entries)
++
 +        # Load conversation history (strip transcript-only metadata entries and
 +        # sanitize historical terminal control sequences before display/model use)
          restored = self._session_db.get_messages_as_conversation(target_id)
@@ -3703,7 +4067,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
          # Re-open the target session so it's not marked as ended
          try:
-@@ -4077,16 +6487,21 @@ class HermesCLI:
+@@ -4077,16 +6556,21 @@
          # Sync the agent if already initialised
          if self.agent:
              self.agent.session_id = target_id
@@ -3729,7 +4093,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  self.agent._invalidate_system_prompt()
  
          title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
-@@ -4097,6 +6512,7 @@ class HermesCLI:
+@@ -4097,6 +6581,7 @@
                  f" ({msg_count} user message{'s' if msg_count != 1 else ''},"
                  f" {len(self.conversation_history)} total)"
              )
@@ -3737,7 +4101,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          else:
              _cprint(f"  ↻ Resumed session {target_id}{title_part} — no messages, starting fresh.")
  
-@@ -4150,10 +6566,9 @@ class HermesCLI:
+@@ -4150,10 +6635,9 @@
                  session_id=new_session_id,
                  source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                  model=self.model,
@@ -3751,7 +4115,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  parent_session_id=parent_session_id,
              )
          except Exception as e:
-@@ -4186,21 +6601,26 @@ class HermesCLI:
+@@ -4186,21 +6670,26 @@
          self.session_start = now
          self._pending_title = None
          self._resumed = True  # Prevents auto-title generation
@@ -3782,7 +4146,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  self.agent._invalidate_system_prompt()
  
          msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
-@@ -4291,7 +6711,61 @@ class HermesCLI:
+@@ -4291,7 +6780,61 @@
          print(f"(^_^)b Undid {removed_count} message(s). Removed: \"{removed_msg[:60]}{'...' if len(removed_msg) > 60 else ''}\"")
          remaining = len(self.conversation_history)
          print(f"  {remaining} message(s) remaining in history.")
@@ -3845,17 +4209,18 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
      def _run_curses_picker(self, title: str, items: list[str], default_index: int = 0) -> int | None:
          """Run curses_single_select via run_in_terminal so prompt_toolkit handles terminal ownership cleanly."""
          import threading
-@@ -4305,15 +6779,16 @@ class HermesCLI:
+@@ -4305,15 +6848,16 @@
          # run_in_terminal requires an asyncio event loop — only exists in the
          # main prompt_toolkit thread.  If we're in a background thread (e.g.
          # process_loop), fall back to direct curses call.
 -        in_main_thread = threading.current_thread() is threading.main_thread()
+-
+-        if self._app and in_main_thread:
+-            from prompt_toolkit.application import run_in_terminal
 +        # Note: slash commands run in a background thread (process_loop), so
 +        # we cannot call prompt_toolkit.run_in_terminal directly here. Use the
 +        # thread-safe _run_in_terminal_blocking helper.
- 
--        if self._app and in_main_thread:
--            from prompt_toolkit.application import run_in_terminal
++
 +        if self._app:
              was_visible = self._status_bar_visible
              self._status_bar_visible = False
@@ -3866,7 +4231,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              finally:
                  self._status_bar_visible = was_visible
                  self._app.invalidate()
-@@ -4333,12 +6808,11 @@ class HermesCLI:
+@@ -4333,12 +6877,11 @@
                  pass
  
          if self._app:
@@ -3880,7 +4245,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              finally:
                  self._status_bar_visible = was_visible
                  self._app.invalidate()
-@@ -4430,6 +6904,7 @@ class HermesCLI:
+@@ -4430,6 +6973,7 @@
              self._explicit_base_url = result.base_url
          if result.api_mode:
              self.api_mode = result.api_mode
@@ -3888,7 +4253,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
          if self.agent is not None:
              try:
-@@ -4439,7 +6914,11 @@ class HermesCLI:
+@@ -4439,7 +6983,11 @@
                      api_key=result.api_key,
                      base_url=result.base_url,
                      api_mode=result.api_mode,
@@ -3900,7 +4265,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              except Exception as exc:
                  _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
  
-@@ -4647,6 +7126,7 @@ class HermesCLI:
+@@ -4647,6 +7195,7 @@
              self._explicit_base_url = result.base_url
          if result.api_mode:
              self.api_mode = result.api_mode
@@ -3908,7 +4273,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
          # Apply to running agent (in-place swap)
          if self.agent is not None:
-@@ -4657,7 +7137,11 @@ class HermesCLI:
+@@ -4657,7 +7206,11 @@
                      api_key=result.api_key,
                      base_url=result.base_url,
                      api_mode=result.api_mode,
@@ -3920,7 +4285,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              except Exception as exc:
                  _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
  
-@@ -6144,12 +8628,10 @@ class HermesCLI:
+@@ -6144,12 +8697,10 @@
              return
  
          self.reasoning_config = parsed
@@ -3935,7 +4300,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
      def _handle_fast_command(self, cmd: str):
          """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode)."""
-@@ -6198,6 +8680,7 @@ class HermesCLI:
+@@ -6198,6 +8749,7 @@
          """Callback for intermediate reasoning display during tool-call loops."""
          if not reasoning_text:
              return
@@ -3943,7 +4308,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          self._reasoning_preview_buf = getattr(self, "_reasoning_preview_buf", "") + reasoning_text
          self._flush_reasoning_preview(force=False)
  
-@@ -6578,6 +9061,7 @@ class HermesCLI:
+@@ -6578,6 +9130,7 @@
              if _pl > 0 and len(label) > _pl:
                  label = label[:_pl - 3] + "..."
              self._spinner_text = f"{emoji} {label}"
@@ -3951,7 +4316,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              self._tool_start_time = _time.monotonic()
              self._invalidate()
  
-@@ -7383,6 +9867,7 @@ class HermesCLI:
+@@ -7383,6 +9936,7 @@
          turn_route = self._resolve_turn_agent_config(message)
          if turn_route["signature"] != self._active_agent_route_signature:
              self.agent = None
@@ -3959,16 +4324,16 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
          # Initialize agent if needed
          if self.agent is None:
-@@ -7432,6 +9917,8 @@ class HermesCLI:
+@@ -7431,6 +9985,8 @@
+         if isinstance(message, str):
              from run_agent import _sanitize_surrogates
              message = _sanitize_surrogates(message)
- 
-+        self._sync_tmux_pane_title(message)
 +
++        self._sync_tmux_pane_title(message)
+ 
          # Add user message to history
          self.conversation_history.append({"role": "user", "content": message})
- 
-@@ -7630,8 +10117,15 @@ class HermesCLI:
+@@ -7630,8 +10186,15 @@
              # Get the final response
              response = result.get("final_response", "") if result else ""
  
@@ -3986,7 +4351,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  try:
                      from agent.title_generator import maybe_auto_title
                      maybe_auto_title(
-@@ -7673,9 +10167,23 @@ class HermesCLI:
+@@ -7673,9 +10236,23 @@
              # intermediate turn boundaries (tool-calling loops), which caused
              # the reasoning box to re-render after the final response.
              _reasoning_already_shown = getattr(self, '_reasoning_shown_this_turn', False)
@@ -4011,7 +4376,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                      w = shutil.get_terminal_size().columns
                      r_label = " Reasoning "
                      r_fill = w - 2 - len(r_label)
-@@ -7705,6 +10213,13 @@ class HermesCLI:
+@@ -7705,6 +10282,13 @@
  
                  is_error_response = result and (result.get("failed") or result.get("partial"))
                  already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
@@ -4025,7 +4390,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  if use_streaming_tts and _streaming_box_opened and not is_error_response:
                      # Text was already printed sentence-by-sentence; just close the box
                      w = shutil.get_terminal_size().columns
-@@ -7785,6 +10300,15 @@ class HermesCLI:
+@@ -7785,6 +10369,15 @@
              if tts_thread is not None and tts_thread.is_alive():
                  tts_thread.join(timeout=5)
      
@@ -4041,7 +4406,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
      def _print_exit_summary(self):
          """Print session resume info on exit, similar to Claude Code."""
          print()
-@@ -7912,7 +10436,7 @@ class HermesCLI:
+@@ -7912,7 +10505,7 @@
          if self._command_running:
              return _state_fragment("class:prompt-working", self._command_spinner_frame())
          if self._agent_running:
@@ -4050,7 +4415,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          if self._voice_mode:
              return _state_fragment("class:voice-prompt", "🎤")
          return [("class:prompt", symbol)]
-@@ -7991,7 +10515,10 @@ class HermesCLI:
+@@ -7991,7 +10584,10 @@
          """
          return [
              item for item in [
@@ -4062,7 +4427,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  sudo_widget,
                  secret_widget,
                  approval_widget,
-@@ -8012,17 +10539,6 @@ class HermesCLI:
+@@ -8012,17 +10608,6 @@
  
      def run(self):
          """Run the interactive CLI loop with persistent input at bottom."""
@@ -4080,7 +4445,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          self.show_banner()
  
          # One-line Honcho session indicator (TTY-only, not captured by agent).
-@@ -8461,13 +10977,15 @@ class HermesCLI:
+@@ -8461,13 +11046,15 @@
                  event.app.invalidate()
                  return
              import os, signal as _sig
@@ -4097,7 +4462,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              run_in_terminal(_suspend)
  
          # Voice push-to-talk key: configurable via config.yaml (voice.record_key)
-@@ -8760,7 +11278,8 @@ class HermesCLI:
+@@ -8760,7 +11347,8 @@
                  status = cli_ref._command_status or "Processing command..."
                  return f"{frame} {status}"
              if cli_ref._agent_running:
@@ -4107,7 +4472,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              if cli_ref._voice_mode:
                  return "type or Ctrl+B to record"
              return ""
-@@ -8824,20 +11343,23 @@ class HermesCLI:
+@@ -8824,20 +11412,23 @@
  
          def get_spinner_text():
              txt = cli_ref._spinner_text
@@ -4145,7 +4510,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
  
          def get_spinner_height():
              return cli_ref._spinner_widget_height()
-@@ -9129,19 +11651,26 @@ class HermesCLI:
+@@ -9129,19 +11720,26 @@
          )
  
          status_bar = ConditionalContainer(
@@ -4185,7 +4550,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              filter=Condition(lambda: cli_ref._status_bar_visible),
          )
  
-@@ -9181,13 +11710,13 @@ class HermesCLI:
+@@ -9181,13 +11779,13 @@
              'prompt': '#FFF8DC',
              'prompt-working': '#888888 italic',
              'hint': '#555555 italic',
@@ -4206,7 +4571,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              # Bronze horizontal rules around the input area
              'input-rule': '#CD7F32',
              # Clipboard image attachment badges
-@@ -9221,8 +11750,8 @@ class HermesCLI:
+@@ -9221,8 +11819,8 @@
              'voice-prompt': '#87CEEB',
              'voice-recording': '#FF4444 bold',
              'voice-processing': '#FFA500 italic',
@@ -4217,7 +4582,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          }
          style = PTStyle.from_dict(self._build_tui_style_dict())
          
-@@ -9288,10 +11817,29 @@ class HermesCLI:
+@@ -9288,10 +11886,29 @@
                  if not self._app:
                      _time.sleep(0.1)
                      continue
@@ -4248,7 +4613,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                      now = _time.monotonic()
                      if now - last_idle_refresh >= 1.0:
                          last_idle_refresh = now
-@@ -9525,11 +12073,7 @@ class HermesCLI:
+@@ -9525,11 +12142,7 @@
              set_approval_callback(None)
              set_secret_capture_callback(None)
              # Close session in SQLite
@@ -4261,7 +4626,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
              # Plugin hook: on_session_end — safety net for interrupted exits.
              # run_conversation() already fires this per-turn on normal completion,
              # so only fire here if the agent was mid-turn (_agent_running) when
-@@ -9745,6 +12289,7 @@ def main(
+@@ -9745,6 +12358,7 @@
                  turn_route = cli._resolve_turn_agent_config(effective_query)
                  if turn_route["signature"] != cli._active_agent_route_signature:
                      cli.agent = None
@@ -4269,7 +4634,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                  if cli._init_agent(
                      model_override=turn_route["model"],
                      runtime_override=turn_route["runtime"],
-@@ -9758,6 +12303,7 @@ def main(
+@@ -9758,6 +12372,7 @@
                          conversation_history=cli.conversation_history,
                      )
                      response = result.get("final_response", "") if isinstance(result, dict) else str(result)
@@ -4277,7 +4642,7 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
                      if response:
                          print(response)
                      print(f"\nsession_id: {cli.session_id}")
-@@ -9773,6 +12319,7 @@ def main(
+@@ -9773,6 +12388,7 @@
              if _query_label:
                  cli.console.print(f"[bold blue]Query:[/] {_query_label}")
              cli.chat(query, images=single_query_images or None)
@@ -4286,10 +4651,9 @@ index b3d51b12710bb96ced6570ac3f051329a96f09a3..ac6a76322405e9b6ae5f93c3e9ded019
          return
      
 diff --git a/hermes_cli/config.py b/hermes_cli/config.py
-index 5faa767a34c10c60e32ac6e3a6e14a79ba3af704..bf96f8eeb59d6935763f4623986c95a7a465f5f4 100644
 --- a/hermes_cli/config.py
 +++ b/hermes_cli/config.py
-@@ -508,6 +508,7 @@ DEFAULT_CONFIG = {
+@@ -508,6 +508,7 @@
          "compact": False,
          "personality": "kawaii",
          "resume_display": "full",
@@ -4298,10 +4662,9 @@ index 5faa767a34c10c60e32ac6e3a6e14a79ba3af704..bf96f8eeb59d6935763f4623986c95a7
          "bell_on_complete": False,
          "show_reasoning": False,
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
-index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141ebd11702d1 100644
 --- a/hermes_cli/main.py
 +++ b/hermes_cli/main.py
-@@ -44,9 +44,11 @@ Usage:
+@@ -44,9 +44,11 @@
  """
  
  import argparse
@@ -4313,7 +4676,7 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
  from pathlib import Path
  from typing import Optional
  
-@@ -280,55 +282,237 @@ def _has_any_provider_configured() -> bool:
+@@ -280,54 +282,236 @@
      return False
  
  
@@ -4548,7 +4911,7 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
          import curses
  
          result_holder = [None]
- 
+-
 -        def _format_row(s, max_x):
 -            """Format a session row for display."""
 -            title = (s.get("title") or "").strip()
@@ -4580,11 +4943,10 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
 -                or q in s.get("id", "").lower()
 -                or q in (s.get("source") or "").lower()
 -            )
--
+ 
          def _curses_browse(stdscr):
              curses.curs_set(0)
-             if curses.has_colors():
-@@ -341,8 +525,8 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+@@ -341,8 +525,8 @@
  
              cursor = 0
              scroll_offset = 0
@@ -4595,7 +4957,7 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
  
              while True:
                  stdscr.clear()
-@@ -383,11 +567,15 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+@@ -383,10 +567,14 @@
                  except curses.error:
                      pass
  
@@ -4607,13 +4969,12 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
 +                visible_rows = max_y - (3 + detail_height + footer_height)
                  if visible_rows < 1:
                      visible_rows = 1
- 
-+                detail_start_y = min(max_y - (detail_height + footer_height), 3 + visible_rows)
 +
++                detail_start_y = min(max_y - (detail_height + footer_height), 3 + visible_rows)
+ 
                  # Clamp cursor and scroll
                  if not filtered:
-                     try:
-@@ -410,7 +598,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+@@ -410,7 +598,7 @@
                          min(len(filtered), scroll_offset + visible_rows)
                      )):
                          y = draw_i + 3
@@ -4622,10 +4983,13 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
                              break
                          s = filtered[i]
                          arrow = " → " if i == cursor else "   "
-@@ -425,6 +613,22 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
-                         except curses.error:
-                             pass
- 
+@@ -422,6 +610,22 @@
+                                 attr |= curses.color_pair(1)
+                         try:
+                             stdscr.addnstr(y, 0, row, max_x - 1, attr)
++                        except curses.error:
++                            pass
++
 +                    # Detail preview for the highlighted session.
 +                    detail_attr = curses.color_pair(4) if curses.has_colors() else curses.A_DIM
 +                    hline_char = getattr(curses, "ACS_HLINE", ord("-"))
@@ -4639,13 +5003,10 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
 +                            break
 +                        try:
 +                            stdscr.addnstr(y, 2, line, max_x - 3, detail_attr)
-+                        except curses.error:
-+                            pass
-+
-                 # Footer
-                 footer_y = max_y - 1
-                 if filtered:
-@@ -456,7 +660,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+                         except curses.error:
+                             pass
+ 
+@@ -456,7 +660,7 @@
                      if search_text:
                          # First Esc clears the search
                          search_text = ""
@@ -4654,7 +5015,7 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
                          cursor = 0
                          scroll_offset = 0
                      else:
-@@ -465,10 +669,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+@@ -465,10 +669,7 @@
                  elif key in (curses.KEY_BACKSPACE, 127, 8):
                      if search_text:
                          search_text = search_text[:-1]
@@ -4666,7 +5027,7 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
                          cursor = 0
                          scroll_offset = 0
                  elif key == ord('q') and not search_text:
-@@ -476,7 +677,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+@@ -476,7 +677,7 @@
                  elif 32 <= key <= 126:
                      # Printable character → add to search filter
                      search_text += chr(key)
@@ -4675,7 +5036,7 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
                      cursor = 0
                      scroll_offset = 0
  
-@@ -487,11 +688,17 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+@@ -487,11 +688,17 @@
          pass
  
      # Fallback: numbered list (Windows without curses, etc.)
@@ -4698,7 +5059,7 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
          if len(label) > 50:
              label = label[:47] + "..."
          last_active = _relative_time(s.get("last_active"))
-@@ -500,13 +707,13 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+@@ -500,13 +707,13 @@
  
      while True:
          try:
@@ -4716,11 +5077,15 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
          except ValueError:
              print("  Invalid input. Enter a number or q to cancel.")
          except (KeyboardInterrupt, EOFError):
-@@ -636,26 +843,82 @@ def _exec_in_container(container_info: dict, cli_args: list):
+@@ -636,26 +843,82 @@
  
  
  def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
 -    """Resolve a session name (title) or ID to a session ID.
+-
+-    - If it looks like a session ID (contains underscore + hex), try direct lookup first.
+-    - Otherwise, treat it as a title and use resolve_session_by_title (auto-latest).
+-    - Falls back to the other method if the first doesn't match.
 +    """Resolve a session query to a session ID.
 +
 +    Resolution order:
@@ -4728,10 +5093,7 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
 +    - unique session ID prefix
 +    - exact title / lineage title resolution
 +    - unique fuzzy match across recent CLI sessions (title or preview)
- 
--    - If it looks like a session ID (contains underscore + hex), try direct lookup first.
--    - Otherwise, treat it as a title and use resolve_session_by_title (auto-latest).
--    - Falls back to the other method if the first doesn't match.
++
 +    Ambiguous fuzzy matches intentionally return ``None`` so interactive callers
 +    can open the session picker instead of guessing wrong.
      """
@@ -4744,14 +5106,14 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
 -        if session:
 +        query = (name_or_id or "").strip()
 +        if not query:
-+            db.close()
+             db.close()
+-            return session["id"]
 +            return None
 +
 +        # Try as exact session ID first, then as a unique ID prefix.
 +        resolved_id = db.resolve_session_id(query)
 +        if resolved_id:
-             db.close()
--            return session["id"]
++            db.close()
 +            return resolved_id
  
          # Try as title (with auto-latest for lineage)
@@ -4810,10 +5172,9 @@ index 037c0a72feb081bce4aca5b18552ca55ef8eede0..452b65a0ba731470d0f965c6144141eb
          pass
      return None
 diff --git a/hermes_cli/skin_engine.py b/hermes_cli/skin_engine.py
-index 16ec39cc9b4fdeb197bb6aed38c129c356d57725..20342635a7008b4257ca86bf3ae06144337f0c3a 100644
 --- a/hermes_cli/skin_engine.py
 +++ b/hermes_cli/skin_engine.py
-@@ -296,6 +296,16 @@ _BUILTIN_SKINS: Dict[str, Dict[str, Any]] = {
+@@ -296,6 +296,16 @@
              "response_border": "#7eb8f6",
              "session_label": "#7eb8f6",
              "session_border": "#4b5563",
@@ -4830,7 +5191,7 @@ index 16ec39cc9b4fdeb197bb6aed38c129c356d57725..20342635a7008b4257ca86bf3ae06144
          },
          "spinner": {},
          "branding": {
-@@ -675,6 +685,9 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
+@@ -675,6 +685,9 @@
  
      These are layered on top of the CLI's base TUI style so /skin can refresh
      the live prompt_toolkit UI immediately without rebuilding the app.
@@ -4840,7 +5201,7 @@ index 16ec39cc9b4fdeb197bb6aed38c129c356d57725..20342635a7008b4257ca86bf3ae06144
      """
      try:
          skin = get_active_skin()
-@@ -685,10 +698,20 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
+@@ -685,10 +698,20 @@
      input_rule = skin.get_color("input_rule", "#CD7F32")
      title = skin.get_color("banner_title", "#FFD700")
      text = skin.get_color("banner_text", prompt)
@@ -4864,7 +5225,7 @@ index 16ec39cc9b4fdeb197bb6aed38c129c356d57725..20342635a7008b4257ca86bf3ae06144
  
      return {
          "input-area": prompt,
-@@ -696,13 +719,20 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
+@@ -696,13 +719,20 @@
          "prompt": prompt,
          "prompt-working": f"{dim} italic",
          "hint": f"{dim} italic",
@@ -4890,7 +5251,7 @@ index 16ec39cc9b4fdeb197bb6aed38c129c356d57725..20342635a7008b4257ca86bf3ae06144
          "clarify-border": input_rule,
          "clarify-title": f"{title} bold",
          "clarify-question": f"{text} bold",
-@@ -710,14 +740,19 @@ def get_prompt_toolkit_style_overrides() -> Dict[str, str]:
+@@ -710,14 +740,19 @@
          "clarify-selected": f"{title} bold",
          "clarify-active-other": f"{title} italic",
          "clarify-countdown": input_rule,
@@ -4914,10 +5275,9 @@ index 16ec39cc9b4fdeb197bb6aed38c129c356d57725..20342635a7008b4257ca86bf3ae06144
 +        "voice-status-recording": f"bg:{status_bg} {voice_text} bold",
      }
 diff --git a/hermes_state.py b/hermes_state.py
-index 5e563666e83de31e3ae58c11ba9efb98b03fca44..0f81ff688bf41b29a725d7a13ffe4447227ebe8b 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -409,6 +409,22 @@ class SessionDB:
+@@ -409,6 +409,22 @@
              )
          self._execute_write(_do)
  
@@ -4940,7 +5300,7 @@ index 5e563666e83de31e3ae58c11ba9efb98b03fca44..0f81ff688bf41b29a725d7a13ffe4447
      def update_token_counts(
          self,
          session_id: str,
-@@ -556,6 +572,70 @@ class SessionDB:
+@@ -556,6 +572,70 @@
              return matches[0]
          return None
  
@@ -5012,23 +5372,22 @@ index 5e563666e83de31e3ae58c11ba9efb98b03fca44..0f81ff688bf41b29a725d7a13ffe4447
      MAX_TITLE_LENGTH = 100
  
 diff --git a/plugins/memory/memory_palace/__init__.py b/plugins/memory/memory_palace/__init__.py
-index 9c5a7dfa7c19321b13145efca79021151c00557d..05c5c8991178380d570b7aef46ea346359db92a7 100644
 --- a/plugins/memory/memory_palace/__init__.py
 +++ b/plugins/memory/memory_palace/__init__.py
-@@ -227,6 +227,12 @@ class _MemoryPalaceClient:
+@@ -226,6 +226,12 @@
+         self._api_key = api_key
          self._timeout = timeout
          self._session = requests.Session()
- 
++
 +    def close(self) -> None:
 +        try:
 +            self._session.close()
 +        except Exception:
 +            logger.debug("Memory Palace session close failed", exc_info=True)
-+
+ 
      def _read_headers(self) -> dict[str, str]:
          return {"Accept": "application/json"}
- 
-@@ -561,6 +567,8 @@ class MemoryPalaceMemoryProvider(MemoryProvider):
+@@ -561,6 +567,8 @@
          for thread in (self._sync_thread, self._summary_thread):
              if thread and thread.is_alive():
                  thread.join(timeout=5.0)
@@ -5038,10 +5397,9 @@ index 9c5a7dfa7c19321b13145efca79021151c00557d..05c5c8991178380d570b7aef46ea3463
          self._summary_thread = None
  
 diff --git a/run_agent.py b/run_agent.py
-index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890caa23f6f2 100644
 --- a/run_agent.py
 +++ b/run_agent.py
-@@ -518,6 +518,7 @@ class AIAgent:
+@@ -518,6 +518,7 @@
          base_url: str = None,
          api_key: str = None,
          provider: str = None,
@@ -5049,7 +5407,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
          api_mode: str = None,
          acp_command: str = None,
          acp_args: list[str] | None = None,
-@@ -640,6 +641,8 @@ class AIAgent:
+@@ -640,6 +641,8 @@
          self.base_url = base_url or ""
          provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
          self.provider = provider_name or ""
@@ -5058,7 +5416,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
          self.acp_command = acp_command or command
          self.acp_args = list(acp_args or args or [])
          if api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
-@@ -1060,6 +1063,13 @@ class AIAgent:
+@@ -1060,6 +1063,13 @@
                          "max_iterations": self.max_iterations,
                          "reasoning_config": reasoning_config,
                          "max_tokens": max_tokens,
@@ -5072,7 +5430,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
                      },
                      user_id=None,
                      parent_session_id=self._parent_session_id,
-@@ -1304,9 +1314,19 @@ class AIAgent:
+@@ -1304,9 +1314,19 @@
                  summary_model_override=compression_summary_model,
                  quiet_mode=self.quiet_mode,
                  base_url=self.base_url,
@@ -5093,7 +5451,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
              )
          self.compression_enabled = compression_enabled
  
-@@ -1412,6 +1432,7 @@ class AIAgent:
+@@ -1412,6 +1432,7 @@
          _cc = self.context_compressor
          self._primary_runtime = {
              "model": self.model,
@@ -5101,7 +5459,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
              "provider": self.provider,
              "base_url": self.base_url,
              "api_mode": self.api_mode,
-@@ -1474,7 +1495,7 @@ class AIAgent:
+@@ -1474,7 +1495,7 @@
          if hasattr(self, "context_compressor") and self.context_compressor:
              self.context_compressor.on_session_reset()
      
@@ -5110,19 +5468,19 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
          """Switch the model/provider in-place for a live agent.
  
          Called by the /model command handlers (CLI and gateway) after
-@@ -1501,8 +1522,11 @@ class AIAgent:
+@@ -1501,8 +1522,11 @@
          # ── Swap core runtime fields ──
          self.model = new_model
          self.provider = new_provider
 +        self.requested_provider = requested_provider or new_provider
          self.base_url = base_url or self.base_url
          self.api_mode = api_mode
-+        self.acp_command = acp_command if acp_command is not None else self.acp_command
-+        self.acp_args = list(acp_args) if acp_args is not None else list(self.acp_args or [])
++        self.acp_command = acp_command if acp_command is not None else getattr(self, "acp_command", None)
++        self.acp_args = list(acp_args) if acp_args is not None else list(getattr(self, "acp_args", []) or [])
          if api_key:
              self.api_key = api_key
  
-@@ -1572,10 +1596,13 @@ class AIAgent:
+@@ -1572,10 +1596,13 @@
          _cc = self.context_compressor if hasattr(self, "context_compressor") and self.context_compressor else None
          self._primary_runtime = {
              "model": self.model,
@@ -5136,7 +5494,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
              "client_kwargs": dict(self._client_kwargs),
              "use_prompt_caching": self._use_prompt_caching,
              "compressor_model": getattr(_cc, "model", self.model) if _cc else self.model,
-@@ -1733,10 +1760,27 @@ class AIAgent:
+@@ -1733,10 +1760,27 @@
  
              aux_base_url = str(getattr(client, "base_url", ""))
              aux_api_key = str(getattr(client, "api_key", ""))
@@ -5164,7 +5522,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
              )
  
              threshold = self.context_compressor.threshold_tokens
-@@ -4918,7 +4962,41 @@ class AIAgent:
+@@ -4918,7 +4962,41 @@
              usage_obj = None
              _first_chunk_seen = False
              for chunk in stream:
@@ -5207,7 +5565,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
                  if not _first_chunk_seen:
                      _first_chunk_seen = True
                      self._touch_activity("receiving stream response")
-@@ -5091,12 +5169,15 @@ class AIAgent:
+@@ -5091,12 +5169,15 @@
              with self._anthropic_client.messages.stream(**api_kwargs) as stream:
                  for event in stream:
                      # Update stale-stream timer on every event so the
@@ -5229,7 +5587,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
  
                      if self._interrupt_requested:
                          break
-@@ -5539,10 +5620,13 @@ class AIAgent:
+@@ -5539,10 +5620,13 @@
          try:
              # ── Core runtime state ──
              self.model = rt["model"]
@@ -5243,7 +5601,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
              self._client_kwargs = dict(rt["client_kwargs"])
              self._use_prompt_caching = rt["use_prompt_caching"]
  
-@@ -6599,6 +6683,17 @@ class AIAgent:
+@@ -6599,6 +6683,17 @@
                      session_id=self.session_id,
                      source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                      model=self.model,
@@ -5261,7 +5619,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
                      parent_session_id=old_session_id,
                  )
                  # Auto-number the title for the continuation session
-@@ -9795,7 +9890,31 @@ class AIAgent:
+@@ -9795,7 +9890,31 @@
                      # Save session log incrementally (so progress is visible even if interrupted)
                      self._session_messages = messages
                      self._save_session_log(messages)
@@ -5294,7 +5652,7 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
                      # Continue loop for next response
                      continue
                  
-@@ -10061,30 +10180,6 @@ class AIAgent:
+@@ -10061,30 +10180,6 @@
                      # session resume (avoids consecutive user messages).
                      messages.append({"role": "assistant", "content": final_response})
                      break
@@ -5326,10 +5684,9 @@ index b2303545425213374a8326955cde7b04ab891699..cdf11ed538a227615df332e6dd60890c
          if final_response is None and (
              api_call_count >= self.max_iterations
 diff --git a/tests/agent/test_context_compressor.py b/tests/agent/test_context_compressor.py
-index f4cf19666f63875be318c60867ecb0a796c5919d..1e3a1b1404e10f3d100b651c4f2f180723d55107 100644
 --- a/tests/agent/test_context_compressor.py
 +++ b/tests/agent/test_context_compressor.py
-@@ -37,6 +37,21 @@ class TestShouldCompress:
+@@ -37,6 +37,21 @@
          assert compressor.should_compress(prompt_tokens=90000) is True
          assert compressor.should_compress(prompt_tokens=50000) is False
  
@@ -5351,10 +5708,54 @@ index f4cf19666f63875be318c60867ecb0a796c5919d..1e3a1b1404e10f3d100b651c4f2f1807
  
  
  class TestUpdateFromResponse:
-@@ -191,6 +206,66 @@ class TestNonStringContent:
+@@ -153,10 +168,14 @@
+         assert isinstance(summary, str)
+         assert summary.startswith(SUMMARY_PREFIX)
+ 
+-    def test_none_content_coerced_to_empty(self):
+-        mock_response = MagicMock()
+-        mock_response.choices = [MagicMock()]
+-        mock_response.choices[0].message.content = None
++    def test_none_content_retries_until_meaningful_summary(self):
++        empty_response = MagicMock()
++        empty_response.choices = [MagicMock()]
++        empty_response.choices[0].message.content = None
++
++        ok_response = MagicMock()
++        ok_response.choices = [MagicMock()]
++        ok_response.choices[0].message.content = "real summary"
+ 
+         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+             c = ContextCompressor(model="test", quiet_mode=True)
+@@ -166,11 +185,15 @@
+             {"role": "assistant", "content": "ok"},
+         ]
+ 
+-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
++        with patch(
++            "agent.context_compressor.call_llm",
++            side_effect=[empty_response, ok_response],
++        ) as mock_call, patch("agent.context_compressor.time.sleep") as mock_sleep:
+             summary = c._generate_summary(messages)
+-        # None content → empty string → standardized compaction handoff prefix added
+-        assert summary is not None
+-        assert summary == SUMMARY_PREFIX
++
++        assert summary == f"{SUMMARY_PREFIX}\nreal summary"
++        assert mock_call.call_count == 2
++        mock_sleep.assert_called_once()
+ 
+     def test_summary_call_does_not_force_temperature(self):
+         mock_response = MagicMock()
+@@ -191,24 +214,156 @@
          kwargs = mock_call.call_args.kwargs
          assert "temperature" not in kwargs
  
+-
+-class TestSummaryFailureCooldown:
+-    def test_summary_failure_enters_cooldown_and_skips_retry(self):
+-        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+-            c = ContextCompressor(model="test", quiet_mode=True)
 +    def test_summary_defaults_to_active_model_and_reasoning_medium(self):
 +        mock_response = MagicMock()
 +        mock_response.choices = [MagicMock()]
@@ -5368,12 +5769,19 @@ index f4cf19666f63875be318c60867ecb0a796c5919d..1e3a1b1404e10f3d100b651c4f2f1807
 +                api_key="sk-primary",
 +                quiet_mode=True,
 +            )
-+
-+        messages = [
-+            {"role": "user", "content": "do something"},
-+            {"role": "assistant", "content": "ok"},
-+        ]
-+
+ 
+         messages = [
+             {"role": "user", "content": "do something"},
+             {"role": "assistant", "content": "ok"},
+         ]
+ 
+-        with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")) as mock_call:
+-            first = c._generate_summary(messages)
+-            second = c._generate_summary(messages)
+-
+-        assert first is None
+-        assert second is None
+-        assert mock_call.call_count == 1
 +        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
 +            c._generate_summary(messages)
 +
@@ -5415,10 +5823,100 @@ index f4cf19666f63875be318c60867ecb0a796c5919d..1e3a1b1404e10f3d100b651c4f2f1807
 +        assert first_kwargs["extra_body"] == {"reasoning": {"enabled": True, "effort": "medium"}}
 +        assert "extra_body" not in second_kwargs
 +
++
++class TestSummaryRetryLoop:
++    def test_summary_failure_retries_until_success(self):
++        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
++            c = ContextCompressor(model="test", quiet_mode=True)
++
++        messages = [
++            {"role": "user", "content": "do something"},
++            {"role": "assistant", "content": "ok"},
++        ]
++
++        ok_response = MagicMock()
++        ok_response.choices = [MagicMock()]
++        ok_response.choices[0].message.content = "stable summary"
++
++        with patch(
++            "agent.context_compressor.call_llm",
++            side_effect=[Exception("boom"), ok_response],
++        ) as mock_call, patch("agent.context_compressor.time.sleep") as mock_sleep:
++            summary = c._generate_summary(messages)
++
++        assert summary == f"{SUMMARY_PREFIX}\nstable summary"
++        assert mock_call.call_count == 2
++        assert c._summary_failure_cooldown_until == 0.0
++        mock_sleep.assert_called_once()
++
++    def test_summary_failure_returns_deterministic_fallback_after_max_attempts(self):
++        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
++            c = ContextCompressor(model="test", quiet_mode=True)
++
++        messages = [
++            {"role": "user", "content": "investigate cliproxy summary failures"},
++            {"role": "assistant", "content": "checking current compression code"},
++            {"role": "tool", "content": "/root/.hermes/hermes-agent/agent/context_compressor.py"},
++        ]
++
++        def _sleep_guard(*_args, **_kwargs):
++            _sleep_guard.calls += 1
++            if _sleep_guard.calls > 2:
++                raise AssertionError("summary retry loop exceeded bounded retry budget")
++
++        _sleep_guard.calls = 0
++
++        with patch(
++            "agent.context_compressor.call_llm",
++            side_effect=RuntimeError("No LLM provider configured for task=compression provider=auto"),
++        ) as mock_call, patch("agent.context_compressor.time.sleep", side_effect=_sleep_guard):
++            summary = c._generate_summary(messages)
++
++        assert mock_call.call_count == 3
++        assert _sleep_guard.calls == 2
++        assert summary.startswith(f"{SUMMARY_PREFIX}\n1. Objective")
++        assert "Remote summary generation failed:" in summary
++        assert "Summary generation was unavailable" not in summary
++        assert c._previous_summary.startswith("1. Objective")
++
++    def test_compress_uses_structured_fallback_instead_of_static_marker(self):
++        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
++            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
++
++        msgs = [
++            {"role": "user", "content": "msg 0"},
++            {"role": "assistant", "content": "msg 1"},
++            {"role": "user", "content": "msg 2"},
++            {"role": "assistant", "content": "msg 3"},
++            {"role": "tool", "content": "/root/.hermes/hermes-agent/tests/agent/test_context_compressor.py"},
++            {"role": "assistant", "content": "msg 5"},
++            {"role": "user", "content": "msg 6"},
++            {"role": "assistant", "content": "msg 7"},
++        ]
++
++        def _sleep_guard(*_args, **_kwargs):
++            _sleep_guard.calls += 1
++            if _sleep_guard.calls > 2:
++                raise AssertionError("compress() summary retry loop exceeded bounded retry budget")
++
++        _sleep_guard.calls = 0
++
++        with patch(
++            "agent.context_compressor.call_llm",
++            side_effect=Exception("Request timed out."),
++        ), patch("agent.context_compressor.time.sleep", side_effect=_sleep_guard):
++            result = c.compress(msgs)
++
++        summary_messages = [m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)]
++        assert len(summary_messages) == 1
++        summary_text = summary_messages[0]["content"]
++        assert "1. Objective" in summary_text
++        assert "Summary generation was unavailable" not in summary_text
++        assert c.compression_count == 1
  
- class TestSummaryFailureCooldown:
-     def test_summary_failure_enters_cooldown_and_skips_retry(self):
-@@ -547,8 +622,8 @@ class TestSummaryTargetRatio:
+ 
+ class TestSummaryPrefixNormalization:
+@@ -547,8 +702,8 @@
          """Tail token budget should be threshold_tokens * summary_target_ratio."""
          with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
              c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
@@ -5429,7 +5927,7 @@ index f4cf19666f63875be318c60867ecb0a796c5919d..1e3a1b1404e10f3d100b651c4f2f1807
  
          with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
              c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-@@ -583,12 +658,11 @@ class TestSummaryTargetRatio:
+@@ -583,12 +738,11 @@
          # 50% of 100K = 50K, but the floor is 64K
          assert c.threshold_tokens == 64_000
  
@@ -5446,10 +5944,9 @@ index f4cf19666f63875be318c60867ecb0a796c5919d..1e3a1b1404e10f3d100b651c4f2f1807
      def test_default_protect_last_n_is_20(self):
          """Default protect_last_n should be 20."""
 diff --git a/tests/agent/test_prompt_builder.py b/tests/agent/test_prompt_builder.py
-index 1f2f6ada7735061f902b809c898ca459118b5104..01f89d94db34b072eb55d986ba947857caf70a4d 100644
 --- a/tests/agent/test_prompt_builder.py
 +++ b/tests/agent/test_prompt_builder.py
-@@ -993,6 +993,29 @@ class TestOpenAIModelExecutionGuidance:
+@@ -993,6 +993,29 @@
          assert "missing_context" in text or "missing context" in text
          assert "hallucinate" in text or "guess" in text
  
@@ -5480,13 +5977,13 @@ index 1f2f6ada7735061f902b809c898ca459118b5104..01f89d94db34b072eb55d986ba947857
          assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
          assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
 diff --git a/tests/agent/test_title_generator.py b/tests/agent/test_title_generator.py
-index 98fb8fb21310d0b03a9f6d048143416222d1a1cd..4497c20f73f0ef57da5c020058447246ecfa2e80 100644
 --- a/tests/agent/test_title_generator.py
 +++ b/tests/agent/test_title_generator.py
-@@ -24,6 +24,62 @@ class TestGenerateTitle:
+@@ -23,6 +23,62 @@
+         with patch("agent.title_generator.call_llm", return_value=mock_response):
              title = generate_title("help me fix this import", "Sure, let me check...")
              assert title == "Debugging Python Import Errors"
- 
++
 +    def test_uses_title_task_instead_of_compression(self):
 +        captured_kwargs = {}
 +
@@ -5542,12 +6039,10 @@ index 98fb8fb21310d0b03a9f6d048143416222d1a1cd..4497c20f73f0ef57da5c020058447246
 +        assert first_kwargs["extra_body"] == reasoning
 +        assert second_kwargs["task"] == "title"
 +        assert "extra_body" not in second_kwargs
-+
+ 
      def test_strips_quotes(self):
          mock_response = MagicMock()
-         mock_response.choices = [MagicMock()]
 diff --git a/tests/cli/test_cli_init.py b/tests/cli/test_cli_init.py
-index b926d55f535dfafc30ad42c2f80d55aa43327848..ff7913de4f197752bcbb2264fa8941192dc51cfa 100644
 --- a/tests/cli/test_cli_init.py
 +++ b/tests/cli/test_cli_init.py
 @@ -1,6 +1,7 @@
@@ -5558,7 +6053,7 @@ index b926d55f535dfafc30ad42c2f80d55aa43327848..ff7913de4f197752bcbb2264fa894119
  import os
  import sys
  from unittest.mock import MagicMock, patch
-@@ -24,7 +25,7 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
+@@ -24,7 +25,7 @@
      }
      if config_overrides:
          _clean_config.update(config_overrides)
@@ -5567,7 +6062,7 @@ index b926d55f535dfafc30ad42c2f80d55aa43327848..ff7913de4f197752bcbb2264fa894119
      if env_overrides:
          clean_env.update(env_overrides)
      prompt_toolkit_stubs = {
-@@ -219,10 +220,12 @@ class TestHistoryDisplay:
+@@ -219,10 +220,12 @@
          assert "/resume" in output
          assert "Current preview" not in output
  
@@ -5581,7 +6076,7 @@ index b926d55f535dfafc30ad42c2f80d55aa43327848..ff7913de4f197752bcbb2264fa894119
          cli._session_db.list_sessions_rich.return_value = [
              {
                  "id": "current",
-@@ -231,19 +234,91 @@ class TestHistoryDisplay:
+@@ -231,19 +234,91 @@
                  "last_active": 0,
              },
              {
@@ -5592,6 +6087,13 @@ index b926d55f535dfafc30ad42c2f80d55aa43327848..ff7913de4f197752bcbb2264fa894119
                  "last_active": 0,
              },
          ]
+-
+-        cli._handle_resume_command("/resume")
+-        output = capsys.readouterr().out
+-
+-        assert "Recent sessions" in output
+-        assert "Checking Running Hermes Agent" in output
+-        assert "Use /resume <session id or title> to continue" in output
 +        cli._session_db.get_session.side_effect = lambda session_id: {
 +            "id": target_id,
 +            "title": "Checking Running Hermes Agent",
@@ -5600,16 +6102,11 @@ index b926d55f535dfafc30ad42c2f80d55aa43327848..ff7913de4f197752bcbb2264fa894119
 +            {"role": "user", "content": "Where did we leave off?"},
 +            {"role": "assistant", "content": "We were debugging resume UX."},
 +        ]
- 
--        cli._handle_resume_command("/resume")
--        output = capsys.readouterr().out
++
 +        with patch("hermes_cli.main._session_browse_picker", return_value=target_id) as picker, \
 +             patch.object(cli, "_display_resumed_history") as display:
 +            cli._handle_resume_command("/resume")
- 
--        assert "Recent sessions" in output
--        assert "Checking Running Hermes Agent" in output
--        assert "Use /resume <session id or title> to continue" in output
++
 +        picker.assert_called_once()
 +        display.assert_called_once()
 +        assert cli.session_id == target_id
@@ -5679,7 +6176,7 @@ index b926d55f535dfafc30ad42c2f80d55aa43327848..ff7913de4f197752bcbb2264fa894119
  
  
  class TestRootLevelProviderOverride:
-@@ -345,3 +420,183 @@ class TestProviderResolution:
+@@ -345,3 +420,183 @@
          cli = _make_cli()
          assert isinstance(cli.model, str)
          assert isinstance(cli.model, str) and '/' in cli.model
@@ -5864,7 +6361,6 @@ index b926d55f535dfafc30ad42c2f80d55aa43327848..ff7913de4f197752bcbb2264fa894119
 +        assert printed == []
 +
 diff --git a/tests/cli/test_cli_new_session.py b/tests/cli/test_cli_new_session.py
-index 0490aad9ce12e44d3851bd27264d34c39ad816f0..3dd4f1994bb7e400bf446ca93a9f86b850305322 100644
 --- a/tests/cli/test_cli_new_session.py
 +++ b/tests/cli/test_cli_new_session.py
 @@ -3,6 +3,7 @@
@@ -5875,7 +6371,7 @@ index 0490aad9ce12e44d3851bd27264d34c39ad816f0..3dd4f1994bb7e400bf446ca93a9f86b8
  import os
  import sys
  from datetime import timedelta
-@@ -28,6 +29,13 @@ class _FakeAgent:
+@@ -28,6 +29,13 @@
          self.session_id = session_id
          self.session_start = session_start
          self.model = "anthropic/claude-opus-4.6"
@@ -5889,7 +6385,7 @@ index 0490aad9ce12e44d3851bd27264d34c39ad816f0..3dd4f1994bb7e400bf446ca93a9f86b8
          self._last_flushed_db_idx = 7
          self._todo_store = TodoStore()
          self._todo_store.write(
-@@ -35,6 +43,7 @@ class _FakeAgent:
+@@ -35,6 +43,7 @@
          )
          self.flush_memories = MagicMock()
          self._invalidate_system_prompt = MagicMock()
@@ -5897,10 +6393,11 @@ index 0490aad9ce12e44d3851bd27264d34c39ad816f0..3dd4f1994bb7e400bf446ca93a9f86b8
  
          # Token counters (non-zero to verify reset)
          self.session_total_tokens = 1000
-@@ -51,6 +60,16 @@ class _FakeAgent:
+@@ -50,6 +59,16 @@
+         self.session_cost_status = "estimated"
          self.session_cost_source = "openrouter"
          self.context_compressor = _FakeCompressor()
- 
++
 +    def _apply_switch_model(self, **kwargs):
 +        self.model = kwargs.get("new_model", self.model)
 +        self.provider = kwargs.get("new_provider", self.provider)
@@ -5910,11 +6407,10 @@ index 0490aad9ce12e44d3851bd27264d34c39ad816f0..3dd4f1994bb7e400bf446ca93a9f86b8
 +        self.api_key = kwargs.get("api_key", self.api_key)
 +        self.acp_command = kwargs.get("acp_command", self.acp_command)
 +        self.acp_args = list(kwargs.get("acp_args") or self.acp_args)
-+
+ 
      def reset_session_state(self):
          """Mirror the real AIAgent.reset_session_state()."""
-         self.session_total_tokens = 0
-@@ -106,6 +125,10 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
+@@ -106,6 +125,10 @@
          "prompt_toolkit.completion": MagicMock(),
          "prompt_toolkit.formatted_text": MagicMock(),
          "prompt_toolkit.auto_suggest": MagicMock(),
@@ -5925,10 +6421,12 @@ index 0490aad9ce12e44d3851bd27264d34c39ad816f0..3dd4f1994bb7e400bf446ca93a9f86b8
      }
      with patch.dict(sys.modules, prompt_toolkit_stubs), patch.dict(
          "os.environ", clean_env, clear=False
-@@ -133,6 +156,15 @@ def _prepare_cli_with_active_session(tmp_path):
+@@ -131,6 +154,15 @@
+     cli.session_start = old_session_start
+     cli.agent.session_start = old_session_start
      return cli
- 
- 
++
++
 +def _session_reasoning_config(session_row):
 +    model_config = json.loads(session_row["model_config"] or "{}")
 +    return model_config.get("reasoning_config")
@@ -5936,12 +6434,10 @@ index 0490aad9ce12e44d3851bd27264d34c39ad816f0..3dd4f1994bb7e400bf446ca93a9f86b8
 +
 +def _session_model_config(session_row):
 +    return json.loads(session_row["model_config"] or "{}")
-+
-+
+ 
+ 
  def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path):
-     cli = _prepare_cli_with_active_session(tmp_path)
-     old_session_id = cli.session_id
-@@ -220,3 +252,222 @@ def test_new_session_resets_token_counters(tmp_path):
+@@ -220,3 +252,222 @@
      assert comp.last_total_tokens == 0
      assert comp.compression_count == 0
      assert comp._context_probed is False
@@ -6165,10 +6661,9 @@ index 0490aad9ce12e44d3851bd27264d34c39ad816f0..3dd4f1994bb7e400bf446ca93a9f86b8
 +    fake_cli._close_session_in_db.assert_called_once_with("cli_close")
 +    fake_cli._print_exit_summary.assert_called_once()
 diff --git a/tests/cli/test_cli_skin_integration.py b/tests/cli/test_cli_skin_integration.py
-index 08a86782d8aabe23944b4489b752532dda7f6b34..68d3bf5a3e85612df3abb542076f2681caf27612 100644
 --- a/tests/cli/test_cli_skin_integration.py
 +++ b/tests/cli/test_cli_skin_integration.py
-@@ -75,6 +75,13 @@ class TestCliSkinPromptIntegration:
+@@ -75,6 +75,13 @@
          with patch("hermes_cli.skin_engine.get_active_prompt_symbol", return_value="⚔ "):
              assert cli._get_tui_prompt_fragments() == [("class:sudo-prompt", "🔑 ⚔ ")]
  
@@ -6183,10 +6678,9 @@ index 08a86782d8aabe23944b4489b752532dda7f6b34..68d3bf5a3e85612df3abb542076f2681
          cli = _make_cli_stub()
  
 diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
-index eabcd0f9624e331375338d994540d1f43887699b..ead2dc05276af2a2e26589ce0a5bb06b4bce1aa7 100644
 --- a/tests/cli/test_cli_status_bar.py
 +++ b/tests/cli/test_cli_status_bar.py
-@@ -2,15 +2,30 @@ from datetime import datetime, timedelta
+@@ -2,15 +2,30 @@
  from types import SimpleNamespace
  from unittest.mock import MagicMock, patch
  
@@ -6218,7 +6712,7 @@ index eabcd0f9624e331375338d994540d1f43887699b..ead2dc05276af2a2e26589ce0a5bb06b
      return cli_obj
  
  
-@@ -51,6 +66,30 @@ def _attach_agent(
+@@ -51,6 +66,30 @@
      return cli_obj
  
  
@@ -6249,7 +6743,7 @@ index eabcd0f9624e331375338d994540d1f43887699b..ead2dc05276af2a2e26589ce0a5bb06b
  class TestCLIStatusBar:
      def test_context_style_thresholds(self):
          cli_obj = _make_cli()
-@@ -75,10 +114,12 @@ class TestCLIStatusBar:
+@@ -75,10 +114,12 @@
          text = cli_obj._build_status_bar_text(width=120)
  
          assert "claude-sonnet-4-20250514" in text
@@ -6263,7 +6757,7 @@ index eabcd0f9624e331375338d994540d1f43887699b..ead2dc05276af2a2e26589ce0a5bb06b
  
      def test_input_height_counts_wide_characters_using_cell_width(self):
          cli_obj = _make_cli()
-@@ -195,7 +236,7 @@ class TestCLIStatusBar:
+@@ -195,7 +236,7 @@
  
          assert "⚕" in text
          assert "$0.06" not in text  # cost hidden by default
@@ -6272,10 +6766,11 @@ index eabcd0f9624e331375338d994540d1f43887699b..ead2dc05276af2a2e26589ce0a5bb06b
          assert "200K" not in text
  
      def test_build_status_bar_text_handles_missing_agent(self):
-@@ -206,6 +247,175 @@ class TestCLIStatusBar:
+@@ -205,6 +246,175 @@
+ 
          assert "⚕" in text
          assert "claude-sonnet-4-20250514" in text
- 
++
 +    def test_status_bar_primary_line_shows_provider_and_reasoning_next_to_model(self):
 +        cli_obj = _attach_agent(
 +            _make_cli(),
@@ -6444,14 +6939,14 @@ index eabcd0f9624e331375338d994540d1f43887699b..ead2dc05276af2a2e26589ce0a5bb06b
 +            assert cli_obj._get_status_bar_provider_label() == expected_name
 +
 +        mock_lookup.assert_called_once_with(base_url)
-+
+ 
      def test_minimal_tui_chrome_threshold(self):
          cli_obj = _make_cli()
- 
-@@ -237,6 +447,108 @@ class TestCLIStatusBar:
+@@ -236,6 +446,108 @@
+         assert cli_obj._spinner_widget_height(width=90) == 1
          cli_obj._spinner_text = ""
          assert cli_obj._spinner_widget_height(width=90) == 0
- 
++
 +    def test_spinner_line_visible_while_agent_working_before_first_spinner_text(self):
 +        cli_obj = _make_cli()
 +        cli_obj._agent_running = True
@@ -6553,14 +7048,14 @@ index eabcd0f9624e331375338d994540d1f43887699b..ead2dc05276af2a2e26589ce0a5bb06b
 +        cli_obj._flush_stream.assert_called_once()
 +        cli_obj._reset_stream_state.assert_called_once()
 +        assert mock_cprint.call_count == 1
-+
+ 
      def test_voice_status_bar_compacts_on_narrow_terminals(self):
          cli_obj = _make_cli()
-         cli_obj._voice_mode = True
-@@ -259,6 +571,379 @@ class TestCLIStatusBar:
+@@ -258,6 +570,412 @@
+         fragments = cli_obj._get_voice_status_fragments(width=50)
  
          assert fragments == [("class:voice-status-recording", " ● REC ")]
- 
++
 +    def test_status_bar_secondary_line_shows_context_details_on_wide_terminal(self):
 +        cli_obj = _attach_todo_items(
 +            _attach_agent(
@@ -6827,6 +7322,39 @@ index eabcd0f9624e331375338d994540d1f43887699b..ead2dc05276af2a2e26589ce0a5bb06b
 +
 +        assert title == "资源回收机制"
 +
++    def test_summarize_prompt_task_rejects_context_compaction_summary_prefix(self):
++        cli_obj = _make_cli()
++
++        title = cli_obj._summarize_prompt_task(
++            "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted to save context space. "
++            "The summary below describes work that was already completed, and the current session state may still reflect that work."
++        )
++
++        assert title == ""
++
++    def test_summarize_prompt_task_rejects_python_mock_repr(self):
++        cli_obj = _make_cli()
++
++        title = cli_obj._summarize_prompt_task(
++            "<MagicMock name='_session_title()' id='133736162728528'>"
++        )
++
++        assert title == ""
++
++    def test_get_saved_tmux_task_title_skips_compaction_history_and_prefers_session_title(self):
++        cli_obj = _make_cli()
++        cli_obj.conversation_history = [
++            {
++                "role": "user",
++                "content": "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted to save context space. "
++                "The summary below describes work that was already completed.",
++            }
++        ]
++        cli_obj._session_db = MagicMock()
++        cli_obj._session_db.get_session_title.return_value = "检查hermes4实例上下文压缩 #5"
++
++        assert cli_obj._get_saved_tmux_task_title() == "检查hermes4实例上下文压缩 #5"
++
 +    def test_get_prompt_task_title_locks_to_first_prompt_per_session(self):
 +        cli_obj = _make_cli()
 +        cli_obj.conversation_history = []
@@ -6933,15 +7461,13 @@ index eabcd0f9624e331375338d994540d1f43887699b..ead2dc05276af2a2e26589ce0a5bb06b
 +
 +        assert " / " in title
 +        assert cli_obj._title_display_width(title) <= 60
-+
+ 
  
  class TestCLIUsageReport:
-     def test_show_usage_includes_estimated_cost(self, capsys):
 diff --git a/tests/cli/test_reasoning_command.py b/tests/cli/test_reasoning_command.py
-index 554cb6f96bcd993f75dfb03ef78370b5d6590236..3209133acf0c165d1905109c19ea83cafeb6cc07 100644
 --- a/tests/cli/test_reasoning_command.py
 +++ b/tests/cli/test_reasoning_command.py
-@@ -386,10 +386,21 @@ class TestReasoningDisplayModeSelection(unittest.TestCase):
+@@ -386,9 +386,20 @@
      def test_show_reasoning_streaming_uses_live_reasoning_box(self):
          cli = self._make_cli(show_reasoning=True, streaming_enabled=True, verbose=False)
  
@@ -6951,7 +7477,7 @@ index 554cb6f96bcd993f75dfb03ef78370b5d6590236..3209133acf0c165d1905109c19ea83ca
 +
          self.assertIsNotNone(callback)
          self.assertEqual(callback("x"), ("stream", "x"))
- 
++
 +    def test_show_reasoning_streaming_uses_preview_callback_inside_tmux(self):
 +        cli = self._make_cli(show_reasoning=True, streaming_enabled=True, verbose=False)
 +
@@ -6960,14 +7486,15 @@ index 554cb6f96bcd993f75dfb03ef78370b5d6590236..3209133acf0c165d1905109c19ea83ca
 +
 +        self.assertIsNotNone(callback)
 +        self.assertEqual(callback("x"), ("preview", "x"))
-+
+ 
      def test_verbose_without_show_reasoning_uses_preview_callback(self):
          cli = self._make_cli(show_reasoning=False, streaming_enabled=False, verbose=True)
- 
-@@ -398,6 +409,46 @@ class TestReasoningDisplayModeSelection(unittest.TestCase):
+@@ -396,6 +407,46 @@
+         callback = cli._current_reasoning_callback()
+         self.assertIsNotNone(callback)
          self.assertEqual(callback("x"), ("preview", "x"))
- 
- 
++
++
 +class TestTmuxReasoningPreviewPolicy(unittest.TestCase):
 +    def _make_cli(self, *, show_reasoning=True):
 +        from cli import HermesCLI
@@ -7006,16 +7533,13 @@ index 554cb6f96bcd993f75dfb03ef78370b5d6590236..3209133acf0c165d1905109c19ea83ca
 +
 +        with patch.dict("os.environ", {"TMUX": ""}, clear=False):
 +            self.assertFalse(cli._should_render_final_reasoning_box())
-+
-+
- # ---------------------------------------------------------------------------
- # Real provider format extraction
+ 
+ 
  # ---------------------------------------------------------------------------
 diff --git a/tests/cli/test_resume_display.py b/tests/cli/test_resume_display.py
-index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f58f8f59b6 100644
 --- a/tests/cli/test_resume_display.py
 +++ b/tests/cli/test_resume_display.py
-@@ -26,7 +26,12 @@ def _make_cli(config_overrides=None, env_overrides=None, **kwargs):
+@@ -26,7 +26,12 @@
              "base_url": "https://openrouter.ai/api/v1",
              "provider": "auto",
          },
@@ -7029,7 +7553,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
          "agent": {},
          "terminal": {"env_type": "local"},
      }
-@@ -89,6 +94,124 @@ def _tool_call_history():
+@@ -89,6 +94,124 @@
      ]
  
  
@@ -7154,7 +7678,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
  def _large_history(n_exchanges=15):
      """Build a history with many exchanges to test truncation."""
      msgs = [{"role": "system", "content": "system prompt"}]
-@@ -120,10 +243,10 @@ class TestDisplayResumedHistory:
+@@ -120,10 +243,10 @@
      """_display_resumed_history() renders a Rich panel with conversation recap."""
  
      def _capture_display(self, cli_obj):
@@ -7168,7 +7692,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
          return buf.getvalue()
  
      def test_simple_history_shows_user_and_assistant(self):
-@@ -155,13 +278,94 @@ class TestDisplayResumedHistory:
+@@ -155,12 +278,93 @@
  
      def test_tool_calls_shown_as_summary(self):
          cli = _make_cli()
@@ -7197,7 +7721,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
          assert "2 tool calls" in output
          assert "web_search" in output
          assert "web_extract" in output
- 
++
 +    def test_tool_only_steps_collapsed_when_final_answer_exists(self):
 +        cli = _make_cli()
 +        cli.conversation_history = _tool_heavy_turn_history()
@@ -7260,11 +7784,10 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
 +        assert "Pending / blockers:" in output
 +        assert "pytest is unavailable in this environment" in output
 +        assert "We can further extract pending work and blockers into a status view." in output
-+
+ 
      def test_long_user_message_truncated(self):
          cli = _make_cli()
-         long_text = "A" * 500
-@@ -209,13 +413,38 @@ class TestDisplayResumedHistory:
+@@ -209,13 +413,38 @@
  
      def test_large_history_shows_truncation_indicator(self):
          cli = _make_cli()
@@ -7305,7 +7828,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
  
      def test_multimodal_content_handled(self):
          cli = _make_cli()
-@@ -329,6 +558,22 @@ class TestDisplayResumedHistory:
+@@ -329,6 +558,22 @@
          assert "1 tool call" in output
          assert "terminal" in output
  
@@ -7328,7 +7851,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
  
  # ── Tests for _preload_resumed_session ──────────────────────────────
  
-@@ -349,6 +594,7 @@ class TestPreloadResumedSession:
+@@ -349,6 +594,7 @@
          cli = _make_cli(resume="nonexistent_session")
          mock_db = MagicMock()
          mock_db.get_session.return_value = None
@@ -7336,7 +7859,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
          cli._session_db = mock_db
  
          buf = StringIO()
-@@ -364,6 +610,9 @@ class TestPreloadResumedSession:
+@@ -364,6 +610,9 @@
          mock_db = MagicMock()
          mock_db.get_session.return_value = {"id": "empty_session", "title": None}
          mock_db.get_messages_as_conversation.return_value = []
@@ -7346,7 +7869,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
          cli._session_db = mock_db
  
          buf = StringIO()
-@@ -380,6 +629,7 @@ class TestPreloadResumedSession:
+@@ -380,6 +629,7 @@
          mock_db = MagicMock()
          mock_db.get_session.return_value = {"id": "good_session", "title": "Test Session"}
          mock_db.get_messages_as_conversation.return_value = messages
@@ -7354,7 +7877,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
          cli._session_db = mock_db
  
          buf = StringIO()
-@@ -400,6 +650,7 @@ class TestPreloadResumedSession:
+@@ -400,6 +650,7 @@
          mock_db = MagicMock()
          mock_db.get_session.return_value = {"id": "reopen_session", "title": None}
          mock_db.get_messages_as_conversation.return_value = messages
@@ -7362,10 +7885,11 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
          mock_conn = MagicMock()
          mock_db._conn = mock_conn
          cli._session_db = mock_db
-@@ -414,6 +665,26 @@ class TestPreloadResumedSession:
+@@ -413,6 +664,26 @@
+         call_args = mock_conn.execute.call_args
          assert "ended_at = NULL" in call_args[0][0]
          mock_conn.commit.assert_called_once()
- 
++
 +    def test_preload_sanitizes_ansi_from_resumed_history(self):
 +        cli = _make_cli(resume="ansi_session")
 +        messages = [
@@ -7385,11 +7909,10 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
 +        assert [m["role"] for m in cli.conversation_history] == ["user", "assistant", "tool"]
 +        assert cli.conversation_history[1]["content"] == "warning"
 +        assert cli.conversation_history[2]["content"] == "tool output"
-+
+ 
      def test_singular_user_message_grammar(self):
          """1 user message should say 'message' not 'messages'."""
-         cli = _make_cli(resume="one_msg_session")
-@@ -424,6 +695,7 @@ class TestPreloadResumedSession:
+@@ -424,6 +695,7 @@
          mock_db = MagicMock()
          mock_db.get_session.return_value = {"id": "one_msg_session", "title": None}
          mock_db.get_messages_as_conversation.return_value = messages
@@ -7397,7 +7920,7 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
          mock_db._conn = MagicMock()
          cli._session_db = mock_db
  
-@@ -472,6 +744,7 @@ class TestResumeDisplayConfig:
+@@ -472,6 +744,7 @@
          display = DEFAULT_CONFIG.get("display", {})
          assert "resume_display" in display
          assert display["resume_display"] == "full"
@@ -7405,16 +7928,15 @@ index d0c156d13a6158ec9f7921f2e04b6c5e9d67dd87..5ef08cca4b6c9fff437e969e2a2ed4f5
  
      def test_cli_defaults_have_resume_display(self):
          """cli.py load_cli_config defaults include resume_display."""
-@@ -486,3 +759,4 @@ class TestResumeDisplayConfig:
+@@ -486,3 +759,4 @@
  
          display = config.get("display", {})
          assert display.get("resume_display") == "full"
 +        assert display.get("resume_history_exchanges") == 20
 diff --git a/tests/hermes_cli/test_session_browse.py b/tests/hermes_cli/test_session_browse.py
-index 4b24a58b920acbc1b2c84ce15c5e82c825c7147e..24ca610ee567301c5e36d1ba5018ef5cc023769f 100644
 --- a/tests/hermes_cli/test_session_browse.py
 +++ b/tests/hermes_cli/test_session_browse.py
-@@ -12,7 +12,12 @@ from unittest.mock import MagicMock, patch, call
+@@ -12,7 +12,12 @@
  
  import pytest
  
@@ -7428,7 +7950,7 @@ index 4b24a58b920acbc1b2c84ce15c5e82c825c7147e..24ca610ee567301c5e36d1ba5018ef5c
  
  
  # ─── Sample session data ──────────────────────────────────────────────────────
-@@ -216,6 +221,66 @@ class TestSessionBrowsePicker:
+@@ -216,6 +221,66 @@
          output = capsys.readouterr().out
          assert "Hello world test message" in output
  
@@ -7495,7 +8017,7 @@ index 4b24a58b920acbc1b2c84ce15c5e82c825c7147e..24ca610ee567301c5e36d1ba5018ef5c
      def test_fallback_shows_id_when_no_title_or_preview(self, capsys):
          """When neither title nor preview, show session ID."""
          sessions = [{
-@@ -242,6 +307,62 @@ class TestSessionBrowsePicker:
+@@ -242,6 +307,62 @@
          assert "test_003_fallback" in output
  
  
@@ -7558,23 +8080,25 @@ index 4b24a58b920acbc1b2c84ce15c5e82c825c7147e..24ca610ee567301c5e36d1ba5018ef5c
  # ─── Curses-based picker (mocked curses) ────────────────────────────────────
  
  class TestCursesBrowse:
-@@ -326,11 +447,12 @@ class TestCursesBrowse:
+@@ -326,11 +447,12 @@
      def test_backspace_removes_filter_char(self):
          """Backspace removes the last character from the filter."""
          import curses
-+        now = time.time()
-         sessions = [
+-        sessions = [
 -            {"id": "s1", "source": "cli", "title": "Alpha", "preview": "", "last_active": time.time()},
 -            {"id": "s2", "source": "cli", "title": "Beta", "preview": "", "last_active": time.time()},
+-        ]
+-        # Type "Bet", backspace, backspace, backspace (clears filter), then Enter (selects first)
++        now = time.time()
++        sessions = [
 +            {"id": "s1", "source": "cli", "title": "Alpha", "preview": "", "last_active": now},
 +            {"id": "s2", "source": "cli", "title": "Beta", "preview": "", "last_active": now - 1},
-         ]
--        # Type "Bet", backspace, backspace, backspace (clears filter), then Enter (selects first)
++        ]
 +        # Type "Bet", backspace, backspace, backspace (clears filter), then Enter (selects top-ranked session)
          keys = [ord('B'), ord('e'), ord('t'), 127, 127, 127, 10]
          result = self._run_with_keys(sessions, keys)
          assert result == "s1"
-@@ -540,3 +662,89 @@ class TestEdgeCases:
+@@ -540,3 +662,89 @@
          assert "just now" in output
          assert "2h ago" in output
          assert "3d ago" in output
@@ -7665,10 +8189,9 @@ index 4b24a58b920acbc1b2c84ce15c5e82c825c7147e..24ca610ee567301c5e36d1ba5018ef5c
 +
 +        assert _session_cwd_score(session, "/srv/apps/hermes") > 0
 diff --git a/tests/hermes_cli/test_skin_engine.py b/tests/hermes_cli/test_skin_engine.py
-index 22bb76267ff4bde63200b74c3ce69da6e585723d..60de4460fad52921dea3be50e2235c063ebcfe86 100644
 --- a/tests/hermes_cli/test_skin_engine.py
 +++ b/tests/hermes_cli/test_skin_engine.py
-@@ -287,3 +287,34 @@ class TestCliBrandingHelpers:
+@@ -287,3 +287,34 @@
          assert overrides["clarify-title"] == f"{skin.get_color('banner_title')} bold"
          assert overrides["sudo-prompt"] == f"{skin.get_color('ui_error')} bold"
          assert overrides["approval-title"] == f"{skin.get_color('ui_warn')} bold"
@@ -7704,10 +8227,9 @@ index 22bb76267ff4bde63200b74c3ce69da6e585723d..60de4460fad52921dea3be50e2235c06
 +        assert overrides["voice-status"] == "bg:#000000 #FFD700"
 +        assert overrides["voice-status-recording"] == "bg:#000000 #FFD700 bold"
 diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
-index d716b59b273ce8479dd6905cd6a9780c8c6e6feb..f33c75941af5e1df95586ab4f75a8b38cd5c501d 100644
 --- a/tests/run_agent/test_run_agent.py
 +++ b/tests/run_agent/test_run_agent.py
-@@ -728,6 +728,28 @@ class TestToolUseEnforcementConfig:
+@@ -728,6 +728,28 @@
          prompt = agent._build_system_prompt()
          assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
  
@@ -7736,10 +8258,11 @@ index d716b59b273ce8479dd6905cd6a9780c8c6e6feb..f33c75941af5e1df95586ab4f75a8b38
      def test_auto_injects_for_codex(self):
          from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
          agent = self._make_agent(model="openai/codex-mini", tool_use_enforcement="auto")
-@@ -2749,6 +2771,70 @@ class TestBudgetPressure:
+@@ -2748,6 +2770,70 @@
+         """Agent should have budget grace call flags."""
          assert agent._budget_exhausted_injected is False
          assert agent._budget_grace_call is False
- 
++
 +    def test_budget_exhaustion_triggers_one_grace_summary_call(self, agent):
 +        """When tool budget runs out after a tool turn, run one extra summary API call."""
 +        agent._cached_system_prompt = "You are helpful."
@@ -7803,33 +8326,30 @@ index d716b59b273ce8479dd6905cd6a9780c8c6e6feb..f33c75941af5e1df95586ab4f75a8b38
 +        assert "tool budget ran out" in tail[2]["content"]
 +        assert tail[3]["content"] == "Budget summary"
 +        assert result["messages"][-4:] == tail
-+
+ 
  
  class TestSafeWriter:
-     """Verify _SafeWriter guards stdout against OSError (broken pipes)."""
 diff --git a/tests/test_cli_skin_integration.py b/tests/test_cli_skin_integration.py
-index 272a7bc5b1da31cf63cc4e290d4725906e748b29..001f1cdc820df23001aa0c7371a172855fcb40ec 100644
 --- a/tests/test_cli_skin_integration.py
 +++ b/tests/test_cli_skin_integration.py
-@@ -56,6 +56,13 @@ class TestCliSkinPromptIntegration:
+@@ -55,6 +55,13 @@
+ 
          with patch("hermes_cli.skin_engine.get_active_prompt_symbol", return_value="⚔ "):
              assert cli._get_tui_prompt_fragments() == [("class:sudo-prompt", "🔑 ⚔ ")]
- 
++
 +    def test_agent_running_prompt_fragments_show_pulse_frame(self):
 +        cli = _make_cli_stub()
 +        cli._agent_running = True
 +
 +        with patch.object(HermesCLI, "_agent_working_frame", return_value="●"):
 +            assert cli._get_tui_prompt_fragments() == [("class:prompt-working", "⚕ ● ❯ ")]
-+
+ 
      def test_build_tui_style_dict_uses_skin_overrides(self):
          cli = _make_cli_stub()
- 
 diff --git a/tests/tools/test_notify_on_complete.py b/tests/tools/test_notify_on_complete.py
-index 411f95f7e036bbe92b5b8b1c38ba302fac1487d9..5ce4d90faf67a02ef5b8d9d7442b23ae7bf1082b 100644
 --- a/tests/tools/test_notify_on_complete.py
 +++ b/tests/tools/test_notify_on_complete.py
-@@ -269,6 +269,25 @@ class TestTerminalSchema:
+@@ -269,6 +269,25 @@
          assert props["notify_on_complete"]["type"] == "boolean"
          assert props["notify_on_complete"]["default"] is False
  
@@ -7856,7 +8376,6 @@ index 411f95f7e036bbe92b5b8b1c38ba302fac1487d9..5ce4d90faf67a02ef5b8d9d7442b23ae
          """_handle_terminal passes notify_on_complete to terminal_tool."""
          from tools.terminal_tool import _handle_terminal
 diff --git a/tests/tools/test_session_search.py b/tests/tools/test_session_search.py
-index acb64d62fbb421e824cf5a6a10f629560ad57224..16c6760fb3bf55391076f502bd2f5ad6c3f8605a 100644
 --- a/tests/tools/test_session_search.py
 +++ b/tests/tools/test_session_search.py
 @@ -1,13 +1,18 @@
@@ -7878,7 +8397,7 @@ index acb64d62fbb421e824cf5a6a10f629560ad57224..16c6760fb3bf55391076f502bd2f5ad6
      _HIDDEN_SESSION_SOURCES,
      MAX_SESSION_CHARS,
      SESSION_SEARCH_SCHEMA,
-@@ -284,3 +289,78 @@ class TestSessionSearch:
+@@ -284,3 +289,78 @@
          assert result["count"] == 0
          assert result["results"] == []
          assert result["sessions_searched"] == 0
@@ -7958,10 +8477,9 @@ index acb64d62fbb421e824cf5a6a10f629560ad57224..16c6760fb3bf55391076f502bd2f5ad6
 +        assert result["count"] == 1
 +        assert result["results"][0]["summary"].startswith("[Raw preview — summarization unavailable]")
 diff --git a/tests/tools/test_terminal_tool_requirements.py b/tests/tools/test_terminal_tool_requirements.py
-index d0ce427358d954bdf1ed8c825f8f4080867abf01..e412b183bff6378f16845202b75ae2aabf1cf1fb 100644
 --- a/tests/tools/test_terminal_tool_requirements.py
 +++ b/tests/tools/test_terminal_tool_requirements.py
-@@ -27,6 +27,28 @@ class TestTerminalRequirements:
+@@ -27,6 +27,28 @@
          assert "terminal" in names
          assert {"read_file", "write_file", "patch", "search_files"}.issubset(names)
  
@@ -7991,10 +8509,9 @@ index d0ce427358d954bdf1ed8c825f8f4080867abf01..e412b183bff6378f16845202b75ae2aa
          monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
          monkeypatch.setenv("HOME", str(tmp_path))
 diff --git a/tools/session_search_tool.py b/tools/session_search_tool.py
-index 3e9c68af40e2d26bb1a2891b56f8b804e9a09f54..a153b5a8c0282babbbdf191d89b1f353d860eece 100644
 --- a/tools/session_search_tool.py
 +++ b/tools/session_search_tool.py
-@@ -24,6 +24,7 @@ from typing import Dict, Any, List, Optional, Union
+@@ -24,6 +24,7 @@
  from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
  MAX_SESSION_CHARS = 100_000
  MAX_SUMMARY_TOKENS = 10000
@@ -8002,7 +8519,7 @@ index 3e9c68af40e2d26bb1a2891b56f8b804e9a09f54..a153b5a8c0282babbbdf191d89b1f353
  
  
  def _format_timestamp(ts: Union[int, float, str, None]) -> str:
-@@ -149,10 +150,9 @@ async def _summarize_session(
+@@ -149,10 +150,9 @@
          f"Summarize this conversation with focus on: {query}"
      )
  
@@ -8016,7 +8533,7 @@ index 3e9c68af40e2d26bb1a2891b56f8b804e9a09f54..a153b5a8c0282babbbdf191d89b1f353
                  task="session_search",
                  messages=[
                      {"role": "system", "content": system_prompt},
-@@ -160,30 +160,32 @@ async def _summarize_session(
+@@ -160,30 +160,32 @@
                  ],
                  temperature=0.1,
                  max_tokens=MAX_SUMMARY_TOKENS,
@@ -8074,10 +8591,9 @@ index 3e9c68af40e2d26bb1a2891b56f8b804e9a09f54..a153b5a8c0282babbbdf191d89b1f353
  
  # Sources that are excluded from session browsing/searching by default.
 diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
-index 3dfa786e1ad6f5b6da31a79e36f2506ce659b180..14ae1747ff3440be9640e0a59406f1a3b4b82442 100644
 --- a/tools/terminal_tool.py
 +++ b/tools/terminal_tool.py
-@@ -525,7 +525,9 @@ Reserve terminal for: builds, installs, git, processes, scripts, network, packag
+@@ -525,7 +525,9 @@
  Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
  Background: Set background=true to get a session_id. Two patterns:
    (1) Long-lived processes that never exit (servers, watchers).
@@ -8088,7 +8604,7 @@ index 3dfa786e1ad6f5b6da31a79e36f2506ce659b180..14ae1747ff3440be9640e0a59406f1a3
  Use process(action="poll") for progress checks, process(action="wait") to block until done.
  Working directory: Use 'workdir' for per-command cwd.
  PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
-@@ -1720,7 +1722,7 @@ TERMINAL_SCHEMA = {
+@@ -1720,7 +1722,7 @@
              },
              "background": {
                  "type": "boolean",
@@ -8098,14 +8614,12 @@ index 3dfa786e1ad6f5b6da31a79e36f2506ce659b180..14ae1747ff3440be9640e0a59406f1a3
              },
              "timeout": {
 diff --git a/uv.lock b/uv.lock
-index c70d3e77ef4441b1706bb60fd1e95c38bd7f1d3c..45efc2d93ff627fee4f94ce2b068440873a22188 100644
 --- a/uv.lock
 +++ b/uv.lock
-@@ -165,6 +165,15 @@ wheels = [
-     { url = "https://files.pythonhosted.org/packages/fb/76/641ae371508676492379f16e2fa48f4e2c11741bd63c48be4b12a6b09cba/aiosignal-1.4.0-py3-none-any.whl", hash = "sha256:053243f8b92b990551949e63930a839ff0cf0b0ebbe0597b0f3fb19e1a0fe82e", size = 7490, upload-time = "2025-07-03T22:54:42.156Z" },
+@@ -166,6 +166,15 @@
  ]
  
-+[[package]]
+ [[package]]
 +name = "aiosqlite"
 +version = "0.22.1"
 +source = { registry = "https://pypi.org/simple" }
@@ -8114,13 +8628,16 @@ index c70d3e77ef4441b1706bb60fd1e95c38bd7f1d3c..45efc2d93ff627fee4f94ce2b0684408
 +    { url = "https://files.pythonhosted.org/packages/00/b7/e3bf5133d697a08128598c8d0abc5e16377b51465a33756de24fa7dee953/aiosqlite-0.22.1-py3-none-any.whl", hash = "sha256:21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb", size = 17405, upload-time = "2025-12-23T19:25:42.139Z" },
 +]
 +
- [[package]]
++[[package]]
  name = "altair"
  version = "6.0.0"
-@@ -240,6 +249,54 @@ wheels = [
+ source = { registry = "https://pypi.org/simple" }
+@@ -238,6 +247,54 @@
+ sdist = { url = "https://files.pythonhosted.org/packages/96/f0/5eb65b2bb0d09ac6776f2eb54adee6abe8228ea05b20a5ad0e4945de8aac/anyio-4.12.1.tar.gz", hash = "sha256:41cfcc3a4c85d3f05c932da7c26d0201ac36f72abd4435ba90d0464a3ffed703", size = 228685, upload-time = "2026-01-06T11:45:21.246Z" }
+ wheels = [
      { url = "https://files.pythonhosted.org/packages/38/0e/27be9fdef66e72d64c0cdc3cc2823101b80585f8119b5c112c2e8f5f7dab/anyio-4.12.1-py3-none-any.whl", hash = "sha256:d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c", size = 113592, upload-time = "2026-01-06T11:45:19.497Z" },
- ]
- 
++]
++
 +[[package]]
 +name = "asyncpg"
 +version = "0.31.0"
@@ -8167,12 +8684,10 @@ index c70d3e77ef4441b1706bb60fd1e95c38bd7f1d3c..45efc2d93ff627fee4f94ce2b0684408
 +    { url = "https://files.pythonhosted.org/packages/ba/7a/15e37d45e7f7c94facc1e9148c0e455e8f33c08f0b8a0b1deb2c5171771b/asyncpg-0.31.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:8df714dba348efcc162d2adf02d213e5fab1bd9f557e1305633e851a61814a7a", size = 3429426, upload-time = "2025-11-24T23:26:41.032Z" },
 +    { url = "https://files.pythonhosted.org/packages/13/d5/71437c5f6ae5f307828710efbe62163974e71237d5d46ebd2869ea052d10/asyncpg-0.31.0-cp314-cp314t-win32.whl", hash = "sha256:1b41f1afb1033f2b44f3234993b15096ddc9cd71b21a42dbd87fc6a57b43d65d", size = 614495, upload-time = "2025-11-24T23:26:42.659Z" },
 +    { url = "https://files.pythonhosted.org/packages/3c/d7/8fb3044eaef08a310acfe23dae9a8e2e07d305edc29a53497e52bc76eca7/asyncpg-0.31.0-cp314-cp314t-win_amd64.whl", hash = "sha256:bd4107bb7cdd0e9e65fae66a62afd3a249663b844fa34d479f6d5b3bef9c04c3", size = 706062, upload-time = "2025-11-24T23:26:44.086Z" },
-+]
-+
+ ]
+ 
  [[package]]
- name = "atroposlib"
- version = "0.4.0"
-@@ -1672,6 +1729,8 @@ acp = [
+@@ -1672,6 +1729,8 @@
  all = [
      { name = "agent-client-protocol" },
      { name = "aiohttp" },
@@ -8181,7 +8696,7 @@ index c70d3e77ef4441b1706bb60fd1e95c38bd7f1d3c..45efc2d93ff627fee4f94ce2b0684408
      { name = "croniter" },
      { name = "daytona" },
      { name = "debugpy" },
-@@ -1727,6 +1786,8 @@ honcho = [
+@@ -1727,6 +1786,8 @@
      { name = "honcho-ai" },
  ]
  matrix = [
@@ -8190,7 +8705,7 @@ index c70d3e77ef4441b1706bb60fd1e95c38bd7f1d3c..45efc2d93ff627fee4f94ce2b0684408
      { name = "markdown" },
      { name = "mautrix", extra = ["encryption"] },
  ]
-@@ -1791,7 +1852,9 @@ requires-dist = [
+@@ -1791,7 +1852,9 @@
      { name = "aiohttp", marker = "extra == 'homeassistant'", specifier = ">=3.9.0,<4" },
      { name = "aiohttp", marker = "extra == 'messaging'", specifier = ">=3.13.3,<4" },
      { name = "aiohttp", marker = "extra == 'sms'", specifier = ">=3.9.0,<4" },

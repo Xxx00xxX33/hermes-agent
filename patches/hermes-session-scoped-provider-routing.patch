@@ -1,0 +1,380 @@
+diff --git a/cli.py b/cli.py
+index 5642b6b9..cfa784c6 100644
+--- a/cli.py
++++ b/cli.py
+@@ -4052,6 +4052,9 @@ class HermesCLI:
+             ChatConsole().print(f"[bold red]{message}[/]")
+             return False
+ 
++        previous_model = self.model
++        previous_base_url = str(self.base_url or "").strip().rstrip("/")
++
+         api_key = runtime.get("api_key")
+         base_url = runtime.get("base_url")
+         resolved_provider = runtime.get("provider", "openrouter")
+@@ -4106,10 +4109,27 @@ class HermesCLI:
+         runtime_model = runtime.get("model")
+         if runtime_model and isinstance(runtime_model, str):
+             self.model = runtime_model
++        elif resolved_provider == "custom":
++            model_cfg = self.config.get("model", {}) if isinstance(self.config, dict) else {}
++            cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
++            cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
++            cfg_default_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
++            resolved_base_url = str(base_url or "").strip().rstrip("/")
++            requested_provider = str(getattr(self, "requested_provider", "") or "").strip().lower()
++            if (
++                requested_provider == "custom"
++                and cfg_provider == "custom"
++                and cfg_default_model
++                and cfg_base_url
++                and resolved_base_url == cfg_base_url
++                and resolved_base_url != previous_base_url
++            ):
++                self.model = cfg_default_model
+ 
+         # Normalize model for the resolved provider (e.g. swap non-Codex
+         # models when provider is openai-codex).  Fixes #651.
+-        model_changed = self._normalize_model_for_provider(resolved_provider)
++        normalized_model_changed = self._normalize_model_for_provider(resolved_provider)
++        model_changed = normalized_model_changed or self.model != previous_model
+ 
+         # AIAgent/OpenAI client holds auth at init time, so rebuild if key,
+         # routing, or the effective model changed.
+@@ -6134,6 +6154,7 @@ class HermesCLI:
+     def _session_routing_model_config(self, *, cwd: Optional[str] = None) -> Dict[str, Any]:
+         """Build the per-session routing metadata stored in sessions.model_config."""
+         model_config: Dict[str, Any] = {
++            "model": self.model,
+             "max_iterations": self.max_turns,
+             "reasoning_config": (
+                 dict(self.reasoning_config) if isinstance(self.reasoning_config, dict) else None
+@@ -6233,7 +6254,11 @@ class HermesCLI:
+             explicit_base_url = defaults["explicit_base_url"]
+             api_key = defaults["api_key"]
+         else:
+-            model = (session_meta or {}).get("model") or defaults["model"]
++            persisted_model = model_config.get("model")
++            if isinstance(persisted_model, str) and persisted_model.strip():
++                model = persisted_model.strip()
++            else:
++                model = (session_meta or {}).get("model") or defaults["model"]
+             requested_provider = (
+                 model_config.get("requested_provider")
+                 or model_config.get("provider")
+@@ -6277,6 +6302,25 @@ class HermesCLI:
+                 explicit_api_key = None
+                 api_key = None
+ 
++            # Backward compatibility for sessions persisted before routing metadata
++            # stored the model explicitly. Generic custom endpoints can change the
++            # effective model with config.yaml, so if the restored route matches the
++            # current default custom endpoint exactly, prefer the current default
++            # model over the stale top-level session.model.
++            defaults_requested = str(defaults["requested_provider"] or "").strip().lower()
++            restored_requested = str(requested_provider or "").strip().lower()
++            defaults_base_url = str(defaults["base_url"] or "").strip().rstrip("/")
++            restored_base_url = str(base_url or "").strip().rstrip("/")
++            if (
++                not (isinstance(persisted_model, str) and persisted_model.strip())
++                and defaults_requested == "custom"
++                and restored_requested == defaults_requested
++                and defaults_base_url
++                and restored_base_url == defaults_base_url
++                and defaults["model"]
++            ):
++                model = defaults["model"]
++
+         self.model = model
+         self.requested_provider = requested_provider
+         self.provider = provider
+@@ -7077,6 +7121,12 @@ class HermesCLI:
+ 
+         user_provs = None
+         custom_provs = None
++        try:
++            user_provs = CLI_CONFIG.get("providers")
++            custom_provs = CLI_CONFIG.get("custom_providers")
++        except Exception:
++            user_provs = None
++            custom_provs = None
+ 
+         # No args at all: open prompt_toolkit-native picker modal
+         if not model_input and not explicit_provider:
+diff --git a/hermes_cli/model_switch.py b/hermes_cli/model_switch.py
+index 273da087..5060a173 100644
+--- a/hermes_cli/model_switch.py
++++ b/hermes_cli/model_switch.py
+@@ -470,9 +470,14 @@ def switch_model(
+ 
+         target_provider = pdef.id
+ 
+-        # If no model specified, try auto-detect from endpoint
++        # If no model specified, prefer the provider's configured default model
++        # (named custom providers in config.yaml may pin a specific model). Fall
++        # back to endpoint auto-detection only when no configured model exists.
+         if not new_model:
+-            if pdef.base_url:
++            configured_model = str(getattr(pdef, "configured_model", "") or "").strip()
++            if configured_model:
++                new_model = configured_model
++            elif pdef.base_url:
+                 from hermes_cli.runtime_provider import _auto_detect_local_model
+                 detected = _auto_detect_local_model(pdef.base_url)
+                 if detected:
+diff --git a/hermes_cli/providers.py b/hermes_cli/providers.py
+index a9976349..6cd02fe8 100644
+--- a/hermes_cli/providers.py
++++ b/hermes_cli/providers.py
+@@ -156,6 +156,7 @@ class ProviderDef:
+     auth_type: str = "api_key"
+     doc: str = ""
+     source: str = ""                      # "models.dev", "hermes", "user-config"
++    configured_model: str = ""
+ 
+ 
+ # -- Aliases ------------------------------------------------------------------
+@@ -470,6 +471,8 @@ def resolve_custom_provider(
+         if requested not in {display_name.lower(), slug}:
+             continue
+ 
++        configured_model = str(entry.get("model") or entry.get("default") or "").strip()
++
+         return ProviderDef(
+             id=slug,
+             name=display_name,
+@@ -479,6 +482,7 @@ def resolve_custom_provider(
+             is_aggregator=False,
+             auth_type="api_key",
+             source="user-config",
++            configured_model=configured_model,
+         )
+ 
+     return None
+diff --git a/tests/cli/test_cli_provider_resolution.py b/tests/cli/test_cli_provider_resolution.py
+index 353b3234..354b7955 100644
+--- a/tests/cli/test_cli_provider_resolution.py
++++ b/tests/cli/test_cli_provider_resolution.py
+@@ -523,6 +523,222 @@ def test_codex_provider_strips_provider_prefix_from_model(monkeypatch):
+     assert shell.model == "gpt-5.3-codex"
+ 
+ 
++def test_generic_custom_runtime_realigns_stale_model_when_route_changes(monkeypatch):
++    cli = _import_cli()
++
++    monkeypatch.setitem(cli.CLI_CONFIG, "model", {
++        "default": "gpt-5.4",
++        "provider": "custom",
++        "base_url": "https://gpt.lucienfc.eu.org/v1",
++    })
++
++    def _runtime_resolve(**kwargs):
++        return {
++            "provider": "custom",
++            "api_mode": "chat_completions",
++            "base_url": "https://gpt.lucienfc.eu.org/v1",
++            "api_key": "***",
++            "source": "env/config",
++        }
++
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
++    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
++
++    shell = cli.HermesCLI(compact=True, max_turns=1)
++    shell.model = "gpt"
++    shell.base_url = "https://octopus.example/v1"
++    shell.provider = "custom"
++    shell.requested_provider = "custom"
++
++    assert shell._ensure_runtime_credentials() is True
++    assert shell.model == "gpt-5.4"
++    assert shell.base_url == "https://gpt.lucienfc.eu.org/v1"
++
++
++def test_apply_session_routing_from_meta_repairs_stale_custom_model(monkeypatch):
++    cli = _import_cli()
++
++    monkeypatch.setitem(cli.CLI_CONFIG, "model", {
++        "default": "gpt-5.4",
++        "provider": "custom",
++        "base_url": "https://gpt.lucienfc.eu.org/v1",
++    })
++
++    shell = cli.HermesCLI(compact=True, max_turns=1)
++    shell._apply_session_routing_from_meta(
++        {
++            "model": "gpt",
++            "model_config": {
++                "requested_provider": "custom",
++                "provider": "custom",
++                "base_url": "https://gpt.lucienfc.eu.org/v1",
++                "api_mode": "chat_completions",
++            },
++        }
++    )
++
++    assert shell.model == "gpt-5.4"
++    assert shell.requested_provider == "custom"
++    assert shell.base_url == "https://gpt.lucienfc.eu.org/v1"
++
++
++def test_session_routing_model_config_persists_model(monkeypatch):
++    cli = _import_cli()
++    shell = cli.HermesCLI(model="custom-session-model", compact=True, max_turns=1)
++    shell.requested_provider = "custom"
++    shell.provider = "custom"
++    shell.base_url = "https://gpt.lucienfc.eu.org/v1"
++
++    model_config = shell._session_routing_model_config(cwd="/tmp")
++
++    assert model_config["model"] == "custom-session-model"
++    assert model_config["requested_provider"] == "custom"
++
++
++def test_named_custom_switch_octopus_then_lucienfc_keeps_lucienfc_model(monkeypatch):
++    cli = _import_cli()
++
++    def _runtime_resolve(**kwargs):
++        requested = kwargs.get("requested")
++        if requested == "custom:octopus-gpt":
++            return {
++                "provider": "custom",
++                "api_mode": "chat_completions",
++                "base_url": "https://octopus.lucienfc.eu.org/v1",
++                "api_key": "***",
++                "model": "gpt",
++                "source": "env/config",
++            }
++        if requested == "custom:lucienfc-gpt":
++            return {
++                "provider": "custom",
++                "api_mode": "chat_completions",
++                "base_url": "https://gpt.lucienfc.eu.org/v1",
++                "api_key": "***",
++                "model": "gpt-5.4",
++                "source": "env/config",
++            }
++        raise AssertionError(f"unexpected requested provider: {requested!r}")
++
++    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
++    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
++
++    shell = cli.HermesCLI(compact=True, max_turns=1)
++    shell.model = "gpt"
++    shell.provider = "custom:octopus-gpt"
++    shell.requested_provider = "custom:octopus-gpt"
++    shell.base_url = "https://octopus.lucienfc.eu.org/v1"
++
++    assert shell._ensure_runtime_credentials() is True
++    assert shell.model == "gpt"
++    assert shell.base_url == "https://octopus.lucienfc.eu.org/v1"
++
++    shell.model = "gpt-5.4"
++    shell.provider = "custom:lucienfc-gpt"
++    shell.requested_provider = "custom:lucienfc-gpt"
++    shell.base_url = "https://gpt.lucienfc.eu.org/v1"
++
++    assert shell._ensure_runtime_credentials() is True
++    assert shell.model == "gpt-5.4"
++    assert shell.base_url == "https://gpt.lucienfc.eu.org/v1"
++
++
++def test_switch_model_uses_named_custom_provider_configured_model_when_implicit(monkeypatch):
++    _import_cli()
++    from hermes_cli.model_switch import switch_model
++
++    custom_providers = [
++        {
++            "name": "lucienfc-gpt",
++            "base_url": "https://gpt.lucienfc.eu.org/v1",
++            "api_key": "sk-lucienfc",
++            "api_mode": "chat_completions",
++            "model": "gpt-5.4",
++        }
++    ]
++
++    monkeypatch.setattr(
++        "hermes_cli.runtime_provider._auto_detect_local_model",
++        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("auto-detect should not be called for named custom providers with configured model")),
++    )
++    monkeypatch.setattr(
++        "hermes_cli.runtime_provider.resolve_runtime_provider",
++        lambda requested: {
++            "provider": "custom",
++            "api_mode": "chat_completions",
++            "base_url": "https://gpt.lucienfc.eu.org/v1",
++            "api_key": "***",
++            "source": "env/config",
++        },
++    )
++    monkeypatch.setattr(
++        "hermes_cli.models.validate_requested_model",
++        lambda *args, **kwargs: {"accepted": True, "persist": True, "recognized": False, "message": None},
++    )
++    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *args, **kwargs: None)
++    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *args, **kwargs: None)
++
++    result = switch_model(
++        raw_input="",
++        current_provider="custom",
++        current_model="gpt",
++        current_base_url="https://octopus.lucienfc.eu.org/v1",
++        current_api_key="***",
++        explicit_provider="lucienfc-gpt",
++        custom_providers=custom_providers,
++    )
++
++    assert result.success is True
++    assert result.new_model == "gpt-5.4"
++    assert result.target_provider == "custom:lucienfc-gpt"
++    assert result.provider_label == "lucienfc-gpt"
++
++
++def test_handle_model_switch_uses_configured_named_custom_provider(monkeypatch):
++    cli = _import_cli()
++
++    monkeypatch.setitem(cli.CLI_CONFIG, "custom_providers", [
++        {
++            "name": "lucienfc-gpt",
++            "base_url": "https://gpt.lucienfc.eu.org/v1",
++            "api_key": "sk-lucienfc",
++            "api_mode": "chat_completions",
++            "model": "gpt-5.4",
++        }
++    ])
++    monkeypatch.setattr(
++        "hermes_cli.runtime_provider.resolve_runtime_provider",
++        lambda requested: {
++            "provider": "custom",
++            "api_mode": "chat_completions",
++            "base_url": "https://gpt.lucienfc.eu.org/v1",
++            "api_key": "***",
++            "model": "gpt-5.4",
++            "source": "env/config",
++        },
++    )
++    monkeypatch.setattr(
++        "hermes_cli.models.validate_requested_model",
++        lambda *args, **kwargs: {"accepted": True, "persist": True, "recognized": False, "message": None},
++    )
++    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *args, **kwargs: None)
++    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *args, **kwargs: None)
++    monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *args, **kwargs: 200_000)
++
++    shell = cli.HermesCLI(compact=True, max_turns=1)
++    shell.model = "gpt"
++    shell.provider = "custom"
++    shell.requested_provider = "custom"
++    shell.base_url = "https://octopus.lucienfc.eu.org/v1"
++
++    shell._handle_model_switch("/model --provider lucienfc-gpt")
++
++    assert shell.model == "gpt-5.4"
++    assert shell.provider == "custom:lucienfc-gpt"
++    assert shell.requested_provider == "custom:lucienfc-gpt"
++    assert shell.base_url == "https://gpt.lucienfc.eu.org/v1"
++
++
+ def test_cmd_model_falls_back_to_auto_on_invalid_provider(monkeypatch, capsys):
+     monkeypatch.setattr(
+         "hermes_cli.config.load_config",

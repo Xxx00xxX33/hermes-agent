@@ -39,6 +39,12 @@ bundle:
     verifies:
       - tests/cli/test_branch_command.py
 
+  - id: session-scoped-provider-routing
+    patch: patches/hermes-session-scoped-provider-routing.patch
+    purpose: Preserve session-scoped provider/model routing across runtime refresh and legacy session restore paths.
+    verifies:
+      - tests/cli/test_cli_provider_resolution.py
+
   - id: tmux-scrollback-gap
     patch: patches/hermes-tmux-scrollback-gap.patch
     purpose: Keep tmux scrollback behavior compatible with the local Hermes layout.
