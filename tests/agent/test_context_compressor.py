@@ -168,10 +168,14 @@ class TestNonStringContent:
         assert isinstance(summary, str)
         assert summary.startswith(SUMMARY_PREFIX)
 
-    def test_none_content_coerced_to_empty(self):
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = None
+    def test_none_content_retries_until_meaningful_summary(self):
+        empty_response = MagicMock()
+        empty_response.choices = [MagicMock()]
+        empty_response.choices[0].message.content = None
+
+        ok_response = MagicMock()
+        ok_response.choices = [MagicMock()]
+        ok_response.choices[0].message.content = "real summary"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
@@ -181,11 +185,15 @@ class TestNonStringContent:
             {"role": "assistant", "content": "ok"},
         ]
 
-        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[empty_response, ok_response],
+        ) as mock_call, patch("agent.context_compressor.time.sleep") as mock_sleep:
             summary = c._generate_summary(messages)
-        # None content → empty string → standardized compaction handoff prefix added
-        assert summary is not None
-        assert summary == SUMMARY_PREFIX
+
+        assert summary == f"{SUMMARY_PREFIX}\nreal summary"
+        assert mock_call.call_count == 2
+        mock_sleep.assert_called_once()
 
     def test_summary_call_does_not_force_temperature(self):
         mock_response = MagicMock()
@@ -267,8 +275,8 @@ class TestNonStringContent:
         assert "extra_body" not in second_kwargs
 
 
-class TestSummaryFailureCooldown:
-    def test_summary_failure_enters_cooldown_and_skips_retry(self):
+class TestSummaryRetryLoop:
+    def test_summary_failure_retries_until_success(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
@@ -277,13 +285,85 @@ class TestSummaryFailureCooldown:
             {"role": "assistant", "content": "ok"},
         ]
 
-        with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")) as mock_call:
-            first = c._generate_summary(messages)
-            second = c._generate_summary(messages)
+        ok_response = MagicMock()
+        ok_response.choices = [MagicMock()]
+        ok_response.choices[0].message.content = "stable summary"
 
-        assert first is None
-        assert second is None
-        assert mock_call.call_count == 1
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[Exception("boom"), ok_response],
+        ) as mock_call, patch("agent.context_compressor.time.sleep") as mock_sleep:
+            summary = c._generate_summary(messages)
+
+        assert summary == f"{SUMMARY_PREFIX}\nstable summary"
+        assert mock_call.call_count == 2
+        assert c._summary_failure_cooldown_until == 0.0
+        mock_sleep.assert_called_once()
+
+    def test_summary_failure_returns_deterministic_fallback_after_max_attempts(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "investigate cliproxy summary failures"},
+            {"role": "assistant", "content": "checking current compression code"},
+            {"role": "tool", "content": "/root/.hermes/hermes-agent/agent/context_compressor.py"},
+        ]
+
+        def _sleep_guard(*_args, **_kwargs):
+            _sleep_guard.calls += 1
+            if _sleep_guard.calls > 2:
+                raise AssertionError("summary retry loop exceeded bounded retry budget")
+
+        _sleep_guard.calls = 0
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=RuntimeError("No LLM provider configured for task=compression provider=auto"),
+        ) as mock_call, patch("agent.context_compressor.time.sleep", side_effect=_sleep_guard):
+            summary = c._generate_summary(messages)
+
+        assert mock_call.call_count == 3
+        assert _sleep_guard.calls == 2
+        assert summary.startswith(f"{SUMMARY_PREFIX}\n1. Objective")
+        assert "Remote summary generation failed:" in summary
+        assert "Summary generation was unavailable" not in summary
+        assert c._previous_summary.startswith("1. Objective")
+
+    def test_compress_uses_structured_fallback_instead_of_static_marker(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+
+        msgs = [
+            {"role": "user", "content": "msg 0"},
+            {"role": "assistant", "content": "msg 1"},
+            {"role": "user", "content": "msg 2"},
+            {"role": "assistant", "content": "msg 3"},
+            {"role": "tool", "content": "/root/.hermes/hermes-agent/tests/agent/test_context_compressor.py"},
+            {"role": "assistant", "content": "msg 5"},
+            {"role": "user", "content": "msg 6"},
+            {"role": "assistant", "content": "msg 7"},
+        ]
+
+        def _sleep_guard(*_args, **_kwargs):
+            _sleep_guard.calls += 1
+            if _sleep_guard.calls > 2:
+                raise AssertionError("compress() summary retry loop exceeded bounded retry budget")
+
+        _sleep_guard.calls = 0
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=Exception("Request timed out."),
+        ), patch("agent.context_compressor.time.sleep", side_effect=_sleep_guard):
+            result = c.compress(msgs)
+
+        summary_messages = [m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)]
+        assert len(summary_messages) == 1
+        summary_text = summary_messages[0]["content"]
+        assert "1. Objective" in summary_text
+        assert "Summary generation was unavailable" not in summary_text
+        assert c.compression_count == 1
 
 
 class TestSummaryPrefixNormalization:

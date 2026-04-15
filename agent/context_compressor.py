@@ -17,6 +17,7 @@ Improvements over v1:
 import logging
 import time
 import json
+import re
 from typing import Any, Dict, List, Optional, Callable
 
 from agent.auxiliary_client import call_llm
@@ -57,7 +58,9 @@ _PRUNED_TOOL_SUMMARY_PREFIX = "[Tool result summary]"
 
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
-_SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+_SUMMARY_RETRY_INITIAL_DELAY_SECONDS = 1.0
+_SUMMARY_RETRY_MAX_DELAY_SECONDS = 30.0
+_SUMMARY_MAX_LLM_ATTEMPTS = 3
 
 
 class ContextCompressor(ContextEngine):
@@ -453,7 +456,164 @@ class ContextCompressor(ContextEngine):
 
         return "\n\n".join(parts)
 
-    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
+    def _build_summary_call_kwargs(self, prompt: str, summary_budget: int) -> Dict[str, Any]:
+        """Build the LLM request kwargs for context-summary generation."""
+        call_kwargs: Dict[str, Any] = {
+            "task": "compression",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": summary_budget * 2,
+            # timeout resolved from auxiliary.compression.timeout config by call_llm
+            "extra_body": {
+                "reasoning": {
+                    "enabled": True,
+                    "effort": "medium",
+                }
+            },
+        }
+        if self.summary_model:
+            # Respect explicit compression-summary override when configured.
+            call_kwargs["model"] = self.summary_model
+        else:
+            # Default: summarize with the current active runtime model.
+            runtime_route = self._resolve_summary_runtime()
+            call_kwargs.update({
+                "provider": runtime_route["provider"],
+                "model": runtime_route["model"],
+                "base_url": runtime_route["base_url"],
+                "api_key": runtime_route["api_key"],
+                "allow_provider_fallback": True,
+            })
+        return call_kwargs
+
+    def _call_summary_llm(self, call_kwargs: Dict[str, Any]):
+        """Call the summary LLM, retrying once without reasoning hints if needed."""
+        try:
+            return call_llm(**call_kwargs)
+        except Exception as reasoning_err:
+            err_str = str(reasoning_err).lower()
+            if any(
+                needle in err_str
+                for needle in (
+                    "reasoning",
+                    "unsupported_parameter",
+                    "unknown parameter",
+                    "unexpected keyword",
+                    "extra_body",
+                    "extra fields not permitted",
+                )
+            ):
+                logger.info(
+                    "Context compression summary: reasoning=medium unsupported on %s (%s); retrying without reasoning",
+                    call_kwargs.get("model") or self.summary_model or self.model,
+                    reasoning_err,
+                )
+                retry_kwargs = dict(call_kwargs)
+                retry_kwargs.pop("extra_body", None)
+                return call_llm(**retry_kwargs)
+            raise
+
+    @staticmethod
+    def _extract_summary_body(response: Any) -> str:
+        """Extract the meaningful summary body from an LLM response."""
+        content = response.choices[0].message.content
+        if not isinstance(content, str):
+            content = str(content) if content else ""
+        text = content.strip()
+        for prefix in (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip()
+                break
+        return text
+
+    @staticmethod
+    def _summary_retry_delay_seconds(attempt: int) -> float:
+        """Return capped exponential backoff for summary-generation retries."""
+        if attempt <= 0:
+            return 0.0
+        delay = _SUMMARY_RETRY_INITIAL_DELAY_SECONDS * (2 ** (attempt - 1))
+        return min(delay, _SUMMARY_RETRY_MAX_DELAY_SECONDS)
+
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        """Remove ANSI escape sequences so fallback summaries stay readable."""
+        return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", text or "")
+
+    def _build_deterministic_fallback_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        focus_topic: str | None = None,
+        failure_reason: str = "",
+    ) -> str:
+        """Generate a readable local fallback summary when the LLM path fails."""
+        user_points: list[str] = []
+        assistant_points: list[str] = []
+        tool_points: list[str] = []
+        references: list[str] = []
+
+        def _clip(text: str, limit: int = 220) -> str:
+            clean = " ".join(self._strip_ansi(text).split())
+            if len(clean) <= limit:
+                return clean
+            return clean[: limit - 3] + "..."
+
+        ref_pattern = re.compile(r"(?:~?/[^\s\]\[\)\(]+|https?://\S+|\b\d{2,5}\b)")
+
+        for msg in turns_to_summarize:
+            role = str(msg.get("role") or "")
+            content = _clip(str(msg.get("content") or ""))
+            if role == "user" and content:
+                user_points.append(content)
+            elif role == "assistant" and content:
+                assistant_points.append(content)
+            elif role == "tool":
+                tool_id = str(msg.get("tool_call_id") or "").strip()
+                tool_summary = f"tool result {tool_id}: {content}" if tool_id else f"tool result: {content}"
+                if content:
+                    tool_points.append(tool_summary)
+
+            for match in ref_pattern.findall(str(msg.get("content") or "")):
+                cleaned = self._strip_ansi(match).strip().rstrip('.,:;')
+                if cleaned and cleaned not in references:
+                    references.append(cleaned)
+                if len(references) >= 8:
+                    break
+            if len(references) >= 8:
+                continue
+
+        objective = user_points[0] if user_points else "Continue the in-progress conversation after compaction."
+        current_state = assistant_points[-2:] or user_points[-2:] or ["Recent turns were compacted with a deterministic local fallback summary."]
+        next_actions = []
+        if focus_topic:
+            next_actions.append(f"Prioritize the focus topic during continuation: {focus_topic}")
+        next_actions.append("Resume from the preserved recent turns and current file/tool state.")
+        if tool_points:
+            next_actions.append("Re-check any important tool outputs against live state before acting on them.")
+
+        hard_constraints = []
+        if failure_reason:
+            hard_constraints.append(f"Remote summary generation failed: {failure_reason}")
+        hard_constraints.append("This fallback summary was generated locally to avoid losing continuity.")
+
+        critical_refs = references[:8] or ["Use the preserved tail messages and current workspace state as ground truth."]
+        dropped_details = [
+            "Verbose middle-turn history was compressed mechanically after summary-generation failures.",
+            "Older raw tool outputs may have been truncated or replaced by shorter notes.",
+        ]
+
+        sections = [
+            "1. Objective\n- " + objective,
+            "2. Current state\n" + "\n".join(f"- {item}" for item in current_state),
+            "3. Hard constraints\n" + "\n".join(f"- {item}" for item in hard_constraints),
+            "4. Key decisions made\n- Continue from current repo/tool state rather than replaying dropped turns.",
+            "5. Open issues / uncertainties\n- Some details were reconstructed locally because the remote summarizer was unavailable.",
+            "6. Next actions\n" + "\n".join(f"- {item}" for item in next_actions),
+            "7. Critical references\n" + "\n".join(f"- {item}" for item in critical_refs),
+            "8. Dropped details\n" + "\n".join(f"- {item}" for item in dropped_details),
+        ]
+        return "\n\n".join(sections)
+
+    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> str:
         """Generate a structured summary of conversation turns.
 
         Uses a structured template (Goal, Progress, Decisions, Files, Next Steps)
@@ -466,18 +626,10 @@ class ContextCompressor(ContextEngine):
                 related to this topic and is more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
 
-        Returns None if all attempts fail — the caller should drop
-        the middle turns without a summary rather than inject a useless
-        placeholder.
+        Retries the remote summarizer up to a bounded number of times. If the
+        LLM path still fails, return a deterministic local handoff summary so
+        compaction never deletes history without leaving a usable summary.
         """
-        now = time.monotonic()
-        if now < self._summary_failure_cooldown_until:
-            logger.debug(
-                "Skipping context summary during cooldown (%.0fs remaining)",
-                self._summary_failure_cooldown_until - now,
-            )
-            return None
-
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
 
@@ -567,81 +719,71 @@ Write only the summary body. Do not include any preamble or prefix."""
 FOCUS TOPIC: "{focus_topic}"
 The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget."""
 
-        try:
-            call_kwargs = {
-                "task": "compression",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": summary_budget * 2,
-                # timeout resolved from auxiliary.compression.timeout config by call_llm
-                "extra_body": {
-                    "reasoning": {
-                        "enabled": True,
-                        "effort": "medium",
-                    }
-                },
-            }
-            if self.summary_model:
-                # Respect explicit compression-summary override when configured.
-                call_kwargs["model"] = self.summary_model
-            else:
-                # Default: summarize with the current active runtime model.
-                runtime_route = self._resolve_summary_runtime()
-                call_kwargs.update({
-                    "provider": runtime_route["provider"],
-                    "model": runtime_route["model"],
-                    "base_url": runtime_route["base_url"],
-                    "api_key": runtime_route["api_key"],
-                    "allow_provider_fallback": True,
-                })
+        attempt = 0
+        last_error: Exception | None = None
+        while attempt < _SUMMARY_MAX_LLM_ATTEMPTS:
+            attempt += 1
             try:
-                response = call_llm(**call_kwargs)
-            except Exception as reasoning_err:
-                err_str = str(reasoning_err).lower()
-                if any(
-                    needle in err_str
-                    for needle in (
-                        "reasoning",
-                        "unsupported_parameter",
-                        "unknown parameter",
-                        "unexpected keyword",
-                        "extra_body",
-                        "extra fields not permitted",
-                    )
-                ):
+                call_kwargs = self._build_summary_call_kwargs(prompt, summary_budget)
+                response = self._call_summary_llm(call_kwargs)
+                summary = self._extract_summary_body(response)
+                if not summary:
+                    raise ValueError("Summary LLM returned empty content")
+
+                # Store for iterative updates on next compaction
+                self._previous_summary = summary
+                self._summary_failure_cooldown_until = 0.0
+                if attempt > 1:
                     logger.info(
-                        "Context compression summary: reasoning=medium unsupported on %s (%s); retrying without reasoning",
-                        self.summary_model or self.model,
-                        reasoning_err,
+                        "Context compression summary succeeded after %d attempts",
+                        attempt,
                     )
-                    call_kwargs.pop("extra_body", None)
-                    response = call_llm(**call_kwargs)
-                else:
-                    raise
-            content = response.choices[0].message.content
-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
-            if not isinstance(content, str):
-                content = str(content) if content else ""
-            summary = content.strip()
-            # Store for iterative updates on next compaction
-            self._previous_summary = summary
-            self._summary_failure_cooldown_until = 0.0
-            return self._with_summary_prefix(summary)
-        except RuntimeError:
-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
-            logging.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary "
-                            "for %d seconds.",
-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
-            return None
-        except Exception as e:
-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
-            logging.warning(
-                "Failed to generate context summary: %s. "
-                "Further summary attempts paused for %d seconds.",
-                e,
-                _SUMMARY_FAILURE_COOLDOWN_SECONDS,
-            )
-            return None
+                return self._with_summary_prefix(summary)
+            except RuntimeError as e:
+                last_error = e
+                if attempt < _SUMMARY_MAX_LLM_ATTEMPTS:
+                    delay = self._summary_retry_delay_seconds(attempt)
+                    logger.warning(
+                        "Context compression summary unavailable on attempt %d/%d: %s. Retrying in %.1fs.",
+                        attempt,
+                        _SUMMARY_MAX_LLM_ATTEMPTS,
+                        e,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.warning(
+                    "Context compression summary unavailable after %d attempts: %s. Using deterministic local fallback summary.",
+                    attempt,
+                    e,
+                )
+            except Exception as e:
+                last_error = e
+                if attempt < _SUMMARY_MAX_LLM_ATTEMPTS:
+                    delay = self._summary_retry_delay_seconds(attempt)
+                    logger.warning(
+                        "Failed to generate context summary on attempt %d/%d: %s. Retrying in %.1fs.",
+                        attempt,
+                        _SUMMARY_MAX_LLM_ATTEMPTS,
+                        e,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.warning(
+                    "Failed to generate context summary after %d attempts: %s. Using deterministic local fallback summary.",
+                    attempt,
+                    e,
+                )
+
+        fallback_summary = self._build_deterministic_fallback_summary(
+            turns_to_summarize,
+            focus_topic=focus_topic,
+            failure_reason=str(last_error or "summary generation failed"),
+        )
+        self._previous_summary = fallback_summary
+        self._summary_failure_cooldown_until = 0.0
+        return self._with_summary_prefix(fallback_summary)
 
     @staticmethod
     def _with_summary_prefix(summary: str) -> str:
@@ -912,18 +1054,17 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 )
             compressed.append(msg)
 
-        # If LLM summary failed, insert a static fallback so the model
-        # knows context was lost rather than silently dropping everything.
+        # _generate_summary should already guarantee a usable handoff summary,
+        # but keep a local deterministic fallback here as a final safety net.
         if not summary:
             if not self.quiet_mode:
-                logger.warning("Summary generation failed — inserting static fallback context marker")
-            n_dropped = compress_end - compress_start
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} conversation turns were "
-                f"removed to free context space but could not be summarized. The removed "
-                f"turns contained earlier work in this session. Continue based on the "
-                f"recent messages below and the current state of any files or resources."
+                logger.warning("Summary generation returned empty output — inserting deterministic local fallback summary")
+            summary = self._with_summary_prefix(
+                self._build_deterministic_fallback_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    failure_reason="summary generation returned empty output",
+                )
             )
 
         _merge_summary_into_tail = False
