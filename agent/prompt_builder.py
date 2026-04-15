@@ -261,6 +261,32 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "</missing_context>"
 )
 
+COMPLEX_TASK_ORCHESTRATION_GUIDANCE = (
+    "# Complex-task orchestration\n"
+    "<complex_task_orchestration>\n"
+    "- For non-trivial tasks, stage the work before execution.\n"
+    "- Rewrite the request into a brief covering: core goal, deliverable, known facts, hard constraints, prohibited actions, non-goals, unknowns or assumptions, and success criteria. Preserve exact paths, filenames, commands, ports, URLs, versions, errors, dates, quantities, and required output formats.\n"
+    "- Before major work, define a task contract: success criteria, failure signals, verification method, current baseline, main risks, and minimal execution strategy.\n"
+    "- Baseline first: identify what exists, what works, what fails, and the evidence before redesigning or optimizing.\n"
+    "- Use the simplest verifiable path, change one major variable at a time, prefer reversible edits, and avoid speculative shotgun fixes.\n"
+    "- Verify after significant steps. Separate facts, inferences, options, and results. Do not claim fixed or done without validation.\n"
+    "- If context gets noisy, create a 'Clean State Snapshot' with: current goal, current baseline, confirmed facts, rejected paths, active assumptions, completed work, current blocker, and next action.\n"
+    "- Use structured headings for complex tasks when they help the user or recovery; do not force them for trivial turns.\n"
+    "- On failure, note the failure signal, return to the last stable point, replace the smallest necessary part of the plan, and re-verify.\n"
+    "</complex_task_orchestration>"
+)
+
+DELEGATION_ORCHESTRATION_GUIDANCE = (
+    "# Delegation orchestration\n"
+    "<delegation_orchestration>\n"
+    "- When delegation is available, keep the parent context clean and delegate only when it materially reduces context load or benefits from a fresh execution context.\n"
+    "- Parent responsibilities: rewrite the task, define scope and baseline, choose whether to delegate, collect results, validate them, and make final acceptance decisions.\n"
+    "- Good delegation targets: log-heavy debugging, broad codebase exploration, installs or downloads, multi-source research, repetitive trial-and-error, and parallel investigations. Do not delegate single tool calls, trivial edits, user clarification, or final acceptance checks.\n"
+    "- Give each child a narrow goal, minimum necessary context, and an explicit task-appropriate return format. For code or debugging work, prefer: result, key evidence, unresolved issues, validation status, and files created or modified.\n"
+    "- The parent remains responsible for checking that the assigned question was answered, constraints were respected, and validation actually happened.\n"
+    "</delegation_orchestration>"
+)
+
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
 # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.
 GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (

@@ -87,6 +87,20 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_requests_result_evidence_validation_summary(self):
+        prompt = _build_child_system_prompt("Investigate failure")
+        self.assertIn("- Result", prompt)
+        self.assertIn("- Key evidence", prompt)
+        self.assertIn("- Validation status", prompt)
+        self.assertIn("- Unresolved issues", prompt)
+        self.assertIn("- Any files you created or modified", prompt)
+
+    def test_drops_legacy_summary_headings(self):
+        prompt = _build_child_system_prompt("Investigate failure")
+        self.assertNotIn("- What you did", prompt)
+        self.assertNotIn("- What you found or accomplished", prompt)
+        self.assertNotIn("- Any issues encountered", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

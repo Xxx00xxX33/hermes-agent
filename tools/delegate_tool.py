@@ -95,11 +95,12 @@ def _build_child_system_prompt(
         )
     parts.append(
         "\nComplete this task using the tools available to you. "
-        "When finished, provide a clear, concise summary of:\n"
-        "- What you did\n"
-        "- What you found or accomplished\n"
-        "- Any files you created or modified\n"
-        "- Any issues encountered\n\n"
+        "When finished, provide a clear, concise summary with these headings:\n"
+        "- Result\n"
+        "- Key evidence\n"
+        "- Validation status\n"
+        "- Unresolved issues\n"
+        "- Any files you created or modified\n\n"
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
         "Be thorough but concise -- your response is returned to the "

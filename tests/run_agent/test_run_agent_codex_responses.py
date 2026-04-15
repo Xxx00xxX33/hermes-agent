@@ -271,6 +271,21 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_build_api_kwargs_codex_carries_complex_orchestration(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    prompt = agent._build_system_prompt()
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "Review the patch and propose next steps."},
+        ]
+    )
+
+    assert "<complex_task_orchestration>" in kwargs["instructions"]
+    assert "task contract" in kwargs["instructions"].lower()
+    assert "<delegation_orchestration>" not in kwargs["instructions"]
+
+
 def test_build_api_kwargs_copilot_responses_omits_openai_only_fields(monkeypatch):
     agent = _build_copilot_agent(monkeypatch)
     kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])

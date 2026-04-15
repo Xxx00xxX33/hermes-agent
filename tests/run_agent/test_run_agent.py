@@ -698,12 +698,17 @@ class TestBuildSystemPrompt:
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""
 
-    def _make_agent(self, model="openai/gpt-4.1", tool_use_enforcement="auto"):
+    def _make_agent(
+        self,
+        model="openai/gpt-4.1",
+        tool_use_enforcement="auto",
+        tool_names=("terminal", "web_search"),
+    ):
         """Create an agent with tools and a specific enforcement config."""
         with (
             patch(
                 "run_agent.get_tool_definitions",
-                return_value=_make_tool_defs("terminal", "web_search"),
+                return_value=_make_tool_defs(*tool_names),
             ),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
@@ -749,6 +754,75 @@ class TestToolUseEnforcementConfig:
         assert "dependency-blocking" in kwargs["instructions"]
         assert "ram-constrained" in kwargs["instructions"].lower()
         assert kwargs["input"] == [{"role": "user", "content": "run the test suite"}]
+
+    def test_gpt_system_prompt_includes_complex_task_orchestration(self):
+        from agent.prompt_builder import COMPLEX_TASK_ORCHESTRATION_GUIDANCE
+
+        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
+        prompt = agent._build_system_prompt()
+
+        assert COMPLEX_TASK_ORCHESTRATION_GUIDANCE in prompt
+        assert "<complex_task_orchestration>" in prompt
+        assert "task contract" in prompt.lower()
+        assert "current baseline" in prompt.lower()
+        assert "clean state snapshot" in prompt.lower()
+
+    def test_gpt5_api_kwargs_carry_complex_task_orchestration_in_instructions(self):
+        from agent.prompt_builder import COMPLEX_TASK_ORCHESTRATION_GUIDANCE
+
+        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
+        prompt = agent._build_system_prompt()
+        kwargs = agent._build_api_kwargs([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "review the repo and propose a patch"},
+        ])
+
+        assert "instructions" in kwargs
+        assert COMPLEX_TASK_ORCHESTRATION_GUIDANCE in kwargs["instructions"]
+        assert "<complex_task_orchestration>" in kwargs["instructions"]
+        assert "clean state snapshot" in kwargs["instructions"].lower()
+
+    def test_gpt_system_prompt_includes_delegation_orchestration_when_delegate_available(self):
+        from agent.prompt_builder import DELEGATION_ORCHESTRATION_GUIDANCE
+
+        agent = self._make_agent(
+            model="gpt-5.4",
+            tool_use_enforcement="auto",
+            tool_names=("terminal", "delegate_task"),
+        )
+        prompt = agent._build_system_prompt()
+
+        assert DELEGATION_ORCHESTRATION_GUIDANCE in prompt
+        assert "<delegation_orchestration>" in prompt
+        assert "key evidence" in prompt.lower()
+        assert "validation status" in prompt.lower()
+
+    def test_gpt_system_prompt_omits_delegation_orchestration_without_delegate_tool(self):
+        from agent.prompt_builder import DELEGATION_ORCHESTRATION_GUIDANCE
+
+        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
+        prompt = agent._build_system_prompt()
+
+        assert DELEGATION_ORCHESTRATION_GUIDANCE not in prompt
+        assert "<delegation_orchestration>" not in prompt
+
+    def test_false_disables_orchestration_blocks_for_gpt(self):
+        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement=False, tool_names=("terminal", "delegate_task"))
+        prompt = agent._build_system_prompt()
+
+        assert "<complex_task_orchestration>" not in prompt
+        assert "<delegation_orchestration>" not in prompt
+
+    def test_true_for_non_gpt_does_not_add_orchestration_blocks(self):
+        agent = self._make_agent(
+            model="anthropic/claude-sonnet-4",
+            tool_use_enforcement=True,
+            tool_names=("terminal", "delegate_task"),
+        )
+        prompt = agent._build_system_prompt()
+
+        assert "<complex_task_orchestration>" not in prompt
+        assert "<delegation_orchestration>" not in prompt
 
     def test_auto_injects_for_codex(self):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
