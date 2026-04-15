@@ -138,15 +138,36 @@ def tracked_modified_files(repo_root: Path) -> list[str]:
     return sorted(set(unstaged) | set(staged))
 
 
+def ahead_modified_files(repo_root: Path, base_ref: str = "upstream/main") -> list[str]:
+    return _git_lines(repo_root, "diff", "--name-only", f"{base_ref}...HEAD", "--")
+
+
 def is_patch_artifact(rel_path: str) -> bool:
     path = PurePosixPath(rel_path)
-    return bool(path.parts) and path.parts[0] == "patches"
+    if not path.parts or path.parts[0] != "patches":
+        return False
+    if "archive" in path.parts:
+        return True
+    if path.name == "manifest.yaml":
+        return True
+    return path.suffix == ".patch"
 
 
 def find_uncovered_tracked_modifications(repo_root: Path) -> list[str]:
     coverage = covered_files(repo_root)
     uncovered = []
     for rel_path in tracked_modified_files(repo_root):
+        if is_patch_artifact(rel_path):
+            continue
+        if rel_path not in coverage:
+            uncovered.append(rel_path)
+    return sorted(uncovered)
+
+
+def find_uncovered_ahead_modifications(repo_root: Path, base_ref: str = "upstream/main") -> list[str]:
+    coverage = covered_files(repo_root)
+    uncovered = []
+    for rel_path in ahead_modified_files(repo_root, base_ref=base_ref):
         if is_patch_artifact(rel_path):
             continue
         if rel_path not in coverage:
@@ -174,6 +195,26 @@ def verify_repo(repo_root: Path) -> tuple[list[str], list[str]]:
     return errors, warnings
 
 
+def verify_ahead_repo(repo_root: Path, base_ref: str = "upstream/main") -> tuple[list[str], list[str]]:
+    errors = validate_manifest(repo_root)
+    warnings: list[str] = []
+    if errors:
+        return errors, warnings
+
+    try:
+        uncovered = find_uncovered_ahead_modifications(repo_root, base_ref=base_ref)
+    except RuntimeError as exc:
+        return [str(exc)], warnings
+
+    if uncovered:
+        joined = "\n - ".join(uncovered)
+        warnings.append(
+            f"Ahead-of-{base_ref} modifications missing from every manifest-listed patch:\n - "
+            + joined
+        )
+    return errors, warnings
+
+
 def _print_lines(lines: Iterable[str], *, stream=sys.stdout) -> None:
     for line in lines:
         print(line, file=stream)
@@ -196,6 +237,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Exit non-zero if uncovered tracked modifications are found",
     )
+    verify_ahead_parser = subparsers.add_parser(
+        "verify-ahead",
+        help="Validate that ahead-of-base local customizations are covered by the manifest",
+    )
+    verify_ahead_parser.add_argument(
+        "--base-ref",
+        default="upstream/main",
+        help="Git base ref to compare against (default: upstream/main)",
+    )
 
     args = parser.parse_args(argv)
     repo_root = Path(args.repo_root).resolve()
@@ -213,6 +263,16 @@ def main(argv: list[str] | None = None) -> int:
         if errors:
             return 1
         if warnings and args.strict:
+            return 1
+        return 0
+
+    if args.command == "verify-ahead":
+        errors, warnings = verify_ahead_repo(repo_root, base_ref=args.base_ref)
+        if errors:
+            _print_lines(errors, stream=sys.stderr)
+        if warnings:
+            _print_lines(warnings, stream=sys.stderr)
+        if errors or warnings:
             return 1
         return 0
 

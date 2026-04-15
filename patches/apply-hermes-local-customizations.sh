@@ -4,6 +4,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+BASE_REF="${HERMES_LOCAL_CUSTOMIZATION_BASE_REF:-upstream/main}"
+
 MODE="apply"
 STRICT_CHECK=0
 RUN_TESTS=1
@@ -56,6 +58,10 @@ manifest_verify() {
     --repo-root "$REPO_ROOT" \
     verify \
     "${strict_flag[@]}"
+  python3 -m patches.local_customization_manifest \
+    --repo-root "$REPO_ROOT" \
+    verify-ahead \
+    --base-ref "$BASE_REF"
 }
 
 patch_state() {

@@ -61,6 +61,12 @@ bundle:
       - tests/run_agent/test_context_pressure.py
       - tests/run_agent/test_long_context_tier_429.py
 
+  - id: auxiliary-provider-fallback
+    patch: patches/hermes-auxiliary-provider-fallback.patch
+    purpose: Preserve explicit-provider auxiliary fallback behavior when callers opt in.
+    verifies:
+      - tests/agent/test_auxiliary_client.py
+
   - id: model-context-config-override
     patch: patches/hermes-model-context-config-override.patch
     purpose: Honour configured model.context_length for the matching main OpenAI-compatible endpoint/model.
@@ -72,3 +78,15 @@ bundle:
     purpose: Persist quick-tool transcript context across the local Hermes CLI flow.
     verifies:
       - tests/cli/test_cli_status_bar.py
+
+  - id: memory-palace-provider
+    patch: patches/hermes-memory-palace-provider.patch
+    purpose: Preserve the local Memory Palace provider metadata and regression coverage.
+    verifies:
+      - tests/plugins/memory/test_memory_palace_provider.py
+
+  - id: local-customization-governance
+    patch: patches/hermes-local-customization-governance.patch
+    purpose: Keep local patch-governance helpers, verification scripts, and coverage tests aligned with the canonical bundle.
+    verifies:
+      - tests/patches/test_local_customization_manifest.py

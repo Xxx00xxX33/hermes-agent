@@ -1173,6 +1173,34 @@ class TestCallLlmPaymentFallback:
         # Fallback should NOT be attempted when provider is explicit
         mock_fb.assert_not_called()
 
+    def test_402_can_fallback_when_explicit_provider_allows_it(self, monkeypatch):
+        """Explicit providers can still use the fallback chain when the caller opts in."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_402_error()
+
+        fallback_client = MagicMock()
+        fallback_response = MagicMock()
+        fallback_client.chat.completions.create.return_value = fallback_response
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                    return_value=(primary_client, "local-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("custom", "local-model", None, None, None)), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                    return_value=(fallback_client, "fb-model", "nous")) as mock_fb:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+                allow_provider_fallback=True,
+            )
+
+        assert result is fallback_response
+        mock_fb.assert_called_once_with("custom", "compression", reason="payment error")
+        fb_kwargs = fallback_client.chat.completions.create.call_args.kwargs
+        assert fb_kwargs["model"] == "fb-model"
+
     def test_connection_error_triggers_fallback_when_auto(self, monkeypatch):
         """Connection errors also trigger fallback when provider is auto."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")

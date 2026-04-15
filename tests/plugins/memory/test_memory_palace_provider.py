@@ -37,6 +37,9 @@ class FakeClient:
         })
         return True
 
+    def close(self):
+        return None
+
 
 @pytest.fixture
 def provider(monkeypatch):
