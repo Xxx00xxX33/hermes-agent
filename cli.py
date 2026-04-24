@@ -6770,6 +6770,11 @@ class HermesCLI:
             return
 
         if not target:
+            if not self._app:
+                if self._show_recent_sessions(reason="resume", limit=200):
+                    return
+                _cprint("  No resumable sessions found.")
+                return
             target_id = self._browse_resume_sessions(limit=200)
             if not target_id:
                 _cprint("  Resume cancelled.")

@@ -760,3 +760,15 @@ class TestResumeDisplayConfig:
         display = config.get("display", {})
         assert display.get("resume_display") == "full"
         assert display.get("resume_history_exchanges") == 20
+
+def test_resume_without_target_lists_recent_sessions_outside_tui():
+    cli = _make_cli()
+    cli._session_db = object()
+    cli._app = None
+    cli._show_recent_sessions = MagicMock(return_value=True)
+    cli._browse_resume_sessions = MagicMock(return_value="should-not-browse")
+
+    cli._handle_resume_command("/resume")
+
+    cli._show_recent_sessions.assert_called_once_with(reason="resume", limit=200)
+    cli._browse_resume_sessions.assert_not_called()
