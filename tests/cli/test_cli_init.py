@@ -24,7 +24,7 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
     }
     if config_overrides:
         _clean_config.update(config_overrides)
-    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": "", "TMUX": ""}
     if env_overrides:
         clean_env.update(env_overrides)
     prompt_toolkit_stubs = {
@@ -345,3 +345,146 @@ class TestProviderResolution:
         cli = _make_cli()
         assert isinstance(cli.model, str)
         assert isinstance(cli.model, str) and '/' in cli.model
+
+class TestBottomDockedTuiLayout:
+    def test_layout_starts_with_flexible_spacer_above_prompt_cluster(self):
+        cli = _make_cli()
+        cli.conversation_history = []
+
+        class _FakeDimension:
+            def __init__(self, **kwargs):
+                self.weight = kwargs.get("weight")
+                self.min = kwargs.get("min")
+                self.preferred = kwargs.get("preferred")
+
+        class _FakeWindow:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.height = kwargs.get("height")
+
+        class _FakeCondition:
+            def __init__(self, func):
+                self.func = func
+
+            def __call__(self):
+                return self.func()
+
+        class _FakeConditionalContainer:
+            def __init__(self, content, filter=None):
+                self.content = content
+                self.filter = filter
+
+        with patch.dict(
+            cli._build_tui_layout_children.__func__.__globals__,
+            {
+                "Dimension": _FakeDimension,
+                "Window": _FakeWindow,
+                "Condition": _FakeCondition,
+                "ConditionalContainer": _FakeConditionalContainer,
+            },
+        ):
+            children = cli._build_tui_layout_children(
+                sudo_widget="sudo",
+                secret_widget="secret",
+                approval_widget="approval",
+                clarify_widget="clarify",
+                model_picker_widget=None,
+                spinner_widget="spinner",
+                spacer="hint",
+                status_bar="status",
+                input_rule_top="rule-top",
+                image_bar="image-bar",
+                input_area="input",
+                input_rule_bot="rule-bot",
+                voice_status_bar="voice-status",
+                completions_menu="menu",
+            )
+
+        assert isinstance(children[0], _FakeConditionalContainer)
+        assert isinstance(children[0].content, _FakeWindow)
+        assert isinstance(children[0].content.height, _FakeDimension)
+        assert children[0].content.height.weight == 1
+        with patch.dict(os.environ, {"TMUX": ""}, clear=False):
+            assert children[0].filter() is True
+        assert children[1:] == [
+            "sudo",
+            "secret",
+            "approval",
+            "clarify",
+            "spinner",
+            "hint",
+            "status",
+            "rule-top",
+            "image-bar",
+            "input",
+            "rule-bot",
+            "voice-status",
+            "menu",
+        ]
+
+    def test_layout_hides_bottom_dock_spacer_after_conversation_history_exists(self):
+        cli = _make_cli()
+        cli.conversation_history = [{"role": "user", "content": "hello"}]
+
+        class _FakeDimension:
+            def __init__(self, **kwargs):
+                self.weight = kwargs.get("weight")
+
+        class _FakeWindow:
+            def __init__(self, *args, **kwargs):
+                self.height = kwargs.get("height")
+
+        class _FakeCondition:
+            def __init__(self, func):
+                self.func = func
+
+            def __call__(self):
+                return self.func()
+
+        class _FakeConditionalContainer:
+            def __init__(self, content, filter=None):
+                self.content = content
+                self.filter = filter
+
+        with patch.dict(
+            cli._build_tui_layout_children.__func__.__globals__,
+            {
+                "Dimension": _FakeDimension,
+                "Window": _FakeWindow,
+                "Condition": _FakeCondition,
+                "ConditionalContainer": _FakeConditionalContainer,
+            },
+        ):
+            children = cli._build_tui_layout_children(
+                sudo_widget="sudo",
+                secret_widget="secret",
+                approval_widget="approval",
+                clarify_widget="clarify",
+                model_picker_widget=None,
+                spinner_widget="spinner",
+                spacer="hint",
+                status_bar="status",
+                input_rule_top="rule-top",
+                image_bar="image-bar",
+                input_area="input",
+                input_rule_bot="rule-bot",
+                voice_status_bar="voice-status",
+                completions_menu="menu",
+            )
+
+        with patch.dict(os.environ, {"TMUX": ""}, clear=False):
+            assert children[0].filter() is False
+
+    def test_bottom_dock_spacer_is_disabled_inside_tmux(self):
+        cli = _make_cli()
+        cli.conversation_history = []
+        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-1000/default,1234,0"}, clear=False):
+            assert cli._should_show_bottom_dock_spacer() is False
+
+    def test_bottom_dock_spacer_still_shows_modal_prompts_inside_tmux(self):
+        cli = _make_cli()
+        cli.conversation_history = []
+        cli._approval_state = {"command": "rm -rf /tmp/demo"}
+        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-1000/default,1234,0"}, clear=False):
+            assert cli._should_show_bottom_dock_spacer() is True
