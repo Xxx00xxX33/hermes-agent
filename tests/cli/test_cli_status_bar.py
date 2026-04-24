@@ -153,8 +153,8 @@ class TestCLIStatusBar:
         assert "DeepSeek-R1" in text
         assert "lucienfc-gpt" in text
         assert "high" in text
-        assert "(2/3)" in text
-        assert text.rstrip().endswith("子任务：2/5")
+        assert "(2/3)" not in text
+        assert text.rstrip().endswith("子任务：5/5")
 
     def test_input_height_counts_wide_characters_using_cell_width(self):
         cli_obj = _make_cli()
@@ -334,16 +334,18 @@ class TestCLIStatusBar:
         mock_app = MagicMock()
         mock_app.output.get_size.return_value = MagicMock(columns=120)
         with patch("prompt_toolkit.application.get_app", return_value=mock_app):
-            fragments = cli_obj._get_status_bar_fragments()
+            primary_fragments = cli_obj._get_status_bar_fragments()
+            secondary_fragments = cli_obj._get_status_bar_secondary_fragments()
 
-        text = "".join(text for _, text in fragments)
-        assert "DeepSeek-R1" in text
-        assert "lucienfc-gpt" in text
-        assert "custom" not in text
-        assert "子任务：2/5" in text
-        assert "(2/3)" in text
-        assert text.rfind("子任务：2/5") > text.rfind("(2/3)")
-        assert text.rstrip().endswith("子任务：2/5")
+        primary_text = "".join(text for _, text in primary_fragments)
+        secondary_text = "".join(text for _, text in secondary_fragments)
+        assert "DeepSeek-R1" in primary_text
+        assert "lucienfc-gpt" in primary_text
+        assert "custom" not in primary_text
+        assert "子任务：5/5" in primary_text
+        assert primary_text.rstrip().endswith("子任务：5/5")
+        assert "(2/3)" in secondary_text
+        assert "子任务：" not in secondary_text
 
     def test_status_bar_primary_line_places_subtask_progress_after_background_label(self):
         cli_obj = _attach_todo_items(
@@ -376,12 +378,17 @@ class TestCLIStatusBar:
         mock_app = MagicMock()
         mock_app.output.get_size.return_value = MagicMock(columns=120)
         with patch("prompt_toolkit.application.get_app", return_value=mock_app):
-            fragments = cli_obj._get_status_bar_fragments()
+            primary_fragments = cli_obj._get_status_bar_fragments()
+            secondary_fragments = cli_obj._get_status_bar_secondary_fragments()
 
-        text = "".join(text for _, text in fragments)
-        assert "后台任务：2/5" in text
-        assert "子任务：2/5" in text
-        assert text.rfind("子任务：2/5") > text.rfind("后台任务：2/5")
+        primary_text = "".join(text for _, text in primary_fragments)
+        secondary_text = "".join(text for _, text in secondary_fragments)
+        assert "后台任务：2/5" in primary_text
+        assert "子任务：5/5" in primary_text
+        assert primary_text.rstrip().endswith("子任务：5/5")
+        assert primary_text.rfind("子任务：5/5") > primary_text.rfind("后台任务：2/5")
+        assert "(2/3)" in secondary_text
+        assert "子任务：" not in secondary_text
 
     def test_status_bar_primary_line_shows_background_task_counts_from_cli_tracking(self):
         cli_obj = _attach_background_tasks(
@@ -674,8 +681,8 @@ class TestCLIStatusBar:
             fragments = cli_obj._get_status_bar_secondary_fragments()
 
         text = "".join(text for _, text in fragments)
-        assert "[x] build" not in text
-        assert "[>] deploy" in text
+        assert "[√] build" not in text
+        assert "[X] deploy" in text
         assert "[ ] docs" not in text
         assert "todo" not in text
         assert "high" not in text
@@ -708,8 +715,8 @@ class TestCLIStatusBar:
             fragments = cli_obj._get_status_bar_secondary_fragments()
 
         text = "".join(text for _, text in fragments)
-        assert "[x] b" not in text
-        assert "[>] d" in text
+        assert "[√] b" not in text
+        assert "[X] d" in text
         assert "[ ] doc" not in text
         assert "med" not in text
         assert "10.2K/200K" not in text
@@ -737,7 +744,7 @@ class TestCLIStatusBar:
             fragments = cli_obj._get_status_bar_secondary_fragments()
 
         text = "".join(text for _, text in fragments)
-        assert "[>] Load relevant Hermes skill/instructions for local CLI status bar maintenance" in text
+        assert "[X] Load relevant Hermes skill/instructions for local CLI status bar maintenance" in text
         assert "12.4K/200K" not in text
         assert "[█" not in text
 
@@ -793,7 +800,7 @@ class TestCLIStatusBar:
 
         text = "".join(text for _, text in fragments)
         assert "claude-sonnet-4-20250514" in text
-        assert "(2/3)" in text
+        assert "(2/3)" not in text
 
     def test_status_bar_secondary_line_shows_task_name_instead_of_todo_summary_when_no_active_task(self):
         cli_obj = _attach_todo_items(

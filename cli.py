@@ -2839,10 +2839,11 @@ class HermesCLI:
         if not subagent_snapshot or subagent_snapshot.get("total", 0) <= 0:
             return "", "class:status-bar-dim"
 
-        label = (
-            f"子任务：{subagent_snapshot['completed']}"
-            f"/{subagent_snapshot['total']}"
+        current = min(
+            subagent_snapshot.get("total", 0),
+            subagent_snapshot.get("completed", 0) + subagent_snapshot.get("active", 0),
         )
+        label = f"子任务：{current}/{subagent_snapshot['total']}"
         if subagent_snapshot.get("active", 0) > 0:
             style = "class:status-bar-strong"
         elif subagent_snapshot.get("completed", 0) >= subagent_snapshot.get("total", 0):
@@ -2988,8 +2989,8 @@ class HermesCLI:
             return [("class:status-bar-dim", "no tasks")]
 
         marker_map = {
-            "completed": ("[x]", "class:status-bar-good"),
-            "in_progress": ("[>]", "class:status-bar-strong"),
+            "completed": ("[√]", "class:status-bar-good"),
+            "in_progress": ("[X]", "class:status-bar-strong"),
             "pending": ("[ ]", "class:status-bar-dim"),
             "cancelled": ("[~]", "class:status-bar-dim"),
         }
@@ -3016,7 +3017,7 @@ class HermesCLI:
             if index:
                 fragments.append(("class:status-bar-dim", separator))
             content = " ".join(str(item.get("content") or "(no description)").split())
-            fragments.append(("class:status-bar-strong", f"[>] {content}"))
+            fragments.append(("class:status-bar-strong", f"[X] {content}"))
         return fragments
 
     @staticmethod
@@ -3040,8 +3041,8 @@ class HermesCLI:
             return [("class:status-bar-dim", "active --")]
 
         marker_map = {
-            "completed": ("[x]", "class:status-bar-good"),
-            "in_progress": ("[>]", "class:status-bar-strong"),
+            "completed": ("[√]", "class:status-bar-good"),
+            "in_progress": ("[X]", "class:status-bar-strong"),
             "pending": ("[ ]", "class:status-bar-dim"),
             "cancelled": ("[~]", "class:status-bar-dim"),
         }
@@ -3274,7 +3275,6 @@ class HermesCLI:
                 getattr(self, "reasoning_config", None),
                 compact=width < 52,
             )
-            progress_label, _ = self._get_status_bar_progress_label(self._get_status_bar_todo_snapshot())
             subagent_label, _ = self._get_status_bar_subagent_task_label(
                 self._get_status_bar_subagent_task_snapshot()
             )
@@ -3286,8 +3286,6 @@ class HermesCLI:
                 separator = " · "
                 parts = [f"⚕ {snapshot['model_short']}"]
                 optional_parts = []
-                if progress_label:
-                    optional_parts.append(progress_label)
                 optional_parts.extend([provider_label, reasoning_label])
                 if background_label:
                     optional_parts.append(background_label)
@@ -3304,8 +3302,6 @@ class HermesCLI:
 
                 parts = [f"⚕ {snapshot['model_short']}"]
                 optional_parts = []
-                if progress_label:
-                    optional_parts.append(progress_label)
                 optional_parts.extend([provider_label, reasoning_label, context_label, percent_label])
                 if background_label:
                     optional_parts.append(background_label)
@@ -3373,12 +3369,11 @@ class HermesCLI:
                 getattr(self, "reasoning_config", None),
                 compact=width < 52,
             )
-            progress_label, progress_style = self._get_status_bar_progress_label(self._get_status_bar_todo_snapshot())
-            subagent_label, subagent_style = self._get_status_bar_subagent_task_label(
-                self._get_status_bar_subagent_task_snapshot()
-            )
             background_label, background_style = self._get_status_bar_background_task_label(
                 self._get_status_bar_background_task_snapshot()
+            )
+            subagent_label, subagent_style = self._get_status_bar_subagent_task_label(
+                self._get_status_bar_subagent_task_snapshot()
             )
 
             if width < 76:
@@ -3391,11 +3386,6 @@ class HermesCLI:
                 ("class:status-bar-strong", snapshot["model_short"]),
             ]
             optional_groups = []
-            if progress_label:
-                optional_groups.append([
-                    ("class:status-bar-dim", separator),
-                    (progress_style, progress_label),
-                ])
             optional_groups.append([
                 ("class:status-bar-dim", separator),
                 ("class:status-bar-dim", provider_label),
@@ -3433,13 +3423,33 @@ class HermesCLI:
             todo_items = self._get_status_bar_todo_items()
             active_todo_items = self._get_status_bar_active_todo_items()
             saved_task_title = self._get_status_bar_saved_task_title()
+            progress_label, progress_style = self._get_status_bar_progress_label(
+                self._get_status_bar_todo_snapshot()
+            )
             if active_todo_items:
-                task_fragments = self._get_status_bar_active_task_fragments(
-                    active_todo_items,
-                    compact=width < 76,
-                )
+                if saved_task_title:
+                    active_saved_title = {
+                        **active_todo_items[0],
+                        "content": saved_task_title,
+                    }
+                    task_fragments = self._get_status_bar_named_task_fragments(active_saved_title)
+                else:
+                    task_fragments = self._get_status_bar_active_task_fragments(
+                        active_todo_items,
+                        compact=width < 76,
+                    )
             elif saved_task_title:
-                task_fragments = [("class:status-bar-strong", saved_task_title)]
+                fallback_todo_item = self._select_status_bar_fallback_todo_item(todo_items)
+                if fallback_todo_item:
+                    saved_title_fragments = self._get_status_bar_named_task_fragments(
+                        {
+                            **fallback_todo_item,
+                            "content": saved_task_title,
+                        }
+                    )
+                    task_fragments = saved_title_fragments
+                else:
+                    task_fragments = [("class:status-bar-strong", saved_task_title)]
             elif todo_items:
                 task_fragments = self._get_status_bar_named_task_fragments(
                     self._select_status_bar_fallback_todo_item(todo_items)
@@ -3454,6 +3464,13 @@ class HermesCLI:
                 ("class:status-bar", " "),
                 *task_fragments,
             ]
+            if progress_label:
+                primary_frags.extend(
+                    [
+                        ("class:status-bar", " "),
+                        (progress_style, progress_label),
+                    ]
+                )
             optional_groups = []
             if width >= 76:
                 optional_groups.append([
@@ -9494,6 +9511,32 @@ class HermesCLI:
     # Tool progress callback (audio cues for voice mode)
     # ====================================================================
 
+
+    def _track_delegate_subtask_started(self, tool_call_id: str | None, function_args: dict | None) -> bool:
+        if not tool_call_id:
+            return False
+        subtask_count = self._count_delegate_subtasks(function_args)
+        active_tasks = getattr(self, "_subagent_active_tasks", None)
+        if not isinstance(active_tasks, dict):
+            active_tasks = {}
+            self._subagent_active_tasks = active_tasks
+
+        previous = active_tasks.get(tool_call_id)
+        active_tasks[tool_call_id] = subtask_count
+        if previous is None:
+            self._subagent_task_counter = int(getattr(self, "_subagent_task_counter", 0) or 0) + subtask_count
+            return True
+        return previous != subtask_count
+
+    def _track_delegate_subtask_completed(self, tool_call_id: str | None) -> bool:
+        if not tool_call_id:
+            return False
+        active_tasks = getattr(self, "_subagent_active_tasks", None)
+        if isinstance(active_tasks, dict) and tool_call_id in active_tasks:
+            active_tasks.pop(tool_call_id, None)
+            return True
+        return False
+
     def _on_tool_progress(self, event_type: str, function_name: str = None, preview: str = None, function_args: dict = None, **kwargs):
         """Called on tool lifecycle events (tool.started, tool.completed, reasoning.available, etc.).
 
@@ -9505,7 +9548,13 @@ class HermesCLI:
         can show a live elapsed timer (the TUI poll loop already invalidates
         every ~0.15s, so the counter updates automatically).
         """
+        tool_call_id = kwargs.get("tool_call_id")
         if event_type == "tool.completed":
+            if function_name == "delegate_task":
+                try:
+                    self._track_delegate_subtask_completed(tool_call_id)
+                except Exception:
+                    logger.debug("Delegate subtask progress completion failed for %s", function_name, exc_info=True)
             import time as _time
             self._tool_start_time = 0.0
             # Completion should repaint immediately so fast final tools (notably
@@ -9514,6 +9563,12 @@ class HermesCLI:
             return
         if event_type != "tool.started":
             return
+        if function_name == "delegate_task":
+            try:
+                if self._track_delegate_subtask_started(tool_call_id, function_args):
+                    self._invalidate(min_interval=0.0)
+            except Exception:
+                logger.debug("Delegate subtask progress start failed for %s", function_name, exc_info=True)
         if function_name and not function_name.startswith("_"):
             import time as _time
             from agent.display import get_tool_emoji
@@ -9546,14 +9601,8 @@ class HermesCLI:
         """Track delegate_task progress and capture local before-state for write-capable tools."""
         if function_name == "delegate_task":
             try:
-                subtask_count = self._count_delegate_subtasks(function_args)
-                active_tasks = getattr(self, "_subagent_active_tasks", None)
-                if not isinstance(active_tasks, dict):
-                    active_tasks = {}
-                    self._subagent_active_tasks = active_tasks
-                active_tasks[tool_call_id] = subtask_count
-                self._subagent_task_counter = int(getattr(self, "_subagent_task_counter", 0) or 0) + subtask_count
-                self._invalidate(min_interval=0.0)
+                if self._track_delegate_subtask_started(tool_call_id, function_args):
+                    self._invalidate(min_interval=0.0)
             except Exception:
                 logger.debug("Delegate subtask tracking failed for %s", function_name, exc_info=True)
 
@@ -9573,9 +9622,7 @@ class HermesCLI:
         """Track delegate_task completion and render inline diffs for write-capable tools."""
         if function_name == "delegate_task":
             try:
-                active_tasks = getattr(self, "_subagent_active_tasks", None)
-                if isinstance(active_tasks, dict) and tool_call_id in active_tasks:
-                    active_tasks.pop(tool_call_id, None)
+                if self._track_delegate_subtask_completed(tool_call_id):
                     self._invalidate(min_interval=0.0)
             except Exception:
                 logger.debug("Delegate subtask completion tracking failed for %s", function_name, exc_info=True)
@@ -10345,6 +10392,9 @@ class HermesCLI:
         Returns:
             The agent's response, or None on error
         """
+        self._subagent_active_tasks = {}
+        self._subagent_task_counter = 0
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
