@@ -2,6 +2,26 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Naranja Live Runtime Verification Gate
+
+For any task that changes Hermes itself on Naranja — source files, patch files, wrapper scripts, runtime behavior, CLI/status-bar/TUI/gateway behavior, themes/skins, scripts, or other customizations expected to affect `hermes chat` — do not stop at repository tests or patch application. Verify the actual live command path before claiming completion.
+
+The live command is `/root/.local/bin/hermes`. The current live runtime source is `/root/.hermes/releases/hermes-agent-custom-20260418_115717-rebuild`. The main maintenance checkout `/root/.hermes/hermes-agent` may not be the code imported by the live command, so passing tests or changing files only in that checkout is not sufficient proof that the user-visible runtime changed.
+
+Before declaring any Hermes modification/customization complete, run the full Naranja live verifier:
+
+```bash
+/root/.local/bin/hermes-verify-live-runtime --full
+```
+
+Equivalent direct invocation:
+
+```bash
+/root/.hermes/scripts/verify-live-hermes-runtime.sh --full
+```
+
+No-argument invocation also defaults to full mode. `--quick` is a fast investigation preflight only and is **not** a completion gate. If the full verifier fails, fix the root cause and re-run it, or explicitly report the failure; do not claim the Hermes change is live or complete.
+
 ## Development Environment
 
 ```bash
