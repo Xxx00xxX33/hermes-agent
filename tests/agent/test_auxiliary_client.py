@@ -589,6 +589,117 @@ class TestCallLlmPaymentFallback:
         exc.status_code = 402
         return exc
 
+    def test_402_triggers_fallback_when_auto(self, monkeypatch):
+        """When provider is auto and returns 402, call_llm tries the next one."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_402_error()
+
+        fallback_client = MagicMock()
+        fallback_response = MagicMock()
+        fallback_client.chat.completions.create.return_value = fallback_response
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                    return_value=(primary_client, "google/gemini-3-flash-preview")),              patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)),              patch("agent.auxiliary_client._try_payment_fallback",
+                    return_value=(fallback_client, "gpt-5.2-codex", "openai-codex")) as mock_fb:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is fallback_response
+        mock_fb.assert_called_once_with("auto", "compression", reason="payment error")
+        fb_kwargs = fallback_client.chat.completions.create.call_args.kwargs
+        assert fb_kwargs["model"] == "gpt-5.2-codex"
+
+    def test_402_no_fallback_when_explicit_provider(self, monkeypatch):
+        """When provider is explicitly configured (not auto), 402 should NOT fallback (#7559)."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_402_error()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                    return_value=(primary_client, "local-model")),              patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("custom", "local-model", None, None, None)),              patch("agent.auxiliary_client._try_payment_fallback") as mock_fb:
+            with pytest.raises(Exception, match="insufficient credits"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        mock_fb.assert_not_called()
+
+    def test_402_can_fallback_when_explicit_provider_allows_it(self, monkeypatch):
+        """Explicit providers can still use the fallback chain when the caller opts in."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_402_error()
+
+        fallback_client = MagicMock()
+        fallback_response = MagicMock()
+        fallback_client.chat.completions.create.return_value = fallback_response
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                    return_value=(primary_client, "local-model")),              patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("custom", "local-model", None, None, None)),              patch("agent.auxiliary_client._try_payment_fallback",
+                    return_value=(fallback_client, "fb-model", "nous")) as mock_fb:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+                allow_provider_fallback=True,
+            )
+
+        assert result is fallback_response
+        mock_fb.assert_called_once_with("custom", "compression", reason="payment error")
+        fb_kwargs = fallback_client.chat.completions.create.call_args.kwargs
+        assert fb_kwargs["model"] == "fb-model"
+
+    def test_connection_error_triggers_fallback_when_auto(self, monkeypatch):
+        """Connection errors also trigger fallback when provider is auto."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        conn_err = Exception("Connection refused")
+        conn_err.status_code = None
+        primary_client.chat.completions.create.side_effect = conn_err
+
+        fallback_client = MagicMock()
+        fallback_response = MagicMock()
+        fallback_client.chat.completions.create.return_value = fallback_response
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                    return_value=(primary_client, "model")),              patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("auto", "model", None, None, None)),              patch("agent.auxiliary_client._is_connection_error", return_value=True),              patch("agent.auxiliary_client._try_payment_fallback",
+                    return_value=(fallback_client, "fb-model", "nous")) as mock_fb:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is fallback_response
+        mock_fb.assert_called_once_with("auto", "compression", reason="connection error")
+
+    def test_402_with_no_fallback_reraises(self, monkeypatch):
+        """When 402 hits and no fallback is available, the original error propagates."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = self._make_402_error()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                    return_value=(primary_client, "google/gemini-3-flash-preview")),              patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)),              patch("agent.auxiliary_client._try_payment_fallback",
+                    return_value=(None, None, "")):
+            with pytest.raises(Exception, match="insufficient credits"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
     def test_non_payment_error_not_caught(self, monkeypatch):
         """Non-payment/non-connection errors (500) should NOT trigger fallback."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")

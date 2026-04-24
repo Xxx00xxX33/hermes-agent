@@ -2421,6 +2421,7 @@ def call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    allow_provider_fallback: bool = False,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -2439,6 +2440,9 @@ def call_llm(
         tools: Tool definitions (for function calling).
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
         extra_body: Additional request body fields.
+        allow_provider_fallback: When True, an explicitly chosen provider may
+            still retry the auto-detection fallback chain on payment or
+            connection failures.
 
     Returns:
         Response object with .choices[0].message.content
@@ -2563,7 +2567,8 @@ def call_llm(
         # configure this task's provider.  Explicit provider = hard constraint;
         # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in ("auto", "", None)
-        if should_fallback and is_auto:
+        fallback_allowed = is_auto or allow_provider_fallback
+        if should_fallback and fallback_allowed:
             reason = "payment error" if _is_payment_error(first_err) else "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)

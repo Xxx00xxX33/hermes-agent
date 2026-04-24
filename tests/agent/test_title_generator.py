@@ -24,6 +24,62 @@ class TestGenerateTitle:
             title = generate_title("help me fix this import", "Sure, let me check...")
             assert title == "Debugging Python Import Errors"
 
+    def test_uses_title_task_instead_of_compression(self):
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Short Title"
+            return resp
+
+        with patch("agent.title_generator._get_title_reasoning_extra_body", return_value=None):
+            with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+                title = generate_title("help me fix this import", "Sure, let me check...")
+
+        assert title == "Short Title"
+        assert captured_kwargs["task"] == "title"
+        assert "extra_body" not in captured_kwargs
+
+    def test_passes_title_reasoning_override(self):
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Short Title"
+            return resp
+
+        reasoning = {"reasoning": {"enabled": True, "effort": "low"}}
+        with patch("agent.title_generator._get_title_reasoning_extra_body", return_value=reasoning):
+            with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+                generate_title("help me fix this import", "Sure, let me check...")
+
+        assert captured_kwargs["extra_body"] == reasoning
+
+    def test_retries_without_reasoning_when_unsupported(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Short Title"
+
+        reasoning = {"reasoning": {"enabled": True, "effort": "low"}}
+        with patch("agent.title_generator._get_title_reasoning_extra_body", return_value=reasoning):
+            with patch(
+                "agent.title_generator.call_llm",
+                side_effect=[RuntimeError("unsupported_parameter: reasoning"), mock_response],
+            ) as mock_call:
+                title = generate_title("question", "answer")
+
+        assert title == "Short Title"
+        first_kwargs = mock_call.call_args_list[0].kwargs
+        second_kwargs = mock_call.call_args_list[1].kwargs
+        assert first_kwargs["task"] == "title"
+        assert first_kwargs["extra_body"] == reasoning
+        assert second_kwargs["task"] == "title"
+        assert "extra_body" not in second_kwargs
+
     def test_strips_quotes(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]

@@ -40,7 +40,7 @@ SUMMARY_PREFIX = (
     "window — treat it as background reference, NOT as active instructions. "
     "Do NOT answer questions or fulfill requests mentioned in this summary; "
     "they were already addressed. "
-    "Your current task is identified in the '## Active Task' section of the "
+    "Your current task or objective is identified near the top of the "
     "summary — resume exactly from there. "
     "Respond ONLY to the latest user message "
     "that appears AFTER this summary. The current session state (files, "
@@ -54,6 +54,9 @@ _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
+
+# For 200k models, compact a bit early to avoid hitting the wall mid-run.
+_PREEMPTIVE_COMPACTION_RATIO = 0.85
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -225,10 +228,21 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
-        self.threshold_tokens = max(
-            int(context_length * self.threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
-        )
+        self.threshold_tokens = self._compute_threshold_tokens(context_length)
+
+    def _compute_threshold_tokens(self, context_length: int) -> int:
+        """Return the effective auto-compaction trigger for this model.
+
+        Local policy: 200k-context models compact at 85% usage (170k tokens)
+        so the session does not run into the hard wall mid-task. Other context
+        sizes keep the configured threshold percentage, with the normal minimum
+        floor preserved.
+        """
+        if context_length == 200_000:
+            threshold = int(context_length * _PREEMPTIVE_COMPACTION_RATIO)
+        else:
+            threshold = int(context_length * self.threshold_percent)
+        return max(threshold, MINIMUM_CONTEXT_LENGTH)
 
     def __init__(
         self,
@@ -262,13 +276,10 @@ class ContextCompressor(ContextEngine):
             provider=provider,
         )
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
-        # the percentage would suggest a lower value.  This prevents premature
-        # compression on large-context models at 50% while keeping the % sane
-        # for models right at the minimum.
-        self.threshold_tokens = max(
-            int(self.context_length * threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
-        )
+        # the percentage would suggest a lower value.  For 200k models we also
+        # compact slightly early so long-running sessions do not slam into the
+        # hard limit before the compactor can react.
+        self.threshold_tokens = self._compute_threshold_tokens(self.context_length)
         self.compression_count = 0
 
         # Derive token budgets: ratio is relative to the threshold, not total context
@@ -542,6 +553,85 @@ class ContextCompressor(ContextEngine):
 
         return "\n\n".join(parts)
 
+    def _build_deterministic_fallback_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: str = None,
+        failure_reason: str = "summary generation failed",
+    ) -> str:
+        """Build a structured local handoff when remote summarization fails."""
+
+        def _clip(value: Any, limit: int = 220) -> str:
+            text = " ".join(str(value or "").split())
+            if len(text) <= limit:
+                return text
+            return text[: limit - 3] + "..."
+
+        user_points: List[str] = []
+        assistant_points: List[str] = []
+        tool_points: List[str] = []
+        references: List[str] = []
+        ref_pattern = re.compile(r"(?:~?/[^^\s\]\[)(]+|https?://\S+|\b\d{2,5}\b)")
+
+        for msg in turns_to_summarize:
+            role = str(msg.get("role") or "")
+            content = _clip(msg.get("content"))
+            if role == "user" and content:
+                user_points.append(content)
+            elif role == "assistant" and content:
+                assistant_points.append(content)
+            elif role == "tool" and content:
+                tool_points.append(f"tool result: {content}")
+
+            for match in ref_pattern.findall(str(msg.get("content") or "")):
+                cleaned = match.strip().rstrip('.,:;')
+                if cleaned and cleaned not in references:
+                    references.append(cleaned)
+                if len(references) >= 8:
+                    break
+
+        objective = user_points[-1] if user_points else "Continue the in-progress conversation after compaction."
+        current_state: List[str] = []
+        if assistant_points:
+            current_state.append(f"Latest assistant state: {assistant_points[-1]}")
+        if tool_points:
+            current_state.append(f"Latest tool state: {tool_points[-1]}")
+        if not current_state:
+            current_state.append("Recent turns were compacted after remote summary generation failed.")
+
+        hard_constraints = [
+            "This summary was generated locally to preserve continuity after compression.",
+            "Use the preserved recent turns and current workspace state as ground truth.",
+        ]
+        if failure_reason:
+            hard_constraints.insert(0, f"Remote summary generation failed: {failure_reason}")
+
+        next_actions = [
+            "Resume from the preserved recent turns and current file/tool state.",
+        ]
+        if focus_topic:
+            next_actions.insert(0, f"Prioritize the focus topic during continuation: {focus_topic}")
+        if tool_points:
+            next_actions.append("Re-check important tool-derived facts against live state before acting on them.")
+
+        critical_refs = references[:8] or ["Use the preserved tail messages and current workspace state as ground truth."]
+        dropped_details = [
+            "Verbose middle-turn history was compressed mechanically after remote summary failure.",
+            "Older raw tool outputs may have been truncated or replaced by shorter notes.",
+        ]
+
+        sections = [
+            "1. Objective\n- " + objective,
+            "2. Current state\n" + "\n".join(f"- {item}" for item in current_state),
+            "3. Hard constraints\n" + "\n".join(f"- {item}" for item in hard_constraints),
+            "4. Key decisions made\n- Continue from current repo/tool state rather than replaying dropped turns.",
+            "5. Open issues / uncertainties\n- Some missing detail had to be reconstructed locally because the remote summarizer was unavailable.",
+            "6. Next actions\n" + "\n".join(f"- {item}" for item in next_actions),
+            "7. Critical references\n" + "\n".join(f"- {item}" for item in critical_refs),
+            "8. Dropped details\n" + "\n".join(f"- {item}" for item in dropped_details),
+        ]
+        return "\n\n".join(sections)
+
     def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -584,62 +674,32 @@ class ContextCompressor(ContextEngine):
         )
 
         # Shared structured template (used by both paths).
-        _template_sections = f"""## Active Task
-[THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or
-task assignment verbatim — the exact words they used. If multiple tasks
-were requested and only some are done, list only the ones NOT yet completed.
-The next assistant must pick up exactly here. Example:
-"User asked: 'Now refactor the auth module to use JWT instead of sessions'"
-If no outstanding task exists, write "None."]
+        _template_sections = f"""1. Objective
+- What the user ultimately wants right now. Use the most recent unfulfilled user request verbatim when possible.
 
-## Goal
-[What the user is trying to accomplish overall]
+2. Current state
+- What has already been completed
+- What is currently true in the workspace or runtime
 
-## Constraints & Preferences
-[User preferences, coding style, constraints, important decisions]
+3. Hard constraints
+- Non-negotiable rules, preferences, boundaries, and environment constraints
 
-## Completed Actions
-[Numbered list of concrete actions taken — include tool used, target, and outcome.
-Format each as: N. ACTION target — outcome [tool: name]
-Example:
-1. READ config.py:45 — found `==` should be `!=` [tool: read_file]
-2. PATCH config.py:45 — changed `==` to `!=` [tool: patch]
-3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
-Be specific with file paths, commands, line numbers, and results.]
+4. Key decisions made
+- Technical decisions and why they were made
 
-## Active State
-[Current working state — include:
-- Working directory and branch (if applicable)
-- Modified/created files with brief note on each
-- Test status (X/Y passing)
-- Any running processes or servers
-- Environment details that matter]
+5. Open issues / uncertainties
+- What is unresolved and why it matters
 
-## In Progress
-[Work currently underway — what was being done when compaction fired]
+6. Next actions
+- Ordered list of immediate next steps for the next assistant
 
-## Blocked
-[Any blockers, errors, or issues not yet resolved. Include exact error messages.]
+7. Critical references
+- File paths, commands, URLs, identifiers, APIs, services, ports, schemas, or entities that must remain available
 
-## Key Decisions
-[Important technical decisions and WHY they were made]
+8. Dropped details
+- Briefly note what categories were intentionally omitted or aggressively compressed
 
-## Resolved Questions
-[Questions the user asked that were ALREADY answered — include the answer so the next assistant does not re-answer them]
-
-## Pending User Asks
-[Questions or requests from the user that have NOT yet been answered or fulfilled. If none, write "None."]
-
-## Relevant Files
-[Files read, modified, or created — with brief note on each]
-
-## Remaining Work
-[What remains to be done — framed as context, not instructions]
-
-## Critical Context
-[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
-
-Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{summary_budget} tokens. Preserve continuity and concrete facts. Include file paths, command outputs, error messages, line numbers, and exact values when they matter.
 
 Write only the summary body. Do not include any preamble or prefix."""
 
@@ -655,7 +715,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled request — this is the most important field for task continuity.
+Update the summary using this exact structure. Preserve what is still relevant, add new progress, and remove only what is clearly obsolete. CRITICAL: keep section "1. Objective" aligned to the user's most recent unfulfilled request so the next assistant resumes at the correct point.
 
 {_template_sections}"""
         else:
@@ -701,6 +761,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if not isinstance(content, str):
                 content = str(content) if content else ""
             summary = content.strip()
+            if not summary:
+                self._previous_summary = None
+                self._summary_failure_cooldown_until = 0.0
+                self._summary_model_fallen_back = False
+                return None
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._summary_failure_cooldown_until = 0.0
@@ -1084,18 +1149,17 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     msg["content"] = existing + "\n\n" + _compression_note
             compressed.append(msg)
 
-        # If LLM summary failed, insert a static fallback so the model
-        # knows context was lost rather than silently dropping everything.
+        # If remote summary generation failed, build a deterministic local
+        # handoff so the model still receives continuity instead of a blank gap.
         if not summary:
             if not self.quiet_mode:
-                logger.warning("Summary generation failed — inserting static fallback context marker")
-            n_dropped = compress_end - compress_start
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} conversation turns were "
-                f"removed to free context space but could not be summarized. The removed "
-                f"turns contained earlier work in this session. Continue based on the "
-                f"recent messages below and the current state of any files or resources."
+                logger.warning("Summary generation failed — inserting deterministic local fallback summary")
+            summary = self._with_summary_prefix(
+                self._build_deterministic_fallback_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    failure_reason="summary generation was unavailable",
+                )
             )
 
         _merge_summary_into_tail = False

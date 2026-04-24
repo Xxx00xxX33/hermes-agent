@@ -37,6 +37,20 @@ class TestShouldCompress:
         assert compressor.should_compress(prompt_tokens=90000) is True
         assert compressor.should_compress(prompt_tokens=50000) is False
 
+    def test_200k_models_compact_preemptively_at_85_percent(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=200000):
+            c = ContextCompressor(model="test/model", threshold_percent=1.0, quiet_mode=True)
+        assert c.threshold_tokens == 170000
+        assert c.should_compress(prompt_tokens=169999) is False
+        assert c.should_compress(prompt_tokens=170000) is True
+
+    def test_larger_context_models_keep_configured_percentage(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=300000):
+            c = ContextCompressor(model="test/model", threshold_percent=0.50, quiet_mode=True)
+        assert c.threshold_tokens == 150000
+        assert c.should_compress(prompt_tokens=149999) is False
+        assert c.should_compress(prompt_tokens=150000) is True
+
 
 
 class TestUpdateFromResponse:
@@ -79,6 +93,19 @@ class TestCompress:
         assert compressor.compression_count == 1
         compressor.compress(msgs)
         assert compressor.compression_count == 2
+
+    def test_failed_summary_uses_structured_local_fallback(self, compressor):
+        msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
+
+        with patch.object(compressor, "_generate_summary", return_value=None):
+            result = compressor.compress(msgs)
+
+        summary_messages = [m for m in result if SUMMARY_PREFIX in str(m.get("content", ""))]
+        assert summary_messages
+        summary_text = str(summary_messages[0]["content"])
+        assert "1. Objective" in summary_text
+        assert "3. Hard constraints" in summary_text
+        assert "6. Next actions" in summary_text
 
     def test_protects_first_and_last(self, compressor):
         msgs = self._make_messages(10)
@@ -153,7 +180,7 @@ class TestNonStringContent:
         assert isinstance(summary, str)
         assert summary.startswith(SUMMARY_PREFIX)
 
-    def test_none_content_coerced_to_empty(self):
+    def test_none_content_returns_none_to_trigger_local_fallback(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = None
@@ -168,9 +195,8 @@ class TestNonStringContent:
 
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             summary = c._generate_summary(messages)
-        # None content → empty string → standardized compaction handoff prefix added
-        assert summary is not None
-        assert summary == SUMMARY_PREFIX
+
+        assert summary is None
 
     def test_summary_call_does_not_force_temperature(self):
         mock_response = MagicMock()
@@ -221,6 +247,27 @@ class TestNonStringContent:
             "api_key": "codex-token",
             "api_mode": "codex_responses",
         }
+
+    def test_summary_prompt_uses_opencode_style_numbered_sections(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "1. Objective" in prompt
+        assert "8. Dropped details" in prompt
+        assert "## Active Task" not in prompt
 
 
 class TestSummaryFailureCooldown:
@@ -578,8 +625,8 @@ class TestSummaryTargetRatio:
         """Tail token budget should be threshold_tokens * summary_target_ratio."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 200K * 0.50 threshold * 0.40 ratio = 40K
-        assert c.tail_token_budget == 40_000
+        # 200K models compact at the local 170K trigger; 170K * 0.40 ratio = 68K
+        assert c.tail_token_budget == 68_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
@@ -614,12 +661,12 @@ class TestSummaryTargetRatio:
         # 50% of 100K = 50K, but the floor is 64K
         assert c.threshold_tokens == 64_000
 
-    def test_threshold_floor_does_not_apply_above_128k(self):
-        """On large-context models the 50% percentage is used directly."""
+    def test_200k_models_use_local_preemptive_threshold(self):
+        """200K-context models use the local 85% preemptive trigger."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        # 50% of 200K = 100K, which is above the 64K floor
-        assert c.threshold_tokens == 100_000
+        # 200K * 0.85 = 170K, which overrides the default 50% threshold locally
+        assert c.threshold_tokens == 170_000
 
     def test_default_protect_last_n_is_20(self):
         """Default protect_last_n should be 20."""
