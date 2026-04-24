@@ -175,6 +175,7 @@ class ProviderDef:
     auth_type: str = "api_key"
     doc: str = ""
     source: str = ""                      # "models.dev", "hermes", "user-config"
+    configured_model: str = ""            # default model pinned by user config
 
 
 # -- Aliases ------------------------------------------------------------------
@@ -521,6 +522,8 @@ def resolve_custom_provider(
         if requested not in {display_name.lower(), slug}:
             continue
 
+        configured_model = str(entry.get("model") or entry.get("default") or "").strip()
+
         return ProviderDef(
             id=slug,
             name=display_name,
@@ -530,6 +533,7 @@ def resolve_custom_provider(
             is_aggregator=False,
             auth_type="api_key",
             source="user-config",
+            configured_model=configured_model,
         )
 
     return None

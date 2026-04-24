@@ -87,6 +87,15 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_summary_requires_structured_headings(self):
+        prompt = _build_child_system_prompt("Fix the tests")
+        self.assertIn("When finished, provide a clear, concise summary with these headings:", prompt)
+        self.assertIn("- Result", prompt)
+        self.assertIn("- Key evidence", prompt)
+        self.assertIn("- Validation status", prompt)
+        self.assertIn("- Unresolved issues", prompt)
+        self.assertIn("- Any files you created or modified", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

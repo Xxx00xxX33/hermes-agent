@@ -297,6 +297,16 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert kwargs["model"] == "gpt-5-codex"
     assert kwargs["instructions"] == "You are Hermes."
     assert kwargs["store"] is False
+
+    prompt = agent._build_system_prompt()
+    kwargs = agent._build_api_kwargs([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": "Review the repo and propose a patch"},
+    ])
+    assert "<background_task_strategy>" in kwargs["instructions"]
+    assert "<complex_task_orchestration>" in kwargs["instructions"]
+    assert "task contract" in kwargs["instructions"].lower()
+    assert "<delegation_orchestration>" not in kwargs["instructions"]
     assert isinstance(kwargs["input"], list)
     assert kwargs["input"][0]["role"] == "user"
     assert kwargs["tools"][0]["type"] == "function"

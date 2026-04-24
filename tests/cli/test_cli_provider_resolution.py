@@ -676,3 +676,107 @@ def test_save_custom_provider_uses_provided_name(monkeypatch, tmp_path):
     entries = saved.get("custom_providers", [])
     assert len(entries) == 1
     assert entries[0]["name"] == "Ollama"
+
+
+def test_apply_session_routing_from_meta_repairs_stale_custom_model(monkeypatch):
+    cli = _import_cli()
+
+    monkeypatch.setitem(
+        cli.CLI_CONFIG,
+        "model",
+        {
+            "default": "gpt-5.4",
+            "provider": "custom",
+            "base_url": "https://gpt.lucienfc.eu.org/v1",
+        },
+    )
+
+    shell = cli.HermesCLI(compact=True, max_turns=1)
+    shell._apply_session_routing_from_meta(
+        {
+            "model": "gpt",
+            "model_config": {
+                "requested_provider": "custom",
+                "provider": "custom",
+                "base_url": "https://gpt.lucienfc.eu.org/v1",
+                "api_mode": "chat_completions",
+            },
+        }
+    )
+
+    assert shell.model == "gpt-5.4"
+    assert shell.requested_provider == "custom"
+    assert shell.base_url == "https://gpt.lucienfc.eu.org/v1"
+
+
+def test_session_routing_model_config_persists_model():
+    cli = _import_cli()
+    shell = cli.HermesCLI(model="custom-session-model", compact=True, max_turns=1)
+    shell.requested_provider = "custom"
+    shell.provider = "custom"
+    shell.base_url = "https://gpt.lucienfc.eu.org/v1"
+
+    model_config = shell._session_routing_model_config(cwd="/tmp")
+
+    assert model_config["model"] == "custom-session-model"
+    assert model_config["requested_provider"] == "custom"
+
+
+def test_switch_model_uses_named_custom_provider_configured_model_when_implicit(monkeypatch):
+    _import_cli()
+    from hermes_cli.model_switch import switch_model
+
+    custom_providers = [
+        {
+            "name": "lucienfc-gpt",
+            "base_url": "https://gpt.lucienfc.eu.org/v1",
+            "api_key": "sk-lucienfc",
+            "api_mode": "chat_completions",
+            "model": "gpt-5.4",
+        }
+    ]
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider._auto_detect_local_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "auto-detect should not be called for named custom providers with configured model"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested: {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://gpt.lucienfc.eu.org/v1",
+            "api_key": "***",
+            "source": "env/config",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *args, **kwargs: {
+            "accepted": True,
+            "persist": True,
+            "recognized": False,
+            "message": None,
+        },
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *args, **kwargs: None)
+
+    result = switch_model(
+        raw_input="",
+        current_provider="custom",
+        current_model="gpt",
+        current_base_url="https://octopus.lucienfc.eu.org/v1",
+        current_api_key="***",
+        explicit_provider="lucienfc-gpt",
+        custom_providers=custom_providers,
+    )
+
+    assert result.success is True
+    assert result.new_model == "gpt-5.4"
+    assert result.target_provider == "custom:lucienfc-gpt"
+    assert result.provider_label == "lucienfc-gpt"

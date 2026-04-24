@@ -94,7 +94,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE, COMPLEX_TASK_ORCHESTRATION_GUIDANCE, DELEGATION_ORCHESTRATION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -607,6 +607,7 @@ class AIAgent:
         base_url: str = None,
         api_key: str = None,
         provider: str = None,
+        requested_provider: str = None,
         api_mode: str = None,
         acp_command: str = None,
         acp_args: list[str] | None = None,
@@ -668,6 +669,7 @@ class AIAgent:
             base_url (str): Base URL for the model API (optional)
             api_key (str): API key for authentication (optional, uses env var if not provided)
             provider (str): Provider identifier (optional; used for telemetry/routing hints)
+            requested_provider (str): Original requested provider before runtime resolution (optional)
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
             model (str): Model name to use (default: "anthropic/claude-opus-4.6")
             max_iterations (int): Maximum number of tool calling iterations (default: 90)
@@ -733,7 +735,13 @@ class AIAgent:
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
         self.base_url = base_url or ""
         provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
+        requested_provider_name = (
+            requested_provider.strip().lower()
+            if isinstance(requested_provider, str) and requested_provider.strip()
+            else provider_name
+        )
         self.provider = provider_name or ""
+        self.requested_provider = requested_provider_name or self.provider
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
         if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
@@ -1681,9 +1689,12 @@ class AIAgent:
         self._primary_runtime = {
             "model": self.model,
             "provider": self.provider,
+            "requested_provider": getattr(self, "requested_provider", self.provider),
             "base_url": self.base_url,
             "api_mode": self.api_mode,
             "api_key": getattr(self, "api_key", ""),
+            "acp_command": getattr(self, "acp_command", None),
+            "acp_args": list(getattr(self, "acp_args", []) or []),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
             # Context engine state that _try_activate_fallback() overwrites.
@@ -1742,7 +1753,17 @@ class AIAgent:
         if hasattr(self, "context_compressor") and self.context_compressor:
             self.context_compressor.on_session_reset()
     
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+    def switch_model(
+        self,
+        new_model,
+        new_provider,
+        api_key='',
+        base_url='',
+        api_mode='',
+        requested_provider=None,
+        acp_command=None,
+        acp_args=None,
+    ):
         """Switch the model/provider in-place for a live agent.
 
         Called by the /model command handlers (CLI and gateway) after
@@ -1783,8 +1804,13 @@ class AIAgent:
         # ── Swap core runtime fields ──
         self.model = new_model
         self.provider = new_provider
+        self.requested_provider = (requested_provider or new_provider or "").strip().lower()
         self.base_url = base_url or self.base_url
         self.api_mode = api_mode
+        if acp_command is not None:
+            self.acp_command = acp_command
+        if acp_args is not None:
+            self.acp_args = list(acp_args)
         if api_key:
             self.api_key = api_key
 
@@ -1816,6 +1842,9 @@ class AIAgent:
                 "api_key": effective_key,
                 "base_url": effective_base,
             }
+            if self.provider == "copilot-acp":
+                self._client_kwargs["command"] = self.acp_command
+                self._client_kwargs["args"] = self.acp_args
             self.client = self._create_openai_client(
                 dict(self._client_kwargs),
                 reason="switch_model",
@@ -1856,9 +1885,12 @@ class AIAgent:
         self._primary_runtime = {
             "model": self.model,
             "provider": self.provider,
+            "requested_provider": getattr(self, "requested_provider", self.provider),
             "base_url": self.base_url,
             "api_mode": self.api_mode,
             "api_key": getattr(self, "api_key", ""),
+            "acp_command": getattr(self, "acp_command", None),
+            "acp_args": list(getattr(self, "acp_args", []) or []),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
             "compressor_model": getattr(_cc, "model", self.model) if _cc else self.model,
@@ -3710,6 +3742,9 @@ class AIAgent:
                 # prerequisite checks, verification, anti-hallucination).
                 if "gpt" in _model_lower or "codex" in _model_lower:
                     prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+                    prompt_parts.append(COMPLEX_TASK_ORCHESTRATION_GUIDANCE)
+                    if "delegate_task" in self.valid_tool_names:
+                        prompt_parts.append(DELEGATION_ORCHESTRATION_GUIDANCE)
 
         # so it can refer the user to them rather than reinventing answers.
 
@@ -6483,9 +6518,12 @@ class AIAgent:
             # ── Core runtime state ──
             self.model = rt["model"]
             self.provider = rt["provider"]
+            self.requested_provider = rt.get("requested_provider", rt["provider"])
             self.base_url = rt["base_url"]           # setter updates _base_url_lower
             self.api_mode = rt["api_mode"]
             self.api_key = rt["api_key"]
+            self.acp_command = rt.get("acp_command", getattr(self, "acp_command", None))
+            self.acp_args = list(rt.get("acp_args", getattr(self, "acp_args", []) or []))
             self._client_kwargs = dict(rt["client_kwargs"])
             self._use_prompt_caching = rt["use_prompt_caching"]
 
@@ -6582,9 +6620,12 @@ class AIAgent:
             self._client_kwargs = dict(rt["client_kwargs"])
             self.model = rt["model"]
             self.provider = rt["provider"]
+            self.requested_provider = rt.get("requested_provider", rt["provider"])
             self.base_url = rt["base_url"]
             self.api_mode = rt["api_mode"]
             self.api_key = rt["api_key"]
+            self.acp_command = rt.get("acp_command", getattr(self, "acp_command", None))
+            self.acp_args = list(rt.get("acp_args", getattr(self, "acp_args", []) or []))
 
             if self.api_mode == "anthropic_messages":
                 from agent.anthropic_adapter import build_anthropic_client
@@ -7870,7 +7911,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
-                    self.tool_progress_callback("tool.started", name, preview, args)
+                    self.tool_progress_callback("tool.started", name, preview, args, tool_call_id=tc.id)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -8029,8 +8070,8 @@ class AIAgent:
                 if self.tool_progress_callback:
                     try:
                         self.tool_progress_callback(
-                            "tool.completed", function_name, None, None,
-                            duration=tool_duration, is_error=is_error,
+                            "tool.completed", function_name, None, function_args,
+                            duration=tool_duration, is_error=is_error, tool_call_id=tc.id,
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
@@ -8168,7 +8209,7 @@ class AIAgent:
             if _block_msg is None and self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(function_name, function_args)
-                    self.tool_progress_callback("tool.started", function_name, preview, function_args)
+                    self.tool_progress_callback("tool.started", function_name, preview, function_args, tool_call_id=tool_call.id)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -8403,8 +8444,8 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     self.tool_progress_callback(
-                        "tool.completed", function_name, None, None,
-                        duration=tool_duration, is_error=_is_error_result,
+                        "tool.completed", function_name, None, function_args,
+                        duration=tool_duration, is_error=_is_error_result, tool_call_id=tool_call.id,
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
