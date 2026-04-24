@@ -1,0 +1,236 @@
+diff --git a/cli.py b/cli.py
+index 8aa8bb03..a2e205bb 100644
+--- a/cli.py
++++ b/cli.py
+@@ -2066,6 +2066,28 @@ class HermesCLI:
+             return 0
+         return 0 if self._use_minimal_tui_chrome(width=width) else 1
+
++    def _should_show_bottom_dock_spacer(self) -> bool:
++        """Return True when the flexible top spacer should keep the prompt docked low.
++
++        On a fresh session, docking the footer to the bottom gives the intended
++        startup layout. Inside tmux, however, that behavior leaves a large blank
++        valley between the last visible transcript line and the footer because the
++        pane itself already preserves history above the live prompt area. Prefer
++        a transcript-following footer there, while still allowing interactive
++        modal prompts to stay anchored and obvious.
++        """
++        if (
++            getattr(self, "_sudo_state", None)
++            or getattr(self, "_secret_state", None)
++            or getattr(self, "_approval_state", None)
++            or getattr(self, "_clarify_state", None)
++            or getattr(self, "_model_picker_state", None)
++        ):
++            return True
++        if os.environ.get("TMUX", "").strip():
++            return False
++        return not bool(getattr(self, "conversation_history", None))
++
+     def _spinner_widget_height(self, width: Optional[int] = None) -> int:
+         """Return the visible height for the spinner/status text line above the status bar."""
+         if not getattr(self, "_spinner_text", ""):
+@@ -8503,7 +8525,10 @@ class HermesCLI:
+         """
+         return [
+             item for item in [
+-                Window(height=0),
++                ConditionalContainer(
++                    Window(height=Dimension(weight=1)),
++                    filter=Condition(lambda: self._should_show_bottom_dock_spacer()),
++                ),
+                 sudo_widget,
+                 secret_widget,
+                 approval_widget,
+@@ -9912,10 +9937,29 @@ class HermesCLI:
+                 if not self._app:
+                     _time.sleep(0.1)
+                     continue
+-                if self._command_running:
++                if (
++                    self._command_running
++                    or self._agent_running
++                    or bool(self._spinner_text)
++                    or self._tool_start_time > 0
++                ):
+                     self._invalidate(min_interval=0.1)
+                     _time.sleep(0.1)
+                 else:
++                    # When the agent is idle, we used to refresh once per second so
++                    # the status bar duration counter stays live. Inside tmux that
++                    # periodic repaint can pollute scrollback (especially if the
++                    # terminal/tmux cannot efficiently overwrite the previous frame),
++                    # leaving behind many historical copies of the footer when the
++                    # user scrolls back.
++                    #
++                    # Mitigation: disable idle refreshes inside tmux. We still
++                    # repaint on real state changes (tool output, user input,
++                    # agent activity), but we do not tick just to update time.
++                    if os.environ.get("TMUX", "").strip():
++                        _time.sleep(0.5)
++                        continue
++
+                     now = _time.monotonic()
+                     if now - last_idle_refresh >= 1.0:
+                         last_idle_refresh = now
+diff --git a/tests/cli/test_cli_init.py b/tests/cli/test_cli_init.py
+index b926d55f..34147a13 100644
+--- a/tests/cli/test_cli_init.py
++++ b/tests/cli/test_cli_init.py
+@@ -24,7 +24,7 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
+     }
+     if config_overrides:
+         _clean_config.update(config_overrides)
+-    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
++    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": "", "TMUX": ""}
+     if env_overrides:
+         clean_env.update(env_overrides)
+     prompt_toolkit_stubs = {
+@@ -345,3 +345,146 @@ class TestProviderResolution:
+         cli = _make_cli()
+         assert isinstance(cli.model, str)
+         assert isinstance(cli.model, str) and '/' in cli.model
++
++class TestBottomDockedTuiLayout:
++    def test_layout_starts_with_flexible_spacer_above_prompt_cluster(self):
++        cli = _make_cli()
++        cli.conversation_history = []
++
++        class _FakeDimension:
++            def __init__(self, **kwargs):
++                self.weight = kwargs.get("weight")
++                self.min = kwargs.get("min")
++                self.preferred = kwargs.get("preferred")
++
++        class _FakeWindow:
++            def __init__(self, *args, **kwargs):
++                self.args = args
++                self.kwargs = kwargs
++                self.height = kwargs.get("height")
++
++        class _FakeCondition:
++            def __init__(self, func):
++                self.func = func
++
++            def __call__(self):
++                return self.func()
++
++        class _FakeConditionalContainer:
++            def __init__(self, content, filter=None):
++                self.content = content
++                self.filter = filter
++
++        with patch.dict(
++            cli._build_tui_layout_children.__func__.__globals__,
++            {
++                "Dimension": _FakeDimension,
++                "Window": _FakeWindow,
++                "Condition": _FakeCondition,
++                "ConditionalContainer": _FakeConditionalContainer,
++            },
++        ):
++            children = cli._build_tui_layout_children(
++                sudo_widget="sudo",
++                secret_widget="secret",
++                approval_widget="approval",
++                clarify_widget="clarify",
++                model_picker_widget=None,
++                spinner_widget="spinner",
++                spacer="hint",
++                status_bar="status",
++                input_rule_top="rule-top",
++                image_bar="image-bar",
++                input_area="input",
++                input_rule_bot="rule-bot",
++                voice_status_bar="voice-status",
++                completions_menu="menu",
++            )
++
++        assert isinstance(children[0], _FakeConditionalContainer)
++        assert isinstance(children[0].content, _FakeWindow)
++        assert isinstance(children[0].content.height, _FakeDimension)
++        assert children[0].content.height.weight == 1
++        with patch.dict(os.environ, {"TMUX": ""}, clear=False):
++            assert children[0].filter() is True
++        assert children[1:] == [
++            "sudo",
++            "secret",
++            "approval",
++            "clarify",
++            "spinner",
++            "hint",
++            "status",
++            "rule-top",
++            "image-bar",
++            "input",
++            "rule-bot",
++            "voice-status",
++            "menu",
++        ]
++
++    def test_layout_hides_bottom_dock_spacer_after_conversation_history_exists(self):
++        cli = _make_cli()
++        cli.conversation_history = [{"role": "user", "content": "hello"}]
++
++        class _FakeDimension:
++            def __init__(self, **kwargs):
++                self.weight = kwargs.get("weight")
++
++        class _FakeWindow:
++            def __init__(self, *args, **kwargs):
++                self.height = kwargs.get("height")
++
++        class _FakeCondition:
++            def __init__(self, func):
++                self.func = func
++
++            def __call__(self):
++                return self.func()
++
++        class _FakeConditionalContainer:
++            def __init__(self, content, filter=None):
++                self.content = content
++                self.filter = filter
++
++        with patch.dict(
++            cli._build_tui_layout_children.__func__.__globals__,
++            {
++                "Dimension": _FakeDimension,
++                "Window": _FakeWindow,
++                "Condition": _FakeCondition,
++                "ConditionalContainer": _FakeConditionalContainer,
++            },
++        ):
++            children = cli._build_tui_layout_children(
++                sudo_widget="sudo",
++                secret_widget="secret",
++                approval_widget="approval",
++                clarify_widget="clarify",
++                model_picker_widget=None,
++                spinner_widget="spinner",
++                spacer="hint",
++                status_bar="status",
++                input_rule_top="rule-top",
++                image_bar="image-bar",
++                input_area="input",
++                input_rule_bot="rule-bot",
++                voice_status_bar="voice-status",
++                completions_menu="menu",
++            )
++
++        with patch.dict(os.environ, {"TMUX": ""}, clear=False):
++            assert children[0].filter() is False
++
++    def test_bottom_dock_spacer_is_disabled_inside_tmux(self):
++        cli = _make_cli()
++        cli.conversation_history = []
++        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-1000/default,1234,0"}, clear=False):
++            assert cli._should_show_bottom_dock_spacer() is False
++
++    def test_bottom_dock_spacer_still_shows_modal_prompts_inside_tmux(self):
++        cli = _make_cli()
++        cli.conversation_history = []
++        cli._approval_state = {"command": "rm -rf /tmp/demo"}
++        with patch.dict(os.environ, {"TMUX": "/tmp/tmux-1000/default,1234,0"}, clear=False):
++            assert cli._should_show_bottom_dock_spacer() is True

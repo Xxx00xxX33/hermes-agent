@@ -1,0 +1,294 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 3e042f65..e7650b65 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -235,6 +235,14 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
+     "- If a task depends on output from a prior step, resolve that dependency first.\n"
+     "</prerequisite_checks>\n"
+     "\n"
++    "<background_task_strategy>\n"
++    "- When a shell command is independent and likely to be long-running or take more than a minute, prefer terminal(background=true, notify_on_complete=true) instead of blocking in foreground.\n"
++    "- Use this especially for tests, builds, deployments, downloads, servers, watchers, and deliberate waits like sleep when there is other work you can continue.\n"
++    "- After starting a background task, continue other work immediately. Use process(action=\"poll\") or process(action=\"wait\") only when you need progress, need the result, or before you finalize.\n"
++    "- Keep short commands or dependency-blocking steps in the foreground when their result is needed right away.\n"
++    "- On RAM-constrained machines, do not stack multiple memory-heavy or resource-heavy jobs in the background just to be proactive.\n"
++    "</background_task_strategy>\n"
++    "\n"
+     "<verification>\n"
+     "Before finalizing your response:\n"
+     "- Correctness: does the output satisfy every stated requirement?\n"
+@@ -253,6 +261,32 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
+     "</missing_context>"
+ )
+
++COMPLEX_TASK_ORCHESTRATION_GUIDANCE = (
++    "# Complex-task orchestration\n"
++    "<complex_task_orchestration>\n"
++    "- For non-trivial tasks, stage the work before execution.\n"
++    "- Rewrite the request into a brief covering: core goal, deliverable, known facts, hard constraints, prohibited actions, non-goals, unknowns or assumptions, and success criteria. Preserve exact paths, filenames, commands, ports, URLs, versions, errors, dates, quantities, and required output formats.\n"
++    "- Before major work, define a task contract: success criteria, failure signals, verification method, current baseline, main risks, and minimal execution strategy.\n"
++    "- Baseline first: identify what exists, what works, what fails, and the evidence before redesigning or optimizing.\n"
++    "- Use the simplest verifiable path, change one major variable at a time, prefer reversible edits, and avoid speculative shotgun fixes.\n"
++    "- Verify after significant steps. Separate facts, inferences, options, and results. Do not claim fixed or done without validation.\n"
++    "- If context gets noisy, create a 'Clean State Snapshot' with: current goal, current baseline, confirmed facts, rejected paths, active assumptions, completed work, current blocker, and next action.\n"
++    "- Use structured headings for complex tasks when they help the user or recovery; do not force them for trivial turns.\n"
++    "- On failure, note the failure signal, return to the last stable point, replace the smallest necessary part of the plan, and re-verify.\n"
++    "</complex_task_orchestration>"
++)
++
++DELEGATION_ORCHESTRATION_GUIDANCE = (
++    "# Delegation orchestration\n"
++    "<delegation_orchestration>\n"
++    "- When delegation is available, keep the parent context clean and delegate only when it materially reduces context load or benefits from a fresh execution context.\n"
++    "- Parent responsibilities: rewrite the task, define scope and baseline, choose whether to delegate, collect results, validate them, and make final acceptance decisions.\n"
++    "- Good delegation targets: log-heavy debugging, broad codebase exploration, installs or downloads, multi-source research, repetitive trial-and-error, and parallel investigations. Do not delegate single tool calls, trivial edits, user clarification, or final acceptance checks.\n"
++    "- Give each child a narrow goal, minimum necessary context, and an explicit task-appropriate return format. For code or debugging work, prefer: result, key evidence, unresolved issues, validation status, and files created or modified.\n"
++    "- The parent remains responsible for checking that the assigned question was answered, constraints were respected, and validation actually happened.\n"
++    "</delegation_orchestration>"
++)
++
+ # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
+ # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.
+ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
+diff --git a/run_agent.py b/run_agent.py
+index a47455e5..5bc3a934 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -94,7 +94,7 @@ from agent.model_metadata import (
+ from agent.context_compressor import ContextCompressor
+ from agent.subdirectory_hints import SubdirectoryHintTracker
+ from agent.prompt_caching import apply_anthropic_cache_control
+-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
++from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE, COMPLEX_TASK_ORCHESTRATION_GUIDANCE, DELEGATION_ORCHESTRATION_GUIDANCE
+ from agent.usage_pricing import estimate_usage_cost, normalize_usage
+ from agent.display import (
+     KawaiiSpinner, build_tool_preview as _build_tool_preview,
+@@ -3710,6 +3710,9 @@ class AIAgent:
+                 # prerequisite checks, verification, anti-hallucination).
+                 if "gpt" in _model_lower or "codex" in _model_lower:
+                     prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
++                    prompt_parts.append(COMPLEX_TASK_ORCHESTRATION_GUIDANCE)
++                    if "delegate_task" in self.valid_tool_names:
++                        prompt_parts.append(DELEGATION_ORCHESTRATION_GUIDANCE)
+
+         # so it can refer the user to them rather than reinventing answers.
+
+diff --git a/tests/agent/test_prompt_builder.py b/tests/agent/test_prompt_builder.py
+index 2b231d2d..3bd9fac3 100644
+--- a/tests/agent/test_prompt_builder.py
++++ b/tests/agent/test_prompt_builder.py
+@@ -1024,6 +1024,29 @@ class TestOpenAIModelExecutionGuidance:
+         assert "<verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
+         assert "</verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
+
++    def test_guidance_covers_background_task_strategy(self):
++        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
++        assert "background" in text
++        assert "notify_on_complete" in text
++        assert "long-running" in text or "takes more than a minute" in text
++        assert "continue" in text and "other work" in text
++
++    def test_background_strategy_decision_matrix_covers_when_to_background(self):
++        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
++        assert "independent" in text
++        assert any(term in text for term in ("tests", "test suites"))
++        assert "build" in text
++        assert "deployment" in text or "deployments" in text
++        assert "downloads" in text
++        assert "sleep" in text
++
++    def test_background_strategy_decision_matrix_covers_when_not_to_background(self):
++        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
++        assert "short commands" in text
++        assert "needed right away" in text
++        assert "dependency-blocking" in text
++        assert any(term in text for term in ("ram-constrained", "memory-heavy", "resource-heavy"))
++
+     def test_guidance_is_string(self):
+         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
+         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index 86f95580..47f395e5 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -717,12 +717,17 @@ class TestBuildSystemPrompt:
+ class TestToolUseEnforcementConfig:
+     """Tests for the agent.tool_use_enforcement config option."""
+
+-    def _make_agent(self, model="openai/gpt-4.1", tool_use_enforcement="auto"):
++    def _make_agent(
++        self,
++        model="openai/gpt-4.1",
++        tool_use_enforcement="auto",
++        tool_names=("terminal", "web_search"),
++    ):
+         """Create an agent with tools and a specific enforcement config."""
+         with (
+             patch(
+                 "run_agent.get_tool_definitions",
+-                return_value=_make_tool_defs("terminal", "web_search"),
++                return_value=_make_tool_defs(*tool_names),
+             ),
+             patch("run_agent.check_toolset_requirements", return_value={}),
+             patch("run_agent.OpenAI"),
+@@ -841,6 +846,97 @@ class TestToolUseEnforcementConfig:
+             prompt = a._build_system_prompt()
+             assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
+
++    def test_gpt_system_prompt_includes_background_task_strategy(self):
++        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
++        prompt = agent._build_system_prompt()
++        assert "<background_task_strategy>" in prompt
++        assert "notify_on_complete=true" in prompt
++        assert "dependency-blocking" in prompt
++        assert "ram-constrained" in prompt.lower()
++
++    def test_gpt5_api_kwargs_carry_background_task_strategy_in_instructions(self):
++        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
++        prompt = agent._build_system_prompt()
++        kwargs = agent._build_api_kwargs([
++            {"role": "system", "content": prompt},
++            {"role": "user", "content": "run the test suite"},
++        ])
++        assert "instructions" in kwargs
++        assert "<background_task_strategy>" in kwargs["instructions"]
++        assert "notify_on_complete=true" in kwargs["instructions"]
++        assert "dependency-blocking" in kwargs["instructions"]
++        assert "ram-constrained" in kwargs["instructions"].lower()
++        assert kwargs["input"] == [{"role": "user", "content": "run the test suite"}]
++
++    def test_gpt_system_prompt_includes_complex_task_orchestration(self):
++        from agent.prompt_builder import COMPLEX_TASK_ORCHESTRATION_GUIDANCE
++
++        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
++        prompt = agent._build_system_prompt()
++
++        assert COMPLEX_TASK_ORCHESTRATION_GUIDANCE in prompt
++        assert "<complex_task_orchestration>" in prompt
++        assert "task contract" in prompt.lower()
++        assert "current baseline" in prompt.lower()
++        assert "clean state snapshot" in prompt.lower()
++
++    def test_gpt5_api_kwargs_carry_complex_task_orchestration_in_instructions(self):
++        from agent.prompt_builder import COMPLEX_TASK_ORCHESTRATION_GUIDANCE
++
++        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
++        prompt = agent._build_system_prompt()
++        kwargs = agent._build_api_kwargs([
++            {"role": "system", "content": prompt},
++            {"role": "user", "content": "review the repo and propose a patch"},
++        ])
++
++        assert "instructions" in kwargs
++        assert COMPLEX_TASK_ORCHESTRATION_GUIDANCE in kwargs["instructions"]
++        assert "<complex_task_orchestration>" in kwargs["instructions"]
++        assert "clean state snapshot" in kwargs["instructions"].lower()
++
++    def test_gpt_system_prompt_includes_delegation_orchestration_when_delegate_available(self):
++        from agent.prompt_builder import DELEGATION_ORCHESTRATION_GUIDANCE
++
++        agent = self._make_agent(
++            model="gpt-5.4",
++            tool_use_enforcement="auto",
++            tool_names=("terminal", "delegate_task"),
++        )
++        prompt = agent._build_system_prompt()
++
++        assert DELEGATION_ORCHESTRATION_GUIDANCE in prompt
++        assert "<delegation_orchestration>" in prompt
++        assert "key evidence" in prompt.lower()
++        assert "validation status" in prompt.lower()
++
++    def test_gpt_system_prompt_omits_delegation_orchestration_without_delegate_tool(self):
++        from agent.prompt_builder import DELEGATION_ORCHESTRATION_GUIDANCE
++
++        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement="auto")
++        prompt = agent._build_system_prompt()
++
++        assert DELEGATION_ORCHESTRATION_GUIDANCE not in prompt
++        assert "<delegation_orchestration>" not in prompt
++
++    def test_false_disables_orchestration_blocks_for_gpt(self):
++        agent = self._make_agent(model="gpt-5.4", tool_use_enforcement=False, tool_names=("terminal", "delegate_task"))
++        prompt = agent._build_system_prompt()
++
++        assert "<complex_task_orchestration>" not in prompt
++        assert "<delegation_orchestration>" not in prompt
++
++    def test_true_for_non_gpt_does_not_add_orchestration_blocks(self):
++        agent = self._make_agent(
++            model="anthropic/claude-sonnet-4",
++            tool_use_enforcement=True,
++            tool_names=("terminal", "delegate_task"),
++        )
++        prompt = agent._build_system_prompt()
++
++        assert "<complex_task_orchestration>" not in prompt
++        assert "<delegation_orchestration>" not in prompt
++
+
+ class TestInvalidateSystemPrompt:
+     def test_clears_cache(self, agent):
+diff --git a/tests/run_agent/test_run_agent_codex_responses.py b/tests/run_agent/test_run_agent_codex_responses.py
+index 81213aaf..f6c1b50e 100644
+--- a/tests/run_agent/test_run_agent_codex_responses.py
++++ b/tests/run_agent/test_run_agent_codex_responses.py
+@@ -297,6 +297,16 @@ def test_build_api_kwargs_codex(monkeypatch):
+     assert kwargs["model"] == "gpt-5-codex"
+     assert kwargs["instructions"] == "You are Hermes."
+     assert kwargs["store"] is False
++
++    prompt = agent._build_system_prompt()
++    kwargs = agent._build_api_kwargs([
++        {"role": "system", "content": prompt},
++        {"role": "user", "content": "Review the repo and propose a patch"},
++    ])
++    assert "<background_task_strategy>" in kwargs["instructions"]
++    assert "<complex_task_orchestration>" in kwargs["instructions"]
++    assert "task contract" in kwargs["instructions"].lower()
++    assert "<delegation_orchestration>" not in kwargs["instructions"]
+     assert isinstance(kwargs["input"], list)
+     assert kwargs["input"][0]["role"] == "user"
+     assert kwargs["tools"][0]["type"] == "function"
+diff --git a/tests/tools/test_delegate.py b/tests/tools/test_delegate.py
+index e1e119d9..fd119e57 100644
+--- a/tests/tools/test_delegate.py
++++ b/tests/tools/test_delegate.py
+@@ -87,6 +87,15 @@ class TestChildSystemPrompt(unittest.TestCase):
+         prompt = _build_child_system_prompt("Do something", "  ")
+         self.assertNotIn("CONTEXT", prompt)
+
++    def test_summary_requires_structured_headings(self):
++        prompt = _build_child_system_prompt("Fix the tests")
++        self.assertIn("When finished, provide a clear, concise summary with these headings:", prompt)
++        self.assertIn("- Result", prompt)
++        self.assertIn("- Key evidence", prompt)
++        self.assertIn("- Validation status", prompt)
++        self.assertIn("- Unresolved issues", prompt)
++        self.assertIn("- Any files you created or modified", prompt)
++
+
+ class TestStripBlockedTools(unittest.TestCase):
+     def test_removes_blocked_toolsets(self):
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 22b132f2..cdcd1fcf 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -109,11 +109,12 @@ def _build_child_system_prompt(
+         )
+     parts.append(
+         "\nComplete this task using the tools available to you. "
+-        "When finished, provide a clear, concise summary of:\n"
+-        "- What you did\n"
+-        "- What you found or accomplished\n"
+-        "- Any files you created or modified\n"
+-        "- Any issues encountered\n\n"
++        "When finished, provide a clear, concise summary with these headings:\n"
++        "- Result\n"
++        "- Key evidence\n"
++        "- Validation status\n"
++        "- Unresolved issues\n"
++        "- Any files you created or modified\n\n"
+         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
+         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
+         "Be thorough but concise -- your response is returned to the "

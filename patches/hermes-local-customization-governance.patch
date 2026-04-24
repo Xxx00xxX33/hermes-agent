@@ -1,0 +1,1382 @@
+diff --git a/patches/README.md b/patches/README.md
+new file mode 100644
+index 00000000..c1f83657
+--- /dev/null
++++ b/patches/README.md
+@@ -0,0 +1,77 @@
++# Local Hermes customization maintenance
++
++This directory contains the canonical local customization bundle for the local Hermes maintenance branch.
++
++The active bundle is defined only by `patches/manifest.yaml`.
++Do not infer active coverage from stray `patches/*.patch` files, archived patch variants, or memory.
++
++## Update-readiness rule
++
++Before any AI or human updates Hermes against newer upstream code, run the governance gates and then run the clean-upstream rehearsal:
++
++```bash
++cd ~/.hermes/hermes-agent
++python3 -m patches.local_customization_manifest --repo-root . verify --strict
++python3 -m patches.local_customization_manifest --repo-root . verify-ahead
++patches/rehearse-upstream-update.sh
++```
++
++This is mandatory.
++
++`verify --strict` and `verify-ahead` prove that the current local customization surface is still covered by the manifest-listed canonical patch bundle.
++They do not prove that the bundle can still be replayed onto the latest upstream tree.
++
++The rehearsal helper is the upgrade-readiness gate.
++If rehearsal reports any manifest-listed patch as `conflict`, the upstream update must stop until that patch is aligned/refreshed or deliberately retired.
++Do not continue the rebase/merge/update while a required local customization still conflicts.
++
++## Meaning of patch states
++
++The rehearsal/apply helpers classify each manifest-listed patch as one of these states:
++
++- `already-applied`: the target tree already contains the effect of the patch, so replay is not needed there.
++- `applicable`: the patch still applies cleanly to the target tree.
++- `conflict`: the patch no longer applies cleanly to the target tree and cannot be trusted to survive the upstream update automatically.
++
++## What `conflict` means here
++
++A conflict is an upgrade-carry-forward problem, not necessarily a current runtime failure.
++It usually means upstream changed the same code region, moved the logic, renamed symbols, split functions, or otherwise changed the surrounding context enough that `git apply --check` can no longer replay the patch safely.
++
++That means all of the following can be true at once:
++
++- the local Hermes checkout still works today,
++- the local customized behavior is still present today,
++- but the durable patch artifact can no longer be replayed onto the latest clean upstream checkout.
++
++If you ignore that signal and continue the upstream update anyway, the most likely failure mode is silent customization loss: the update completes, but one or more local behaviors no longer survive the upgrade.
++
++## Required response when rehearsal finds conflicts
++
++When `patches/rehearse-upstream-update.sh` reports `conflict` for any active manifest-listed patch:
++
++1. Stop the upstream update flow.
++2. Inspect the failing files and hunk context printed by the helper.
++3. Refresh or realign the conflicting patch against the current upstream structure.
++4. Re-run:
++   - `python3 -m patches.local_customization_manifest --repo-root . verify --strict`
++   - `python3 -m patches.local_customization_manifest --repo-root . verify-ahead`
++   - `patches/apply-hermes-local-customizations.sh --status --no-tests`
++   - `patches/rehearse-upstream-update.sh`
++5. Continue the actual upstream merge/rebase/update only after the needed patch is no longer reported as `conflict`.
++
++If upstream already absorbed the behavior, convert that patch from "conflict" into an intentional retirement or absorbed state rather than forcing stale hunks forward.
++If upstream changed the architecture, adapt the customization to the new structure and regenerate the canonical patch artifact.
++
++## Base-ref expectations
++
++Inside the main local maintenance repo, the canonical baseline is `upstream/main`.
++In a fresh upstream clone or overlay-CI rehearsal, the equivalent baseline is usually `origin/main`.
++The helper scripts resolve this automatically when possible, but future maintainers should still interpret results with that distinction in mind.
++
++## Governance notes
++
++- `patches/manifest.yaml` is the single source of truth for active patch membership and order.
++- `patches/archive/` is historical only.
++- Governance code and helper scripts under `patches/` are themselves part of the local customization surface and must remain covered by the canonical bundle.
++- Governance-green is not the same thing as upgrade-ready-green; rehearsal is the authoritative check for latest-upstream applicability.
+diff --git a/patches/__init__.py b/patches/__init__.py
+new file mode 100644
+index 00000000..d4e2d5a6
+--- /dev/null
++++ b/patches/__init__.py
+@@ -0,0 +1 @@
++"""Helpers for local Hermes customization artifacts."""
+diff --git a/patches/apply-hermes-cli-working-indicator.sh b/patches/apply-hermes-cli-working-indicator.sh
+new file mode 100755
+index 00000000..c3060a20
+--- /dev/null
++++ b/patches/apply-hermes-cli-working-indicator.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++PATCH_FILE="$REPO_ROOT/patches/hermes-cli-working-indicator.patch"
++
++cd "$REPO_ROOT"
++
++echo "Checking patch applicability: $PATCH_FILE"
++git apply --check --3way "$PATCH_FILE"
++echo "Applying patch..."
++git apply --3way "$PATCH_FILE"
++
++echo "Patch applied successfully."
++if [ -f venv/bin/activate ]; then
++  # shellcheck disable=SC1091
++  source venv/bin/activate
++elif [ -f .venv/bin/activate ]; then
++  # shellcheck disable=SC1091
++  source .venv/bin/activate
++fi
++
++if command -v pytest >/dev/null 2>&1; then
++  echo "Running targeted verification tests..."
++  pytest tests/cli/test_cli_status_bar.py tests/cli/test_cli_skin_integration.py tests/test_cli_skin_integration.py -q
++else
++  echo "pytest not found; skip tests."
++fi
+diff --git a/patches/apply-hermes-local-customizations.sh b/patches/apply-hermes-local-customizations.sh
+new file mode 100755
+index 00000000..d884bfc2
+--- /dev/null
++++ b/patches/apply-hermes-local-customizations.sh
+@@ -0,0 +1,159 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$REPO_ROOT"
++
++if [[ -n "${HERMES_LOCAL_CUSTOMIZATION_BASE_REF:-}" ]]; then
++  BASE_REF="$HERMES_LOCAL_CUSTOMIZATION_BASE_REF"
++else
++  BASE_REF="$(python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" resolve-base-ref)"
++fi
++
++MODE="apply"
++STRICT_CHECK=0
++RUN_TESTS=1
++if [[ "${1:-}" == "--check" ]]; then
++  MODE="check"
++  STRICT_CHECK=1
++  shift || true
++elif [[ "${1:-}" == "--status" ]]; then
++  MODE="check"
++  STRICT_CHECK=0
++  shift || true
++fi
++if [[ "${1:-}" == "--no-tests" ]]; then
++  RUN_TESTS=0
++  shift || true
++fi
++if [[ $# -gt 0 ]]; then
++  echo "Usage: $0 [--check|--status] [--no-tests]" >&2
++  exit 2
++fi
++
++mapfile -t PATCHES < <(
++  python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" bundle-lines
++)
++
++LOCAL_HELPERS=(
++  "patches/ensure-hermes-tmux-scrollkeys.sh"
++)
++
++TESTS=(
++  tests/cli/test_cli_status_bar.py
++  tests/hermes_cli/test_skin_engine.py
++  tests/cli/test_cli_skin_integration.py
++  tests/test_cli_skin_integration.py
++  tests/hermes_cli/test_session_browse.py
++  tests/cli/test_resume_display.py
++  tests/cli/test_cli_init.py
++  tests/agent/test_context_compressor.py
++  tests/run_agent/test_compression_feasibility.py
++  tests/run_agent/test_context_pressure.py
++  tests/run_agent/test_long_context_tier_429.py
++)
++
++manifest_verify() {
++  local strict_flag=()
++  if (( STRICT_CHECK == 1 )) || [[ "$MODE" == "apply" ]]; then
++    strict_flag+=(--strict)
++  fi
++  python3 -m patches.local_customization_manifest \
++    --repo-root "$REPO_ROOT" \
++    verify \
++    "${strict_flag[@]}"
++  python3 -m patches.local_customization_manifest \
++    --repo-root "$REPO_ROOT" \
++    verify-ahead \
++    --base-ref "$BASE_REF"
++}
++
++patch_state() {
++  local patch_file="$1"
++  if git apply --reverse --check "$patch_file" >/dev/null 2>&1; then
++    printf 'already-applied'
++  elif git apply --check --3way "$patch_file" >/dev/null 2>&1; then
++    printf 'applicable'
++  else
++    printf 'conflict'
++  fi
++}
++
++activate_venv_if_present() {
++  if [[ -f venv/bin/activate ]]; then
++    # shellcheck disable=SC1091
++    source venv/bin/activate
++  elif [[ -f .venv/bin/activate ]]; then
++    # shellcheck disable=SC1091
++    source .venv/bin/activate
++  fi
++}
++
++failures=()
++applied_any=0
++
++echo "Hermes local customization patch bundle ($MODE mode)"
++manifest_verify
++for entry in "${PATCHES[@]}"; do
++  name="${entry%%|*}"
++  patch_file="${entry#*|}"
++  state="$(patch_state "$patch_file")"
++  printf ' - %-24s %s\n' "$name" "$state"
++
++  if [[ "$MODE" == "apply" ]]; then
++    case "$state" in
++      already-applied)
++        ;;
++      applicable)
++        echo "   applying: $patch_file"
++        git apply --3way "$patch_file"
++        applied_any=1
++        ;;
++      conflict)
++        failures+=("$name:$patch_file")
++        ;;
++    esac
++  elif [[ "$state" == "conflict" ]]; then
++    failures+=("$name:$patch_file")
++  fi
++done
++
++if (( ${#failures[@]} > 0 )); then
++  echo
++  echo "The following local customizations need manual review or patch refresh:" >&2
++  printf ' - %s\n' "${failures[@]}" >&2
++  if (( STRICT_CHECK == 1 )) || [[ "$MODE" == "apply" ]]; then
++    exit 1
++  fi
++fi
++
++if [[ "$MODE" == "check" ]]; then
++  echo
++  echo "Status check completed."
++  exit 0
++fi
++
++if (( ${#LOCAL_HELPERS[@]} > 0 )); then
++  echo
++  echo "Applying local helper scripts..."
++  for helper in "${LOCAL_HELPERS[@]}"; do
++    echo " - $helper"
++    "$helper"
++  done
++fi
++
++if (( RUN_TESTS == 0 )); then
++  echo
++  echo "Patches processed. Tests skipped by request."
++  exit 0
++fi
++
++activate_venv_if_present
++if command -v pytest >/dev/null 2>&1; then
++  echo
++  echo "Running combined targeted verification tests..."
++  pytest "${TESTS[@]}" -q
++else
++  echo
++  echo "pytest not found; patch application finished without automated tests."
++fi
+diff --git a/patches/apply-hermes-local-high-contrast-statusbar.sh b/patches/apply-hermes-local-high-contrast-statusbar.sh
+new file mode 100755
+index 00000000..3b7e6ce4
+--- /dev/null
++++ b/patches/apply-hermes-local-high-contrast-statusbar.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++PATCH_FILE="$REPO_ROOT/patches/hermes-local-high-contrast-statusbar.patch"
++
++cd "$REPO_ROOT"
++
++echo "Checking patch applicability: $PATCH_FILE"
++git apply --check --3way "$PATCH_FILE"
++echo "Applying patch..."
++git apply --3way "$PATCH_FILE"
++
++echo "Patch applied successfully."
++if [ -f venv/bin/activate ]; then
++  # shellcheck disable=SC1091
++  source venv/bin/activate
++elif [ -f .venv/bin/activate ]; then
++  # shellcheck disable=SC1091
++  source .venv/bin/activate
++fi
++
++if command -v pytest >/dev/null 2>&1; then
++  echo "Running targeted verification tests..."
++  pytest tests/cli/test_cli_status_bar.py tests/hermes_cli/test_skin_engine.py
++else
++  echo "pytest not found; skip tests."
++fi
+diff --git a/patches/ensure-hermes-tmux-scrollkeys.sh b/patches/ensure-hermes-tmux-scrollkeys.sh
+new file mode 100755
+index 00000000..5e07239a
+--- /dev/null
++++ b/patches/ensure-hermes-tmux-scrollkeys.sh
+@@ -0,0 +1,89 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++TMUX_CONF="${TMUX_CONF:-$HOME/.tmux.conf}"
++
++mkdir -p "$(dirname "$TMUX_CONF")"
++touch "$TMUX_CONF"
++
++python3 - "$TMUX_CONF" <<'PY'
++import pathlib, sys
++
++path = pathlib.Path(sys.argv[1])
++text = path.read_text() if path.exists() else ""
++
++legacy = """# Hermes local tmux usability tweaks
++# Allow direct PageUp/PageDown scrollback in tmux panes without pressing the prefix first.
++# - PageUp: enter copy mode and page up immediately.
++# - PageDown: if already in copy mode, page down; otherwise pass the key through.
++bind-key -n PPage if-shell -F '#{pane_in_mode}' 'send-keys -X page-up' 'copy-mode -eu'
++bind-key -n NPage if-shell -F '#{pane_in_mode}' 'send-keys -X page-down' 'send-keys NPage'
++"""
++
++old_block = """# >>> Hermes tmux direct PageUp/PageDown >>>
++# Allow direct PageUp/PageDown scrollback in tmux panes without pressing the prefix first.
++# - PageUp: enter copy mode and page up immediately.
++# - PageDown: if already in copy mode, page down; otherwise pass the key through.
++bind-key -n PPage if-shell -F '#{pane_in_mode}' 'send-keys -X page-up' 'copy-mode -eu'
++bind-key -n NPage if-shell -F '#{pane_in_mode}' 'send-keys -X page-down' 'send-keys NPage'
++# <<< Hermes tmux direct PageUp/PageDown <<<
++"""
++
++scroll_block = r"""# >>> Hermes tmux direct scroll/history keys >>>
++# Allow direct history navigation in tmux panes without pressing the prefix first.
++# - PageUp: enter copy mode and page up immediately.
++# - PageDown: if already in copy mode, page down; otherwise pass the key through.
++# - Home: jump to the top of scrollback while browsing history; otherwise pass through.
++# - End: jump to the bottom of scrollback and return to the live pane; otherwise pass through.
++bind-key -n PPage if-shell -F '#{pane_in_mode}' 'send-keys -X page-up' 'copy-mode -eu'
++bind-key -n NPage if-shell -F '#{pane_in_mode}' 'send-keys -X page-down' 'send-keys NPage'
++bind-key -n Home if-shell -F '#{pane_in_mode}' 'send-keys -X history-top' 'send-keys Home'
++bind-key -n End if-shell -F '#{pane_in_mode}' 'send-keys -X history-bottom \; send-keys -X cancel' 'send-keys End'
++bind-key -T copy-mode Home send-keys -X history-top
++bind-key -T copy-mode End send-keys -X history-bottom \; send-keys -X cancel
++bind-key -T copy-mode-vi Home send-keys -X history-top
++bind-key -T copy-mode-vi End send-keys -X history-bottom \; send-keys -X cancel
++# <<< Hermes tmux direct scroll/history keys <<<
++"""
++
++title_block = r"""# >>> Hermes tmux task title status-right >>>
++# Show only the current pane title in tmux's bottom-right status area.
++# Hermes updates pane titles with the current prompt summary, so omit time/date.
++set-option -g status-right '#{?pane_title,#{=80:pane_title},Hermes}'
++set-option -g status-right-length 80
++# <<< Hermes tmux task title status-right <<<
++"""
++
++blocks = [
++    ("# >>> Hermes tmux direct scroll/history keys >>>", "# <<< Hermes tmux direct scroll/history keys <<<", scroll_block),
++    ("# >>> Hermes tmux task title status-right >>>", "# <<< Hermes tmux task title status-right <<<", title_block),
++]
++
++if legacy in text:
++    text = text.replace(legacy, "")
++
++if old_block in text:
++    text = text.replace(old_block, "")
++
++for start, end, _block in blocks:
++    if start in text and end in text:
++        si = text.index(start)
++        ei = text.index(end, si) + len(end)
++        if ei < len(text) and text[ei:ei + 1] == "\n":
++            ei += 1
++        text = text[:si] + text[ei:]
++
++text = text.rstrip("\n")
++if text:
++    text += "\n\n"
++text += scroll_block + "\n\n" + title_block + "\n"
++path.write_text(text)
++PY
++
++if command -v tmux >/dev/null 2>&1; then
++  if tmux list-sessions >/dev/null 2>&1; then
++    tmux source-file "$TMUX_CONF" >/dev/null 2>&1 || true
++  fi
++fi
++
++echo "Ensured tmux scroll/history keys and task-title status-right in $TMUX_CONF"
+diff --git a/patches/local_customization_manifest.py b/patches/local_customization_manifest.py
+new file mode 100644
+index 00000000..bd0c8909
+--- /dev/null
++++ b/patches/local_customization_manifest.py
+@@ -0,0 +1,338 @@
++from __future__ import annotations
++
++import argparse
++import subprocess
++import sys
++from pathlib import Path, PurePosixPath
++from typing import Iterable
++
++import yaml
++
++MANIFEST_VERSION = 1
++
++
++def manifest_path(repo_root: Path) -> Path:
++    return repo_root / "patches" / "manifest.yaml"
++
++
++def load_manifest(repo_root: Path) -> dict:
++    path = manifest_path(repo_root)
++    if not path.exists():
++        return {}
++    with path.open("r", encoding="utf-8") as fh:
++        data = yaml.safe_load(fh) or {}
++    if not isinstance(data, dict):
++        raise ValueError(f"Manifest must parse to a mapping: {path}")
++    return data
++
++
++def bundle_entries(manifest: dict) -> list[dict]:
++    entries = manifest.get("bundle") or []
++    if not isinstance(entries, list):
++        raise ValueError("Manifest key 'bundle' must be a list")
++    normalized: list[dict] = []
++    for idx, entry in enumerate(entries, start=1):
++        if not isinstance(entry, dict):
++            raise ValueError(f"Manifest bundle entry #{idx} must be a mapping")
++        normalized.append(entry)
++    return normalized
++
++
++def validate_manifest(repo_root: Path) -> list[str]:
++    errors: list[str] = []
++    try:
++        manifest = load_manifest(repo_root)
++    except Exception as exc:
++        return [f"Failed to load patches/manifest.yaml: {exc}"]
++
++    version = manifest.get("version")
++    if version != MANIFEST_VERSION:
++        errors.append(
++            f"patches/manifest.yaml must declare version: {MANIFEST_VERSION} (got {version!r})"
++        )
++
++    seen_ids: set[str] = set()
++    seen_patches: set[str] = set()
++    for idx, entry in enumerate(bundle_entries(manifest), start=1):
++        entry_id = str(entry.get("id") or "").strip()
++        patch_rel = str(entry.get("patch") or "").strip()
++        purpose = str(entry.get("purpose") or "").strip()
++
++        if not entry_id:
++            errors.append(f"Bundle entry #{idx} is missing a non-empty 'id'")
++        elif entry_id in seen_ids:
++            errors.append(f"Bundle entry id is duplicated: {entry_id}")
++        else:
++            seen_ids.add(entry_id)
++
++        if not patch_rel:
++            errors.append(f"Bundle entry #{idx} is missing a non-empty 'patch'")
++        elif patch_rel in seen_patches:
++            errors.append(f"Bundle entry patch is duplicated: {patch_rel}")
++        else:
++            seen_patches.add(patch_rel)
++            patch_path = repo_root / patch_rel
++            if not patch_path.exists():
++                errors.append(f"Bundle entry references missing patch file: {patch_rel}")
++
++        if not purpose:
++            errors.append(f"Bundle entry #{idx} ({entry_id or 'unknown'}) is missing 'purpose'")
++
++    return errors
++
++
++def patch_inventory_paths(repo_root: Path) -> list[Path]:
++    manifest = load_manifest(repo_root)
++    paths: list[Path] = []
++    for entry in bundle_entries(manifest):
++        patch_rel = str(entry.get("patch") or "").strip()
++        if not patch_rel:
++            continue
++        patch_path = repo_root / patch_rel
++        if patch_path.exists():
++            paths.append(patch_path)
++    return paths
++
++
++def patch_referenced_files(patch_path: Path) -> set[str]:
++    referenced: set[str] = set()
++    for line in patch_path.read_text(encoding="utf-8", errors="ignore").splitlines():
++        if line.startswith("+++ b/"):
++            rel = line[len("+++ b/") :].strip()
++            if rel and rel != "/dev/null":
++                referenced.add(rel)
++    return referenced
++
++
++def patch_coverage_index(repo_root: Path) -> dict[str, set[str]]:
++    coverage: dict[str, set[str]] = {}
++    for patch_path in patch_inventory_paths(repo_root):
++        coverage[patch_path.name] = patch_referenced_files(patch_path)
++    return coverage
++
++
++def covered_files(repo_root: Path) -> set[str]:
++    covered: set[str] = set()
++    for files in patch_coverage_index(repo_root).values():
++        covered.update(files)
++    return covered
++
++
++def _git_lines(repo_root: Path, *args: str) -> list[str]:
++    proc = subprocess.run(
++        ["git", *args],
++        cwd=repo_root,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    if proc.returncode != 0:
++        stderr = (proc.stderr or proc.stdout or "").strip()
++        raise RuntimeError(f"git {' '.join(args)} failed: {stderr}")
++    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
++
++
++def git_ref_exists(repo_root: Path, ref: str) -> bool:
++    proc = subprocess.run(
++        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
++        cwd=repo_root,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    return proc.returncode == 0
++
++
++def resolve_base_ref(repo_root: Path, preferred: str = "upstream/main") -> str:
++    candidates: list[str] = []
++
++    def add_candidate(ref: str) -> None:
++        if ref and ref not in candidates:
++            candidates.append(ref)
++
++    add_candidate(preferred)
++    remote, sep, branch = preferred.partition("/")
++    if sep:
++        if remote != "upstream":
++            add_candidate(f"upstream/{branch}")
++        if remote != "origin":
++            add_candidate(f"origin/{branch}")
++
++    for candidate in candidates:
++        if git_ref_exists(repo_root, candidate):
++            return candidate
++
++    joined = ", ".join(candidates) or preferred
++    raise RuntimeError(
++        f"Unable to resolve base ref from available candidates: {joined}. "
++        "Set HERMES_LOCAL_CUSTOMIZATION_BASE_REF explicitly if needed."
++    )
++
++
++def tracked_modified_files(repo_root: Path) -> list[str]:
++    unstaged = _git_lines(repo_root, "diff", "--name-only", "--")
++    staged = _git_lines(repo_root, "diff", "--name-only", "--cached", "--")
++    return sorted(set(unstaged) | set(staged))
++
++
++def ahead_modified_files(repo_root: Path, base_ref: str = "upstream/main") -> list[str]:
++    return _git_lines(repo_root, "diff", "--name-only", f"{base_ref}...HEAD", "--")
++
++
++def is_patch_artifact(rel_path: str) -> bool:
++    path = PurePosixPath(rel_path)
++    if not path.parts or path.parts[0] != "patches":
++        return False
++    if "archive" in path.parts:
++        return True
++    if path.name == "manifest.yaml":
++        return True
++    return path.suffix == ".patch"
++
++
++def find_uncovered_tracked_modifications(repo_root: Path) -> list[str]:
++    coverage = covered_files(repo_root)
++    uncovered = []
++    for rel_path in tracked_modified_files(repo_root):
++        if is_patch_artifact(rel_path):
++            continue
++        if rel_path not in coverage:
++            uncovered.append(rel_path)
++    return sorted(uncovered)
++
++
++def find_uncovered_ahead_modifications(repo_root: Path, base_ref: str = "upstream/main") -> list[str]:
++    coverage = covered_files(repo_root)
++    uncovered = []
++    for rel_path in ahead_modified_files(repo_root, base_ref=base_ref):
++        if is_patch_artifact(rel_path):
++            continue
++        if rel_path not in coverage:
++            uncovered.append(rel_path)
++    return sorted(uncovered)
++
++
++def bundle_lines(repo_root: Path) -> list[str]:
++    manifest = load_manifest(repo_root)
++    lines = []
++    for entry in bundle_entries(manifest):
++        lines.append(f"{entry['id']}|{entry['patch']}")
++    return lines
++
++
++def verify_repo(repo_root: Path) -> tuple[list[str], list[str]]:
++    errors = validate_manifest(repo_root)
++    uncovered = find_uncovered_tracked_modifications(repo_root)
++    warnings: list[str] = []
++    if uncovered:
++        joined = "\n - ".join(uncovered)
++        warnings.append(
++            "Tracked modifications missing from every manifest-listed patch:\n - " + joined
++        )
++    return errors, warnings
++
++
++def verify_ahead_repo(repo_root: Path, base_ref: str = "upstream/main") -> tuple[list[str], list[str]]:
++    errors = validate_manifest(repo_root)
++    warnings: list[str] = []
++    if errors:
++        return errors, warnings
++
++    try:
++        uncovered = find_uncovered_ahead_modifications(repo_root, base_ref=base_ref)
++    except RuntimeError as exc:
++        return [str(exc)], warnings
++
++    if uncovered:
++        joined = "\n - ".join(uncovered)
++        warnings.append(
++            f"Ahead-of-{base_ref} modifications missing from every manifest-listed patch:\n - "
++            + joined
++        )
++    return errors, warnings
++
++
++def _print_lines(lines: Iterable[str], *, stream=sys.stdout) -> None:
++    for line in lines:
++        print(line, file=stream)
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description="Local Hermes customization manifest helpers")
++    parser.add_argument(
++        "--repo-root",
++        default=Path(__file__).resolve().parents[1],
++        type=Path,
++        help="Hermes repo root (default: parent of patches/)",
++    )
++    subparsers = parser.add_subparsers(dest="command", required=True)
++
++    subparsers.add_parser("bundle-lines", help="Print bundle entries as id|path lines")
++    resolve_base_ref_parser = subparsers.add_parser(
++        "resolve-base-ref",
++        help="Resolve the preferred git base ref, falling back only when it is unavailable",
++    )
++    resolve_base_ref_parser.add_argument(
++        "--prefer",
++        default="upstream/main",
++        help="Preferred git base ref (default: upstream/main)",
++    )
++    verify_parser = subparsers.add_parser("verify", help="Validate manifest and coverage")
++    verify_parser.add_argument(
++        "--strict",
++        action="store_true",
++        help="Exit non-zero if uncovered tracked modifications are found",
++    )
++    verify_ahead_parser = subparsers.add_parser(
++        "verify-ahead",
++        help="Validate that ahead-of-base local customizations are covered by the manifest",
++    )
++    verify_ahead_parser.add_argument(
++        "--base-ref",
++        default="upstream/main",
++        help="Git base ref to compare against (default: upstream/main)",
++    )
++
++    args = parser.parse_args(argv)
++    repo_root = Path(args.repo_root).resolve()
++
++    if args.command == "bundle-lines":
++        _print_lines(bundle_lines(repo_root))
++        return 0
++
++    if args.command == "resolve-base-ref":
++        try:
++            print(resolve_base_ref(repo_root, preferred=args.prefer))
++        except RuntimeError as exc:
++            print(str(exc), file=sys.stderr)
++            return 1
++        return 0
++
++    if args.command == "verify":
++        errors, warnings = verify_repo(repo_root)
++        if errors:
++            _print_lines(errors, stream=sys.stderr)
++        if warnings:
++            _print_lines(warnings, stream=sys.stderr)
++        if errors:
++            return 1
++        if warnings and args.strict:
++            return 1
++        return 0
++
++    if args.command == "verify-ahead":
++        errors, warnings = verify_ahead_repo(repo_root, base_ref=args.base_ref)
++        if errors:
++            _print_lines(errors, stream=sys.stderr)
++        if warnings:
++            _print_lines(warnings, stream=sys.stderr)
++        if errors or warnings:
++            return 1
++        return 0
++
++    parser.error(f"Unknown command: {args.command}")
++    return 2
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/patches/rehearse-upstream-update.sh b/patches/rehearse-upstream-update.sh
+new file mode 100755
+index 00000000..2e8176f1
+--- /dev/null
++++ b/patches/rehearse-upstream-update.sh
+@@ -0,0 +1,211 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$REPO_ROOT"
++
++KEEP_TEMP=0
++FETCH_REMOTE=1
++
++usage() {
++  cat <<'EOF'
++Usage: patches/rehearse-upstream-update.sh [--keep-temp] [--no-fetch]
++
++Verify the local customization bundle, then rehearse patch applicability
++against a clean clone of the configured upstream baseline.
++
++Options:
++  --keep-temp  Keep the temporary clean clone for inspection.
++  --no-fetch   Skip 'git fetch --all --prune' in the source repo.
++
++Environment:
++  HERMES_LOCAL_CUSTOMIZATION_TMPDIR  Parent directory for the temporary rehearsal clone
++                                    (defaults to $TMPDIR, then /tmp).
++EOF
++}
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --keep-temp)
++      KEEP_TEMP=1
++      shift
++      ;;
++    --no-fetch)
++      FETCH_REMOTE=0
++      shift
++      ;;
++    -h|--help)
++      usage
++      exit 0
++      ;;
++    *)
++      usage >&2
++      exit 2
++      ;;
++  esac
++done
++
++resolve_base_ref() {
++  if [[ -n "${HERMES_LOCAL_CUSTOMIZATION_BASE_REF:-}" ]]; then
++    printf '%s\n' "$HERMES_LOCAL_CUSTOMIZATION_BASE_REF"
++  else
++    python3 -m patches.local_customization_manifest --repo-root "$1" resolve-base-ref
++  fi
++}
++
++resolve_rehearsal_remote_url() {
++  if [[ -n "${HERMES_LOCAL_CUSTOMIZATION_UPSTREAM_URL:-}" ]]; then
++    printf '%s\n' "$HERMES_LOCAL_CUSTOMIZATION_UPSTREAM_URL"
++    return 0
++  fi
++
++  if [[ -f "$REPO_ROOT/metadata.json" ]]; then
++    local metadata_url
++    metadata_url="$(python3 - <<'PY' "$REPO_ROOT/metadata.json"
++import json
++import sys
++from pathlib import Path
++path = Path(sys.argv[1])
++try:
++    data = json.loads(path.read_text(encoding='utf-8'))
++except Exception:
++    print('', end='')
++    raise SystemExit(0)
++print(str(data.get('upstream_remote') or ''), end='')
++PY
++)"
++    if [[ -n "$metadata_url" ]]; then
++      printf '%s\n' "$metadata_url"
++      return 0
++    fi
++  fi
++
++  git remote get-url "$SOURCE_REMOTE"
++}
++
++patch_state_in_repo() {
++  local repo_root="$1"
++  local patch_file="$2"
++
++  if git -C "$repo_root" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
++    printf 'already-applied'
++  elif git -C "$repo_root" apply --check "$patch_file" >/dev/null 2>&1; then
++    printf 'applicable'
++  elif git -C "$repo_root" apply --check --3way "$patch_file" >/dev/null 2>&1; then
++    printf 'applicable'
++  else
++    printf 'conflict'
++  fi
++}
++
++SOURCE_BASE_REF="$(resolve_base_ref "$REPO_ROOT")"
++if [[ "$SOURCE_BASE_REF" != */* ]]; then
++  echo "Expected a remote-tracking base ref such as upstream/main or origin/main; got: $SOURCE_BASE_REF" >&2
++  exit 2
++fi
++SOURCE_REMOTE="${SOURCE_BASE_REF%%/*}"
++SOURCE_BRANCH="${SOURCE_BASE_REF#*/}"
++REMOTE_URL="$(resolve_rehearsal_remote_url)"
++OVERLAY_EXPORT_REPO=0
++if [[ -f "$REPO_ROOT/metadata.json" ]]; then
++  OVERLAY_EXPORT_REPO=1
++fi
++
++if (( FETCH_REMOTE == 1 )); then
++  git fetch --all --prune
++fi
++
++resolve_temp_root() {
++  if [[ -n "${HERMES_LOCAL_CUSTOMIZATION_TMPDIR:-}" ]]; then
++    printf '%s\n' "$HERMES_LOCAL_CUSTOMIZATION_TMPDIR"
++  elif [[ -n "${TMPDIR:-}" ]]; then
++    printf '%s\n' "$TMPDIR"
++  else
++    printf '/tmp\n'
++  fi
++}
++
++REHEARSAL_TMP_ROOT="$(resolve_temp_root)"
++mkdir -p "$REHEARSAL_TMP_ROOT"
++REHEARSAL_TMPDIR="$(mktemp -d "$REHEARSAL_TMP_ROOT/hermes-upstream-rehearsal.XXXXXX")"
++CLEAN_REPO="$REHEARSAL_TMPDIR/upstream"
++cleanup() {
++  if (( KEEP_TEMP == 0 )); then
++    rm -rf "$REHEARSAL_TMPDIR"
++  fi
++}
++trap cleanup EXIT
++
++echo "Hermes local customization upstream rehearsal"
++echo " - source repo: $REPO_ROOT"
++echo " - source base ref: $SOURCE_BASE_REF"
++echo " - rehearsal remote URL: $REMOTE_URL"
++echo " - temp clone: $CLEAN_REPO"
++echo
++
++echo "Verifying local customization governance in source repo..."
++if (( OVERLAY_EXPORT_REPO == 1 )); then
++  echo "Detected sanitized overlay export; skipping source-repo strict/ahead gates."
++else
++  python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" verify --strict
++  python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" verify-ahead --base-ref "$SOURCE_BASE_REF"
++fi
++
++echo
++echo "Cloning clean upstream baseline..."
++git clone --quiet --origin origin --branch "$SOURCE_BRANCH" --single-branch "$REMOTE_URL" "$CLEAN_REPO"
++CLEAN_BASE_REF="$(python3 -m patches.local_customization_manifest --repo-root "$CLEAN_REPO" resolve-base-ref --prefer "origin/$SOURCE_BRANCH")"
++
++echo "Resolved clean-clone base ref: $CLEAN_BASE_REF"
++echo
++echo "Patch applicability against clean upstream:"
++
++already_applied_count=0
++applicable_count=0
++conflict_count=0
++conflicts=()
++
++while IFS='|' read -r patch_id patch_rel; do
++  patch_file="$REPO_ROOT/$patch_rel"
++  state="$(patch_state_in_repo "$CLEAN_REPO" "$patch_file")"
++  printf ' - %-32s %s\n' "$patch_id" "$state"
++
++  case "$state" in
++    already-applied)
++      already_applied_count=$((already_applied_count + 1))
++      ;;
++    applicable)
++      applicable_count=$((applicable_count + 1))
++      ;;
++    conflict)
++      conflict_count=$((conflict_count + 1))
++      conflicts+=("$patch_id:$patch_rel")
++      git -C "$CLEAN_REPO" apply --check --verbose "$patch_file" 2>&1 \
++        | grep -E '^(Checking patch|error:)' \
++        | sed 's/^/     /' || true
++      ;;
++  esac
++done < <(python3 -m patches.local_customization_manifest --repo-root "$REPO_ROOT" bundle-lines)
++
++echo
++echo "Summary:"
++echo " - already-applied: $already_applied_count"
++echo " - applicable:      $applicable_count"
++echo " - conflict:        $conflict_count"
++
++if (( conflict_count > 0 )); then
++  echo
++  echo "Conflicting patch artifacts need refresh before an upstream update:" >&2
++  printf ' - %s\n' "${conflicts[@]}" >&2
++  if (( KEEP_TEMP == 1 )); then
++    echo "Temporary clone preserved at: $CLEAN_REPO" >&2
++  fi
++  exit 1
++fi
++
++echo
++if (( KEEP_TEMP == 1 )); then
++  echo "Rehearsal completed successfully. Temporary clone preserved at: $CLEAN_REPO"
++else
++  echo "Rehearsal completed successfully."
++fi
+diff --git a/tests/patches/test_local_customization_manifest.py b/tests/patches/test_local_customization_manifest.py
+new file mode 100644
+index 00000000..8c8f1a9d
+--- /dev/null
++++ b/tests/patches/test_local_customization_manifest.py
+@@ -0,0 +1,366 @@
++from __future__ import annotations
++
++import subprocess
++import sys
++from pathlib import Path
++
++from patches.local_customization_manifest import (
++    bundle_entries,
++    find_uncovered_ahead_modifications,
++    find_uncovered_tracked_modifications,
++    load_manifest,
++    resolve_base_ref,
++    validate_manifest,
++)
++
++
++def _init_git_repo(repo_root: Path) -> None:
++    subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True, text=True)
++    subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=repo_root, check=True)
++    subprocess.run(["git", "config", "user.name", "Hermes Tests"], cwd=repo_root, check=True)
++
++
++def _commit_all(repo_root: Path, message: str) -> None:
++    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
++    subprocess.run(["git", "commit", "-m", message], cwd=repo_root, check=True, capture_output=True, text=True)
++
++
++def _set_remote_ref(repo_root: Path, ref: str) -> None:
++    subprocess.run(["git", "update-ref", ref, "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True)
++
++
++def test_bundle_entries_follow_manifest_order(tmp_path: Path) -> None:
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: first
++    patch: patches/first.patch
++    purpose: first patch
++  - id: second
++    patch: patches/second.patch
++    purpose: second patch
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++
++    manifest = load_manifest(tmp_path)
++
++    entries = bundle_entries(manifest)
++    assert [entry["id"] for entry in entries] == ["first", "second"]
++    assert [entry["patch"] for entry in entries] == [
++        "patches/first.patch",
++        "patches/second.patch",
++    ]
++
++
++def test_validate_manifest_reports_missing_patch_file(tmp_path: Path) -> None:
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: missing
++    patch: patches/missing.patch
++    purpose: missing patch file
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++
++    errors = validate_manifest(tmp_path)
++
++    assert any("patches/missing.patch" in error for error in errors)
++
++
++def test_resolve_base_ref_prefers_upstream_main_when_available(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
++    _commit_all(tmp_path, "initial")
++    _set_remote_ref(tmp_path, "refs/remotes/origin/main")
++    _set_remote_ref(tmp_path, "refs/remotes/upstream/main")
++
++    assert resolve_base_ref(tmp_path) == "upstream/main"
++
++
++def test_resolve_base_ref_falls_back_to_origin_main_when_upstream_missing(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
++    _commit_all(tmp_path, "initial")
++    _set_remote_ref(tmp_path, "refs/remotes/origin/main")
++
++    assert resolve_base_ref(tmp_path) == "origin/main"
++
++
++def test_resolve_base_ref_cli_reports_origin_fallback(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
++    _commit_all(tmp_path, "initial")
++    _set_remote_ref(tmp_path, "refs/remotes/origin/main")
++
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-m",
++            "patches.local_customization_manifest",
++            "--repo-root",
++            str(tmp_path),
++            "resolve-base-ref",
++        ],
++        cwd=Path(__file__).resolve().parents[2],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++
++    assert result.returncode == 0
++    assert result.stdout.strip() == "origin/main"
++
++
++def test_uncovered_tracked_modifications_ignore_patch_bundle_artifacts_and_report_real_gaps(
++    tmp_path: Path,
++) -> None:
++    _init_git_repo(tmp_path)
++
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (tmp_path / "covered.py").write_text("print('covered')\n", encoding="utf-8")
++    (tmp_path / "uncovered.py").write_text("print('uncovered')\n", encoding="utf-8")
++    (patches_dir / "covered.patch").write_text(
++        """
++diff --git a/covered.py b/covered.py
++--- a/covered.py
+++++ b/covered.py
++@@ -1 +1 @@
++-print('covered')
+++print('covered v2')
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: covered
++    patch: patches/covered.patch
++    purpose: covers covered.py
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++
++    subprocess.run(["git", "add", "covered.py", "uncovered.py"], cwd=tmp_path, check=True)
++    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True)
++
++    (tmp_path / "covered.py").write_text("print('covered local change')\n", encoding="utf-8")
++    (tmp_path / "uncovered.py").write_text("print('uncovered local change')\n", encoding="utf-8")
++    (patches_dir / "docs-only.patch").write_text(
++        """
++diff --git a/docs.md b/docs.md
++--- a/docs.md
+++++ b/docs.md
++@@ -0,0 +1 @@
+++notes
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: covered
++    patch: patches/covered.patch
++    purpose: covers covered.py
++  - id: docs-only
++    patch: patches/docs-only.patch
++    purpose: exercise patch artifacts being ignored
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++
++    uncovered = find_uncovered_tracked_modifications(tmp_path)
++
++    assert uncovered == ["uncovered.py"]
++
++
++def test_patch_helper_code_is_not_treated_as_ignored_patch_artifact(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (patches_dir / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
++
++    subprocess.run(["git", "add", "patches/helper.py"], cwd=tmp_path, check=True)
++    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True)
++
++    (patches_dir / "helper.py").write_text("VALUE = 2\n", encoding="utf-8")
++
++    uncovered = find_uncovered_tracked_modifications(tmp_path)
++
++    assert uncovered == ["patches/helper.py"]
++
++
++def test_unlisted_top_level_patch_does_not_count_toward_coverage(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (tmp_path / "covered.py").write_text("print('covered')\n", encoding="utf-8")
++    (tmp_path / "uncovered.py").write_text("print('uncovered')\n", encoding="utf-8")
++    (patches_dir / "covered.patch").write_text(
++        """
++diff --git a/covered.py b/covered.py
++--- a/covered.py
+++++ b/covered.py
++@@ -1 +1 @@
++-print('covered')
+++print('covered v2')
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++    (patches_dir / "stray.patch").write_text(
++        """
++diff --git a/uncovered.py b/uncovered.py
++--- a/uncovered.py
+++++ b/uncovered.py
++@@ -1 +1 @@
++-print('uncovered')
+++print('stray patch should not count')
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: covered
++    patch: patches/covered.patch
++    purpose: covers covered.py
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++
++    subprocess.run(["git", "add", "covered.py", "uncovered.py"], cwd=tmp_path, check=True)
++    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True, text=True)
++
++    (tmp_path / "covered.py").write_text("print('covered local change')\n", encoding="utf-8")
++    (tmp_path / "uncovered.py").write_text("print('uncovered local change')\n", encoding="utf-8")
++
++    uncovered = find_uncovered_tracked_modifications(tmp_path)
++
++    assert uncovered == ["uncovered.py"]
++
++
++def test_find_uncovered_ahead_modifications_reports_local_only_gaps(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (tmp_path / "covered.py").write_text("print('covered')\n", encoding="utf-8")
++    (tmp_path / "uncovered.py").write_text("print('uncovered')\n", encoding="utf-8")
++    (patches_dir / "covered.patch").write_text(
++        """
++diff --git a/covered.py b/covered.py
++--- a/covered.py
+++++ b/covered.py
++@@ -1 +1 @@
++-print('covered')
+++print('covered v2')
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: covered
++    patch: patches/covered.patch
++    purpose: covers covered.py
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++
++    _commit_all(tmp_path, "initial")
++    subprocess.run(["git", "branch", "-M", "main"], cwd=tmp_path, check=True)
++    subprocess.run(["git", "checkout", "-b", "local/customizations"], cwd=tmp_path, check=True, capture_output=True, text=True)
++
++    (tmp_path / "covered.py").write_text("print('covered local change')\n", encoding="utf-8")
++    (tmp_path / "uncovered.py").write_text("print('uncovered local change')\n", encoding="utf-8")
++    (patches_dir / "scratch.patch").write_text("scratch\n", encoding="utf-8")
++    _commit_all(tmp_path, "local customizations")
++
++    uncovered = find_uncovered_ahead_modifications(tmp_path, base_ref="main")
++
++    assert uncovered == ["uncovered.py"]
++
++
++def test_verify_ahead_cli_exits_nonzero_when_local_ahead_changes_are_uncovered(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (tmp_path / "covered.py").write_text("print('covered')\n", encoding="utf-8")
++    (tmp_path / "uncovered.py").write_text("print('uncovered')\n", encoding="utf-8")
++    (patches_dir / "covered.patch").write_text(
++        """
++diff --git a/covered.py b/covered.py
++--- a/covered.py
+++++ b/covered.py
++@@ -1 +1 @@
++-print('covered')
+++print('covered v2')
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: covered
++    patch: patches/covered.patch
++    purpose: covers covered.py
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++
++    _commit_all(tmp_path, "initial")
++    subprocess.run(["git", "branch", "-M", "main"], cwd=tmp_path, check=True)
++    subprocess.run(["git", "checkout", "-b", "local/customizations"], cwd=tmp_path, check=True, capture_output=True, text=True)
++
++    (tmp_path / "covered.py").write_text("print('covered local change')\n", encoding="utf-8")
++    (tmp_path / "uncovered.py").write_text("print('uncovered local change')\n", encoding="utf-8")
++    _commit_all(tmp_path, "local customizations")
++
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-m",
++            "patches.local_customization_manifest",
++            "--repo-root",
++            str(tmp_path),
++            "verify-ahead",
++            "--base-ref",
++            "main",
++        ],
++        cwd=Path(__file__).resolve().parents[2],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++
++    assert result.returncode == 1
++    assert "uncovered.py" in result.stderr
+diff --git a/AGENTS.md b/AGENTS.md
+index 8bd979b0..ba030442 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -2,6 +2,26 @@
+
+ Instructions for AI coding assistants and developers working on the hermes-agent codebase.
+
++## Naranja Live Runtime Verification Gate
++
++For any task that changes Hermes itself on Naranja — source files, patch files, wrapper scripts, runtime behavior, CLI/status-bar/TUI/gateway behavior, themes/skins, scripts, or other customizations expected to affect `hermes chat` — do not stop at repository tests or patch application. Verify the actual live command path before claiming completion.
++
++The live command is `/root/.local/bin/hermes`. The current live runtime source is `/root/.hermes/releases/hermes-agent-custom-20260418_115717-rebuild`. The main maintenance checkout `/root/.hermes/hermes-agent` may not be the code imported by the live command, so passing tests or changing files only in that checkout is not sufficient proof that the user-visible runtime changed.
++
++Before declaring any Hermes modification/customization complete, run the full Naranja live verifier:
++
++```bash
++/root/.local/bin/hermes-verify-live-runtime --full
++```
++
++Equivalent direct invocation:
++
++```bash
++/root/.hermes/scripts/verify-live-hermes-runtime.sh --full
++```
++
++No-argument invocation also defaults to full mode. `--quick` is a fast investigation preflight only and is **not** a completion gate. If the full verifier fails, fix the root cause and re-run it, or explicitly report the failure; do not claim the Hermes change is live or complete.
++
+ ## Development Environment
+
+ ```bash

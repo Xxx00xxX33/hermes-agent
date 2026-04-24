@@ -1,0 +1,1358 @@
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index dfb6b721..f59ebc70 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -554,6 +554,7 @@ DEFAULT_CONFIG = {
+         "compact": False,
+         "personality": "kawaii",
+         "resume_display": "full",
++        "resume_history_exchanges": 20,
+         "busy_input_mode": "interrupt",
+         "bell_on_complete": False,
+         "show_reasoning": False,
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 0afadac3..5f59f587 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -44,10 +44,12 @@ Usage:
+ """
+
+ import argparse
++import json
+ import os
+ import shutil
+ import subprocess
+ import sys
++import textwrap
+ from pathlib import Path
+ from typing import Optional
+
+@@ -317,55 +319,237 @@ def _has_any_provider_configured() -> bool:
+     return False
+
+
+-def _session_browse_picker(sessions: list) -> Optional[str]:
++def _normalize_session_path(path: str) -> str:
++    """Normalize a session cwd for matching/sorting."""
++    if not path:
++        return ""
++    try:
++        normalized = os.path.expanduser(str(path).strip())
++        normalized = os.path.abspath(normalized)
++        normalized = os.path.realpath(normalized)
++        normalized = os.path.normpath(normalized)
++        normalized = os.path.normcase(normalized)
++        return normalized
++    except Exception:
++        return str(path).strip().lower()
++
++
++def _session_model_config(session: dict) -> dict:
++    """Return a session's model_config as a dict, parsing JSON strings if needed."""
++    raw = session.get("model_config")
++    if isinstance(raw, dict):
++        return raw
++    if isinstance(raw, str) and raw.strip():
++        try:
++            parsed = json.loads(raw)
++            if isinstance(parsed, dict):
++                return parsed
++        except Exception:
++            return {}
++    return {}
++
++
++def _session_cwd(session: dict) -> str:
++    """Extract the stored cwd for a session, if available."""
++    model_config = _session_model_config(session)
++    cwd = model_config.get("cwd") or session.get("cwd") or ""
++    return str(cwd).strip()
++
++
++def _session_cwd_score(session: dict, current_cwd: str = "") -> int:
++    """Score how closely a session matches the current working directory."""
++    session_cwd = _normalize_session_path(_session_cwd(session))
++    current_cwd = _normalize_session_path(current_cwd)
++    if not session_cwd or not current_cwd:
++        return 0
++    if session_cwd == current_cwd:
++        return 3000
++
++    sep = os.sep
++    if current_cwd.startswith(session_cwd + sep) or session_cwd.startswith(current_cwd + sep):
++        return 2200
++
++    session_base = os.path.basename(session_cwd)
++    current_base = os.path.basename(current_cwd)
++    if session_base and current_base and session_base == current_base:
++        return 900
++
++    return 0
++
++
++def _session_search_blob(session: dict) -> str:
++    """Build a lowercase search blob for fuzzy filtering/ranking."""
++    return " ".join([
++        (session.get("title") or "").strip().lower(),
++        (session.get("preview") or "").strip().lower(),
++        (session.get("id") or "").strip().lower(),
++        (session.get("source") or "").strip().lower(),
++        _session_cwd(session).lower(),
++    ]).strip()
++
++
++def _session_text_score(session: dict, query: str = "") -> int:
++    """Score a session against the live search query."""
++    q = " ".join((query or "").lower().split())
++    if not q:
++        return 0
++
++    title = (session.get("title") or "").strip().lower()
++    preview = (session.get("preview") or "").strip().lower()
++    sid = (session.get("id") or "").strip().lower()
++    source = (session.get("source") or "").strip().lower()
++    blob = _session_search_blob(session)
++    terms = [term for term in q.split() if term]
++
++    score = 0
++    if title == q:
++        score += 7000
++    elif title.startswith(q):
++        score += 5500
++    elif q in title:
++        score += 4200
++
++    if q in preview:
++        score += 2200
++    if q in sid:
++        score += 1600
++    if q in source:
++        score += 600
++    if q in _session_cwd(session).lower():
++        score += 1200
++
++    if terms:
++        if title and all(term in title for term in terms):
++            score += 1400
++        if all(term in blob for term in terms):
++            score += 900
++        score += 250 * sum(1 for term in terms if term in title)
++        score += 100 * sum(1 for term in terms if term in preview)
++        score += 80 * sum(1 for term in terms if term in sid)
++        score += 40 * sum(1 for term in terms if term in source)
++        score += 80 * sum(1 for term in terms if term in _session_cwd(session).lower())
++
++    return score
++
++
++def _session_sort_key(session: dict, query: str = "", current_cwd: str = "") -> tuple:
++    """Sort key for /resume browsing.
++
++    Empty-query browsing should feel like a true "recent sessions" list, so it
++    sorts purely by recency. When a query is present, prefer textual relevance,
++    then cwd affinity, then recency.
++    """
++    q = " ".join((query or "").split())
++    if not q:
++        return (
++            -(session.get("last_active") or 0),
++            -(session.get("started_at") or 0),
++            session.get("id") or "",
++        )
++
++    text_score = _session_text_score(session, q)
++    cwd_score = _session_cwd_score(session, current_cwd)
++    total = text_score + cwd_score
++    return (
++        -total,
++        -text_score,
++        -cwd_score,
++        -(session.get("last_active") or 0),
++        -(session.get("started_at") or 0),
++        session.get("id") or "",
++    )
++
++
++
++def _session_browse_picker(
++    sessions: list,
++    initial_query: str = "",
++    current_cwd: str = "",
++) -> Optional[str]:
+     """Interactive curses-based session browser with live search filtering.
+
+     Returns the selected session ID, or None if cancelled.
+     Uses curses (not simple_term_menu) to avoid the ghost-duplication rendering
+     bug in tmux/iTerm when arrow keys are used.
++
++    ``initial_query`` pre-seeds the live filter so callers like ``/resume foo``
++    can jump straight into a narrowed session list. ``current_cwd`` lets the
++    picker rank sessions from the current project ahead of unrelated work.
+     """
+     if not sessions:
+         print("No sessions found.")
+         return None
+
++    initial_query = (initial_query or "").strip()
++    current_cwd = (current_cwd or os.getenv("TERMINAL_CWD") or os.getcwd() or "").strip()
++
++    def _combined_session_label(s: dict) -> str:
++        title = (s.get("title") or "").strip()
++        preview = (s.get("preview") or "").strip()
++        sid = s.get("id", "")
++        if title and preview:
++            return f"{title} — {preview}"
++        if title:
++            return title
++        if preview:
++            return preview
++        return sid
++
++    def _query_terms(query: str) -> list[str]:
++        return [term for term in query.lower().split() if term]
++
++    def _format_row(s, max_x):
++        """Format a session row for display."""
++        source = s.get("source", "")[:6]
++        last_active = _relative_time(s.get("last_active"))
++        sid = s["id"][:18]
++
++        # Adaptive column widths based on terminal width
++        # Layout: [arrow 3] [title/preview flexible] [active 12] [src 6] [id 18]
++        fixed_cols = 3 + 12 + 6 + 18 + 6  # arrow + active + src + id + padding
++        name_width = max(20, max_x - fixed_cols)
++        name = _combined_session_label(s)[:name_width]
++
++        return f"{name:<{name_width}}  {last_active:<10}  {source:<5} {sid}"
++
++    def _match(s, query):
++        """Check if a session matches the search query (case-insensitive)."""
++        q = " ".join((query or "").lower().split())
++        if not q:
++            return True
++        haystack = _session_search_blob(s)
++        if q in haystack:
++            return True
++        terms = _query_terms(q)
++        return bool(terms) and all(term in haystack for term in terms)
++
++    def _apply_filter(query: str):
++        matched = [s for s in sessions if _match(s, query)]
++        return sorted(matched, key=lambda s: _session_sort_key(s, query, current_cwd))
++
++    def _detail_lines(s: dict, width: int) -> list[str]:
++        width = max(20, width)
++        preview = (s.get("preview") or "").strip() or "(no preview)"
++        title = (s.get("title") or "").strip() or "(untitled)"
++        session_cwd = _session_cwd(s) or "(unknown cwd)"
++        meta = (
++            f"id: {s.get('id', '')}   "
++            f"active: {_relative_time(s.get('last_active'))}   "
++            f"source: {(s.get('source') or 'unknown')}"
++        )
++        lines = [f"Title: {title}", f"CWD: {session_cwd}", meta, "Preview:"]
++        wrapped = textwrap.wrap(preview, width=width) or ["(no preview)"]
++        lines.extend(wrapped[:4])
++        if len(wrapped) > 4:
++            lines[-1] = lines[-1][: max(0, width - 4)] + "..."
++        return lines
++
+     # Try curses-based picker first
+     try:
+         import curses
+
+         result_holder = [None]
+
+-        def _format_row(s, max_x):
+-            """Format a session row for display."""
+-            title = (s.get("title") or "").strip()
+-            preview = (s.get("preview") or "").strip()
+-            source = s.get("source", "")[:6]
+-            last_active = _relative_time(s.get("last_active"))
+-            sid = s["id"][:18]
+-
+-            # Adaptive column widths based on terminal width
+-            # Layout: [arrow 3] [title/preview flexible] [active 12] [src 6] [id 18]
+-            fixed_cols = 3 + 12 + 6 + 18 + 6  # arrow + active + src + id + padding
+-            name_width = max(20, max_x - fixed_cols)
+-
+-            if title:
+-                name = title[:name_width]
+-            elif preview:
+-                name = preview[:name_width]
+-            else:
+-                name = sid
+-
+-            return f"{name:<{name_width}}  {last_active:<10}  {source:<5} {sid}"
+-
+-        def _match(s, query):
+-            """Check if a session matches the search query (case-insensitive)."""
+-            q = query.lower()
+-            return (
+-                q in (s.get("title") or "").lower()
+-                or q in (s.get("preview") or "").lower()
+-                or q in s.get("id", "").lower()
+-                or q in (s.get("source") or "").lower()
+-            )
+-
+         def _curses_browse(stdscr):
+             curses.curs_set(0)
+             if curses.has_colors():
+@@ -378,8 +562,8 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+
+             cursor = 0
+             scroll_offset = 0
+-            search_text = ""
+-            filtered = list(sessions)
++            search_text = initial_query
++            filtered = _apply_filter(search_text)
+
+             while True:
+                 stdscr.clear()
+@@ -422,11 +606,15 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+                 except curses.error:
+                     pass
+
+-                # Compute visible area
+-                visible_rows = max_y - 4  # header + col header + blank + footer
++                # Compute visible area (leave room for preview pane + footer)
++                detail_height = 7
++                footer_height = 1
++                visible_rows = max_y - (3 + detail_height + footer_height)
+                 if visible_rows < 1:
+                     visible_rows = 1
+
++                detail_start_y = min(max_y - (detail_height + footer_height), 3 + visible_rows)
++
+                 # Clamp cursor and scroll
+                 if not filtered:
+                     try:
+@@ -451,7 +639,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+                         )
+                     ):
+                         y = draw_i + 3
+-                        if y >= max_y - 1:
++                        if y >= detail_start_y:
+                             break
+                         s = filtered[i]
+                         arrow = " → " if i == cursor else "   "
+@@ -466,6 +654,22 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+                         except curses.error:
+                             pass
+
++                    # Detail preview for the highlighted session.
++                    detail_attr = curses.color_pair(4) if curses.has_colors() else curses.A_DIM
++                    hline_char = getattr(curses, "ACS_HLINE", ord("-"))
++                    try:
++                        stdscr.hline(detail_start_y, 0, hline_char, max_x - 1)
++                    except curses.error:
++                        pass
++                    for idx, line in enumerate(_detail_lines(filtered[cursor], max_x - 4)):
++                        y = detail_start_y + 1 + idx
++                        if y >= max_y - footer_height:
++                            break
++                        try:
++                            stdscr.addnstr(y, 2, line, max_x - 3, detail_attr)
++                        except curses.error:
++                            pass
++
+                 # Footer
+                 footer_y = max_y - 1
+                 if filtered:
+@@ -502,7 +706,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+                     if search_text:
+                         # First Esc clears the search
+                         search_text = ""
+-                        filtered = list(sessions)
++                        filtered = _apply_filter(search_text)
+                         cursor = 0
+                         scroll_offset = 0
+                     else:
+@@ -511,10 +715,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+                 elif key in (curses.KEY_BACKSPACE, 127, 8):
+                     if search_text:
+                         search_text = search_text[:-1]
+-                        if search_text:
+-                            filtered = [s for s in sessions if _match(s, search_text)]
+-                        else:
+-                            filtered = list(sessions)
++                        filtered = _apply_filter(search_text)
+                         cursor = 0
+                         scroll_offset = 0
+                 elif key == ord("q") and not search_text:
+@@ -522,7 +723,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+                 elif 32 <= key <= 126:
+                     # Printable character → add to search filter
+                     search_text += chr(key)
+-                    filtered = [s for s in sessions if _match(s, search_text)]
++                    filtered = _apply_filter(search_text)
+                     cursor = 0
+                     scroll_offset = 0
+
+@@ -533,11 +734,17 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+         pass
+
+     # Fallback: numbered list (Windows without curses, etc.)
+-    print("\n  Browse sessions  (enter number to resume, q to cancel)\n")
+-    for i, s in enumerate(sessions):
+-        title = (s.get("title") or "").strip()
+-        preview = (s.get("preview") or "").strip()
+-        label = title or preview or s["id"]
++    filtered_sessions = _apply_filter(initial_query)
++    if not filtered_sessions:
++        print(f"\n  No sessions match: {initial_query}\n")
++        return None
++
++    print("\n  Browse sessions  (enter number to resume, q to cancel)")
++    if initial_query:
++        print(f"  Filter: {initial_query}")
++    print()
++    for i, s in enumerate(filtered_sessions):
++        label = _combined_session_label(s)
+         if len(label) > 50:
+             label = label[:47] + "..."
+         last_active = _relative_time(s.get("last_active"))
+@@ -546,13 +753,13 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
+
+     while True:
+         try:
+-            val = input(f"\n  Select [1-{len(sessions)}]: ").strip()
++            val = input(f"\n  Select [1-{len(filtered_sessions)}]: ").strip()
+             if not val or val.lower() in ("q", "quit", "exit"):
+                 return None
+             idx = int(val) - 1
+-            if 0 <= idx < len(sessions):
+-                return sessions[idx]["id"]
+-            print(f"  Invalid selection. Enter 1-{len(sessions)} or q to cancel.")
++            if 0 <= idx < len(filtered_sessions):
++                return filtered_sessions[idx]["id"]
++            print(f"  Invalid selection. Enter 1-{len(filtered_sessions)} or q to cancel.")
+         except ValueError:
+             print("  Invalid input. Enter a number or q to cancel.")
+         except (KeyboardInterrupt, EOFError):
+@@ -688,27 +895,83 @@ def _exec_in_container(container_info: dict, cli_args: list):
+
+
+ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
+-    """Resolve a session name (title) or ID to a session ID.
++    """Resolve a session query to a session ID.
++
++    Resolution order:
++    - exact session ID
++    - unique session ID prefix
++    - exact title / lineage title resolution
++    - unique fuzzy match across recent CLI sessions (title or preview)
+
+-    - If it looks like a session ID (contains underscore + hex), try direct lookup first.
+-    - Otherwise, treat it as a title and use resolve_session_by_title (auto-latest).
+-    - Falls back to the other method if the first doesn't match.
++    Ambiguous fuzzy matches intentionally return ``None`` so interactive callers
++    can open the session picker instead of guessing wrong.
+     """
+     try:
+         from hermes_state import SessionDB
+
+         db = SessionDB()
+
+-        # Try as exact session ID first
+-        session = db.get_session(name_or_id)
+-        if session:
++        query = (name_or_id or "").strip()
++        if not query:
+             db.close()
+-            return session["id"]
++            return None
++
++        # Try as exact session ID first, then as a unique ID prefix.
++        resolved_id = db.resolve_session_id(query)
++        if resolved_id:
++            db.close()
++            return resolved_id
+
+         # Try as title (with auto-latest for lineage)
+-        session_id = db.resolve_session_by_title(name_or_id)
++        session_id = db.resolve_session_by_title(query)
++        if session_id:
++            db.close()
++            return session_id
++
++        # Fuzzy fallback for shell ergonomics: accept a unique recent title or
++        # preview match, but never guess if multiple sessions match.
++        sessions = db.list_sessions_rich(source="cli", exclude_sources=["tool"], limit=200)
++        q = " ".join(query.lower().split())
++        terms = [term for term in q.split() if term]
++
++        def _title(session: dict) -> str:
++            return (session.get("title") or "").strip().lower()
++
++        def _preview(session: dict) -> str:
++            return (session.get("preview") or "").strip().lower()
++
++        def _blob(session: dict) -> str:
++            return " ".join([
++                _title(session),
++                _preview(session),
++                (session.get("id") or "").strip().lower(),
++                (session.get("source") or "").strip().lower(),
++            ]).strip()
++
++        ranked_groups = [
++            [s for s in sessions if _title(s) == q],
++            [s for s in sessions if _title(s).startswith(q)],
++            [s for s in sessions if q in _title(s)],
++            [s for s in sessions if q in _preview(s)],
++            [s for s in sessions if terms and all(term in _title(s) for term in terms)],
++            [s for s in sessions if terms and all(term in _blob(s) for term in terms)],
++        ]
++        for matches in ranked_groups:
++            unique = []
++            seen_ids = set()
++            for session in matches:
++                sid = session.get("id")
++                if sid and sid not in seen_ids:
++                    unique.append(session)
++                    seen_ids.add(sid)
++            if len(unique) == 1:
++                db.close()
++                return unique[0]["id"]
++            if len(unique) > 1:
++                db.close()
++                return None
++
+         db.close()
+-        return session_id
+     except Exception:
+         pass
+     return None
+diff --git a/hermes_state.py b/hermes_state.py
+index af97f7fb..e5ba82e0 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -409,6 +409,22 @@ class SessionDB:
+             )
+         self._execute_write(_do)
+
++    def update_session_model_config(
++        self,
++        session_id: str,
++        model_config: Optional[Dict[str, Any]],
++        model: str = None,
++    ) -> None:
++        """Replace a session's stored model_config JSON, optionally backfilling model."""
++
++        def _do(conn):
++            conn.execute(
++                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
++                (json.dumps(model_config) if model_config is not None else None, model, session_id),
++            )
++
++        self._execute_write(_do)
++
+     def update_token_counts(
+         self,
+         session_id: str,
+@@ -556,6 +572,70 @@ class SessionDB:
+             return matches[0]
+         return None
+
++    def resolve_latest_descendant_session(
++        self,
++        session_id: str,
++        *,
++        require_messages: bool = True,
++    ) -> Optional[str]:
++        """Return the newest descendant (including itself) in a session lineage.
++
++        Hermes can split sessions during context compression by creating a new
++        session with ``parent_session_id`` pointing to the previous session.
++
++        The CLI session browser often lists only root sessions
++        (parent_session_id is NULL). If the first real content happened after a
++        compression split, that root session can legitimately have zero messages.
++        Resuming it should land on the latest continuation that actually has
++        messages, otherwise the user sees "no messages, starting fresh".
++
++        Args:
++            session_id: The session ID the user selected.
++            require_messages: If True, only consider sessions that have at least
++                one row in the messages table.
++
++        Returns:
++            The selected session ID (possibly the same as input), or None if the
++            input ID doesn't exist.
++        """
++        if not session_id:
++            return None
++
++        if not self.get_session(session_id):
++            return None
++
++        msg_filter = ""
++        if require_messages:
++            msg_filter = (
++                "AND EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id LIMIT 1)"
++            )
++
++        sql = f"""
++            WITH RECURSIVE lineage(id) AS (
++                SELECT id FROM sessions WHERE id = ?
++                UNION ALL
++                SELECT s2.id FROM sessions s2
++                    JOIN lineage l ON s2.parent_session_id = l.id
++            )
++            SELECT s.id
++            FROM lineage l
++            JOIN sessions s ON s.id = l.id
++            WHERE 1=1
++            {msg_filter}
++            ORDER BY s.started_at DESC
++            LIMIT 1
++        """
++
++        with self._lock:
++            cursor = self._conn.execute(sql, (session_id,))
++            row = cursor.fetchone()
++        if row:
++            return row["id"]
++
++        # No descendant has messages. Fall back to the original ID so callers
++        # can resume the empty session (useful for metadata-only sessions).
++        return session_id
++
+     # Maximum length for session titles
+     MAX_TITLE_LENGTH = 100
+
+diff --git a/tests/cli/test_resume_display.py b/tests/cli/test_resume_display.py
+index d183e48b..8050b56c 100644
+--- a/tests/cli/test_resume_display.py
++++ b/tests/cli/test_resume_display.py
+@@ -26,7 +26,12 @@ def _make_cli(config_overrides=None, env_overrides=None, **kwargs):
+             "base_url": "https://openrouter.ai/api/v1",
+             "provider": "auto",
+         },
+-        "display": {"compact": False, "tool_progress": "all", "resume_display": "full"},
++        "display": {
++            "compact": False,
++            "tool_progress": "all",
++            "resume_display": "full",
++            "resume_history_exchanges": 20,
++        },
+         "agent": {},
+         "terminal": {"env_type": "local"},
+     }
+@@ -89,6 +94,124 @@ def _tool_call_history():
+     ]
+
+
++def _tool_heavy_turn_history():
++    """A single user turn that triggers many assistant tool-only messages before a final answer."""
++    return [
++        {"role": "system", "content": "system prompt"},
++        {"role": "user", "content": "Please debug why /resume is noisy"},
++        {
++            "role": "assistant",
++            "content": None,
++            "tool_calls": [
++                {
++                    "id": "call_1",
++                    "type": "function",
++                    "function": {"name": "read_file", "arguments": '{"path":"cli.py"}'},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "call_1", "content": "file content"},
++        {
++            "role": "assistant",
++            "content": None,
++            "tool_calls": [
++                {
++                    "id": "call_2",
++                    "type": "function",
++                    "function": {"name": "patch", "arguments": '{"path":"cli.py"}'},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "call_2", "content": "patch result"},
++        {
++            "role": "assistant",
++            "content": "I found the issue: the resume preview is showing raw intermediate tool-only assistant steps instead of the final useful answer.",
++        },
++    ]
++
++
++def _multi_step_exchange_history():
++    """Multiple user turns where one turn contains many intermediate assistant tool steps."""
++    return [
++        {"role": "system", "content": "system prompt"},
++        {"role": "user", "content": "Question #1"},
++        {"role": "assistant", "content": "Answer #1"},
++        {"role": "user", "content": "Question #2"},
++        {
++            "role": "assistant",
++            "content": None,
++            "tool_calls": [
++                {
++                    "id": "call_a",
++                    "type": "function",
++                    "function": {"name": "search_files", "arguments": '{"pattern":"resume"}'},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "call_a", "content": "matches"},
++        {
++            "role": "assistant",
++            "content": None,
++            "tool_calls": [
++                {
++                    "id": "call_b",
++                    "type": "function",
++                    "function": {"name": "read_file", "arguments": '{"path":"cli.py"}'},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "call_b", "content": "lines"},
++        {"role": "assistant", "content": "Answer #2"},
++        {"role": "user", "content": "Question #3"},
++        {"role": "assistant", "content": "Answer #3"},
++    ]
++
++
++def _latest_turn_only_has_tool_activity_history():
++    """Latest turn has tool activity but no final assistant text yet."""
++    return [
++        {"role": "system", "content": "system prompt"},
++        {"role": "user", "content": "What changed in /resume?"},
++        {"role": "assistant", "content": "It now collapses noisy tool-only steps into useful exchanges."},
++        {"role": "user", "content": "Can you inspect the latest logs too?"},
++        {
++            "role": "assistant",
++            "content": None,
++            "tool_calls": [
++                {
++                    "id": "call_logs",
++                    "type": "function",
++                    "function": {"name": "terminal", "arguments": '{"command":"tail -n 50 app.log"}'},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "call_logs", "content": "tail output"},
++    ]
++
++
++def _status_summary_history():
++    """Recent answer contains structured status details and the latest user prompt is low-signal."""
++    return [
++        {"role": "system", "content": "system prompt"},
++        {"role": "user", "content": "Please make /resume show task status instead of raw history."},
++        {
++            "role": "assistant",
++            "content": (
++                "Done:\n"
++                "- Added Resume Snapshot above Previous Conversation.\n"
++                "- Updated tests and refreshed the patch artifact.\n"
++                "Decision:\n"
++                "- The snapshot now falls back to the last substantive user request when the latest prompt is just '继续'.\n"
++                "Limitations:\n"
++                "- pytest is unavailable in this environment, so only py_compile and git diff --check ran here.\n"
++                "Next:\n"
++                "- We can further extract pending work and blockers into a status view."
++            ),
++        },
++        {"role": "user", "content": "继续"},
++    ]
++
++
+ def _large_history(n_exchanges=15):
+     """Build a history with many exchanges to test truncation."""
+     msgs = [{"role": "system", "content": "system prompt"}]
+@@ -120,10 +243,10 @@ class TestDisplayResumedHistory:
+     """_display_resumed_history() renders a Rich panel with conversation recap."""
+
+     def _capture_display(self, cli_obj):
+-        """Run _display_resumed_history and capture the Rich console output."""
++        """Run _display_resumed_history and capture the rendered output."""
+         buf = StringIO()
+-        cli_obj.console.file = buf
+-        cli_obj._display_resumed_history()
++        with patch("cli._cprint", side_effect=lambda text: buf.write(text + "\n")):
++            cli_obj._display_resumed_history()
+         return buf.getvalue()
+
+     def test_simple_history_shows_user_and_assistant(self):
+@@ -155,13 +278,94 @@ class TestDisplayResumedHistory:
+
+     def test_tool_calls_shown_as_summary(self):
+         cli = _make_cli()
+-        cli.conversation_history = _tool_call_history()
++        cli.conversation_history = [
++            {"role": "user", "content": "Search for Python tutorials"},
++            {
++                "role": "assistant",
++                "content": None,
++                "tool_calls": [
++                    {
++                        "id": "call_1",
++                        "type": "function",
++                        "function": {"name": "web_search", "arguments": '{"query":"python tutorials"}'},
++                    },
++                    {
++                        "id": "call_2",
++                        "type": "function",
++                        "function": {"name": "web_extract", "arguments": '{"urls":["https://example.com"]}'},
++                    },
++                ],
++            },
++        ]
+         output = self._capture_display(cli)
+
+         assert "2 tool calls" in output
+         assert "web_search" in output
+         assert "web_extract" in output
+
++    def test_tool_only_steps_collapsed_when_final_answer_exists(self):
++        cli = _make_cli()
++        cli.conversation_history = _tool_heavy_turn_history()
++        output = self._capture_display(cli)
++
++        assert "Please debug why /resume is noisy" in output
++        assert "I found the issue" in output
++        assert "read_file" not in output
++        assert "patch" not in output
++        assert output.count("Hermes:") == 1
++
++    def test_resume_snapshot_surfaces_latest_focus_and_answer(self):
++        cli = _make_cli()
++        cli.conversation_history = _tool_heavy_turn_history()
++        output = self._capture_display(cli)
++
++        assert "Resume Snapshot" in output
++        assert "Focus:" in output
++        assert "Please debug why /resume is noisy" in output
++        assert "Latest answer:" in output
++        assert "final useful answer" in output
++        assert "Showing 1 of 1 recent exchanges below." in output
++
++    def test_resume_snapshot_shows_latest_activity_when_last_turn_has_only_tools(self):
++        cli = _make_cli(config_overrides={"display": {"resume_history_exchanges": 1}})
++        cli.conversation_history = _latest_turn_only_has_tool_activity_history()
++        output = self._capture_display(cli)
++
++        assert "Resume Snapshot" in output
++        assert "Focus:" in output
++        assert "Can you inspect the latest logs too?" in output
++        assert "Latest answer:" in output
++        assert "collapses noisy tool-only steps" in output
++        assert "Latest activity:" in output
++        assert "1 tool call" in output
++        assert "terminal" in output
++        assert "Pending / blockers:" in output
++        assert "In progress:" in output
++        assert "Key actions:" in output
++        assert "terminal:" in output
++        assert "Commands:" in output
++        assert "tail -n 50 app.log" in output
++        assert "Showing 1 of 2 recent exchanges below." in output
++
++    def test_resume_snapshot_extracts_current_task_completed_pending_and_decision(self):
++        cli = _make_cli()
++        cli.conversation_history = _status_summary_history()
++        output = self._capture_display(cli)
++
++        assert "Current task:" in output
++        assert "Please make /resume show task status instead of raw history." in output
++        assert "Latest prompt:" in output
++        assert "继续" in output
++        assert "Latest decision:" in output
++        assert "falls back to the last substantive user request" in output
++        assert "Decision trace:" in output
++        assert "Completed:" in output
++        assert "Added Resume Snapshot above Previous Conversation." in output
++        assert "Updated tests and refreshed the patch artifact." in output
++        assert "Pending / blockers:" in output
++        assert "pytest is unavailable in this environment" in output
++        assert "We can further extract pending work and blockers into a status view." in output
++
+     def test_long_user_message_truncated(self):
+         cli = _make_cli()
+         long_text = "A" * 500
+@@ -180,80 +384,67 @@ class TestDisplayResumedHistory:
+         assert 200 <= a_count <= 310  # roughly 300 chars (±panel padding)
+
+     def test_long_assistant_message_truncated(self):
+-        """Non-last assistant messages are still truncated."""
+         cli = _make_cli()
+         long_text = "B" * 400
+         cli.conversation_history = [
+             {"role": "user", "content": "Tell me a lot."},
+             {"role": "assistant", "content": long_text},
+-            {"role": "user", "content": "And more?"},
+-            {"role": "assistant", "content": "Short final reply."},
+         ]
+         output = self._capture_display(cli)
+
+-        # The non-last assistant message should be truncated
++        assert "..." in output
+         assert "B" * 400 not in output
+-        # The last assistant message shown in full
+-        assert "Short final reply." in output
+
+     def test_multiline_assistant_truncated(self):
+-        """Non-last multiline assistant messages are truncated to 3 lines."""
+         cli = _make_cli()
+         multi = "\n".join([f"Line {i}" for i in range(20)])
+         cli.conversation_history = [
+             {"role": "user", "content": "Show me lines."},
+             {"role": "assistant", "content": multi},
+-            {"role": "user", "content": "What else?"},
+-            {"role": "assistant", "content": "Done."},
+         ]
+         output = self._capture_display(cli)
+
+-        # First 3 lines of non-last assistant should be there
++        # First 3 lines should be there
+         assert "Line 0" in output
+         assert "Line 1" in output
+         assert "Line 2" in output
+-        # Line 19 should NOT be in the truncated message
++        # Line 19 should NOT be there (truncated after 3 lines)
+         assert "Line 19" not in output
+
+-    def test_last_assistant_response_shown_in_full(self):
+-        """The last assistant response is shown un-truncated so the user
+-        knows where they left off without wasting tokens re-asking."""
++    def test_large_history_shows_truncation_indicator(self):
+         cli = _make_cli()
+-        long_text = "X" * 500
+-        cli.conversation_history = [
+-            {"role": "user", "content": "Tell me everything."},
+-            {"role": "assistant", "content": long_text},
+-        ]
++        cli.conversation_history = _large_history(n_exchanges=25)
+         output = self._capture_display(cli)
+
+-        # Full 500-char text should be present (may be line-wrapped by Rich)
+-        x_count = output.count("X")
+-        assert x_count >= 490  # allow small Rich formatting variance
++        # Should show "earlier messages" indicator
++        assert "earlier messages" in output
++        # Last question should still be visible
++        assert "Question #25" in output
+
+-    def test_last_assistant_multiline_shown_in_full(self):
+-        """The last assistant response shows all lines, not just 3."""
+-        cli = _make_cli()
+-        multi = "\n".join([f"Line {i}" for i in range(20)])
+-        cli.conversation_history = [
+-            {"role": "user", "content": "Show me everything."},
+-            {"role": "assistant", "content": multi},
+-        ]
++    def test_resume_history_exchanges_config_controls_default_length(self):
++        cli = _make_cli(config_overrides={"display": {"resume_history_exchanges": 3}})
++        cli.conversation_history = _large_history(n_exchanges=5)
+         output = self._capture_display(cli)
+
+-        # All 20 lines should be present since it's the last response
+-        assert "Line 0" in output
+-        assert "Line 10" in output
+-        assert "Line 19" in output
+-
+-    def test_large_history_shows_truncation_indicator(self):
+-        cli = _make_cli()
+-        cli.conversation_history = _large_history(n_exchanges=15)
++        assert "earlier messages" in output
++        assert "Question #1" not in output
++        assert "Question #2" not in output
++        assert "Question #3" in output
++        assert "Question #5" in output
++
++    def test_resume_history_exchanges_counts_user_turns_not_intermediate_assistant_steps(self):
++        cli = _make_cli(config_overrides={"display": {"resume_history_exchanges": 2}})
++        cli.conversation_history = _multi_step_exchange_history()
+         output = self._capture_display(cli)
+
+-        # Should show "earlier messages" indicator
+-        assert "earlier messages" in output
+-        # Last question should still be visible
+-        assert "Question #15" in output
++        assert "Question #1" not in output
++        assert "Answer #1" not in output
++        assert "Question #2" in output
++        assert "Answer #2" in output
++        assert "Question #3" in output
++        assert "Answer #3" in output
++        assert "search_files" not in output
++        assert "read_file" not in output
+
+     def test_multimodal_content_handled(self):
+         cli = _make_cli()
+@@ -367,6 +558,22 @@ class TestDisplayResumedHistory:
+         assert "1 tool call" in output
+         assert "terminal" in output
+
++    def test_resume_display_strips_ansi_sequences(self):
++        cli = _make_cli()
++        cli.conversation_history = [
++            {"role": "user", "content": "Show the last output"},
++            {
++                "role": "assistant",
++                "content": "\x1b[33mwarning\x1b[0m\n\x1b[1;38;5;79mall good\x1b[0m",
++            },
++        ]
++        output = self._capture_display(cli)
++
++        assert "warning" in output
++        assert "all good" in output
++        assert "?[33mwarning" not in output
++        assert "?[1;38;5;79m" not in output
++
+
+ # ── Tests for _preload_resumed_session ──────────────────────────────
+
+@@ -387,6 +594,7 @@ class TestPreloadResumedSession:
+         cli = _make_cli(resume="nonexistent_session")
+         mock_db = MagicMock()
+         mock_db.get_session.return_value = None
++        mock_db.resolve_latest_descendant_session.return_value = None
+         cli._session_db = mock_db
+
+         buf = StringIO()
+@@ -402,6 +610,9 @@ class TestPreloadResumedSession:
+         mock_db = MagicMock()
+         mock_db.get_session.return_value = {"id": "empty_session", "title": None}
+         mock_db.get_messages_as_conversation.return_value = []
++        # When a session has no messages, the lineage resolver should fall back
++        # to the same ID.
++        mock_db.resolve_latest_descendant_session.return_value = "empty_session"
+         cli._session_db = mock_db
+
+         buf = StringIO()
+@@ -418,6 +629,7 @@ class TestPreloadResumedSession:
+         mock_db = MagicMock()
+         mock_db.get_session.return_value = {"id": "good_session", "title": "Test Session"}
+         mock_db.get_messages_as_conversation.return_value = messages
++        mock_db.resolve_latest_descendant_session.return_value = "good_session"
+         cli._session_db = mock_db
+
+         buf = StringIO()
+@@ -438,6 +650,7 @@ class TestPreloadResumedSession:
+         mock_db = MagicMock()
+         mock_db.get_session.return_value = {"id": "reopen_session", "title": None}
+         mock_db.get_messages_as_conversation.return_value = messages
++        mock_db.resolve_latest_descendant_session.return_value = "reopen_session"
+         mock_conn = MagicMock()
+         mock_db._conn = mock_conn
+         cli._session_db = mock_db
+@@ -452,6 +665,26 @@ class TestPreloadResumedSession:
+         assert "ended_at = NULL" in call_args[0][0]
+         mock_conn.commit.assert_called_once()
+
++    def test_preload_sanitizes_ansi_from_resumed_history(self):
++        cli = _make_cli(resume="ansi_session")
++        messages = [
++            {"role": "session_meta", "content": "ignore me"},
++            {"role": "user", "content": "show it"},
++            {"role": "assistant", "content": "\x1b[33mwarning\x1b[0m"},
++            {"role": "tool", "content": "\x1b[31mtool output\x1b[0m"},
++        ]
++        mock_db = MagicMock()
++        mock_db.get_session.return_value = {"id": "ansi_session", "title": "ANSI Session"}
++        mock_db.get_messages_as_conversation.return_value = messages
++        mock_db.resolve_latest_descendant_session.return_value = "ansi_session"
++        mock_db._conn = MagicMock()
++        cli._session_db = mock_db
++
++        assert cli._preload_resumed_session() is True
++        assert [m["role"] for m in cli.conversation_history] == ["user", "assistant", "tool"]
++        assert cli.conversation_history[1]["content"] == "warning"
++        assert cli.conversation_history[2]["content"] == "tool output"
++
+     def test_singular_user_message_grammar(self):
+         """1 user message should say 'message' not 'messages'."""
+         cli = _make_cli(resume="one_msg_session")
+@@ -462,6 +695,7 @@ class TestPreloadResumedSession:
+         mock_db = MagicMock()
+         mock_db.get_session.return_value = {"id": "one_msg_session", "title": None}
+         mock_db.get_messages_as_conversation.return_value = messages
++        mock_db.resolve_latest_descendant_session.return_value = "one_msg_session"
+         mock_db._conn = MagicMock()
+         cli._session_db = mock_db
+
+@@ -510,6 +744,7 @@ class TestResumeDisplayConfig:
+         display = DEFAULT_CONFIG.get("display", {})
+         assert "resume_display" in display
+         assert display["resume_display"] == "full"
++        assert display["resume_history_exchanges"] == 20
+
+     def test_cli_defaults_have_resume_display(self):
+         """cli.py load_cli_config defaults include resume_display."""
+@@ -524,3 +759,16 @@ class TestResumeDisplayConfig:
+
+         display = config.get("display", {})
+         assert display.get("resume_display") == "full"
++        assert display.get("resume_history_exchanges") == 20
++
++def test_resume_without_target_lists_recent_sessions_outside_tui():
++    cli = _make_cli()
++    cli._session_db = object()
++    cli._app = None
++    cli._show_recent_sessions = MagicMock(return_value=True)
++    cli._browse_resume_sessions = MagicMock(return_value="should-not-browse")
++
++    cli._handle_resume_command("/resume")
++
++    cli._show_recent_sessions.assert_called_once_with(reason="resume", limit=200)
++    cli._browse_resume_sessions.assert_not_called()
+diff --git a/tests/hermes_cli/test_session_browse.py b/tests/hermes_cli/test_session_browse.py
+index 4b24a58b..24ca610e 100644
+--- a/tests/hermes_cli/test_session_browse.py
++++ b/tests/hermes_cli/test_session_browse.py
+@@ -12,7 +12,12 @@ from unittest.mock import MagicMock, patch, call
+
+ import pytest
+
+-from hermes_cli.main import _session_browse_picker
++from hermes_cli.main import (
++    _resolve_session_by_name_or_id,
++    _session_browse_picker,
++    _session_cwd_score,
++    _session_sort_key,
++)
+
+
+ # ─── Sample session data ──────────────────────────────────────────────────────
+@@ -216,6 +221,66 @@ class TestSessionBrowsePicker:
+         output = capsys.readouterr().out
+         assert "Hello world test message" in output
+
++    def test_fallback_shows_preview_even_when_title_exists(self, capsys):
++        """When both title and preview exist, the preview should also be visible."""
++        sessions = [{
++            "id": "test_002b",
++            "source": "cli",
++            "title": "My Cool Project",
++            "preview": "Patch the Hermes resume flow for better searchability",
++            "last_active": time.time(),
++            "message_count": 14,
++        }]
++
++        import builtins
++        original_import = builtins.__import__
++
++        def mock_import(name, *args, **kwargs):
++            if name == "curses":
++                raise ImportError("no curses")
++            return original_import(name, *args, **kwargs)
++
++        with patch.object(builtins, "__import__", side_effect=mock_import):
++            with patch("builtins.input", return_value="q"):
++                _session_browse_picker(sessions)
++
++        output = capsys.readouterr().out
++        assert "My Cool Project" in output
++        assert "Patch the Hermes resume flow" in output
++
++    def test_fallback_initial_query_supports_multi_term_matching(self):
++        """Multi-word filters should match across title/preview fields."""
++        sessions = [
++            {
++                "id": "s1",
++                "source": "cli",
++                "title": "Running notes",
++                "preview": "Hermes status bar patch discussion",
++                "last_active": time.time(),
++            },
++            {
++                "id": "s2",
++                "source": "cli",
++                "title": "Other topic",
++                "preview": "Nothing relevant here",
++                "last_active": time.time(),
++            },
++        ]
++
++        import builtins
++        original_import = builtins.__import__
++
++        def mock_import(name, *args, **kwargs):
++            if name == "curses":
++                raise ImportError("no curses")
++            return original_import(name, *args, **kwargs)
++
++        with patch.object(builtins, "__import__", side_effect=mock_import):
++            with patch("builtins.input", return_value="1"):
++                result = _session_browse_picker(sessions, initial_query="running hermes")
++
++        assert result == "s1"
++
+     def test_fallback_shows_id_when_no_title_or_preview(self, capsys):
+         """When neither title nor preview, show session ID."""
+         sessions = [{
+@@ -242,6 +307,62 @@ class TestSessionBrowsePicker:
+         assert "test_003_fallback" in output
+
+
++class TestResolveSessionByNameOrId:
++    def test_unique_fuzzy_match_across_title_and_preview_returns_session_id(self):
++        sessions = [
++            {
++                "id": "s1",
++                "source": "cli",
++                "title": "Running notes",
++                "preview": "Hermes resume bug triage",
++                "last_active": time.time(),
++            },
++            {
++                "id": "s2",
++                "source": "cli",
++                "title": "Other work",
++                "preview": "Unrelated topic",
++                "last_active": time.time(),
++            },
++        ]
++
++        fake_db = MagicMock()
++        fake_db.resolve_session_id.return_value = None
++        fake_db.resolve_session_by_title.return_value = None
++        fake_db.list_sessions_rich.return_value = sessions
++
++        with patch("hermes_state.SessionDB", return_value=fake_db):
++            assert _resolve_session_by_name_or_id("running hermes") == "s1"
++
++        fake_db.close.assert_called()
++
++    def test_ambiguous_fuzzy_match_returns_none(self):
++        sessions = [
++            {
++                "id": "s1",
++                "source": "cli",
++                "title": "Running notes",
++                "preview": "Hermes resume bug triage",
++                "last_active": time.time(),
++            },
++            {
++                "id": "s2",
++                "source": "cli",
++                "title": "Running deployment",
++                "preview": "Hermes status follow-up",
++                "last_active": time.time(),
++            },
++        ]
++
++        fake_db = MagicMock()
++        fake_db.resolve_session_id.return_value = None
++        fake_db.resolve_session_by_title.return_value = None
++        fake_db.list_sessions_rich.return_value = sessions
++
++        with patch("hermes_state.SessionDB", return_value=fake_db):
++            assert _resolve_session_by_name_or_id("running hermes") is None
++
++
+ # ─── Curses-based picker (mocked curses) ────────────────────────────────────
+
+ class TestCursesBrowse:
+@@ -326,11 +447,12 @@ class TestCursesBrowse:
+     def test_backspace_removes_filter_char(self):
+         """Backspace removes the last character from the filter."""
+         import curses
++        now = time.time()
+         sessions = [
+-            {"id": "s1", "source": "cli", "title": "Alpha", "preview": "", "last_active": time.time()},
+-            {"id": "s2", "source": "cli", "title": "Beta", "preview": "", "last_active": time.time()},
++            {"id": "s1", "source": "cli", "title": "Alpha", "preview": "", "last_active": now},
++            {"id": "s2", "source": "cli", "title": "Beta", "preview": "", "last_active": now - 1},
+         ]
+-        # Type "Bet", backspace, backspace, backspace (clears filter), then Enter (selects first)
++        # Type "Bet", backspace, backspace, backspace (clears filter), then Enter (selects top-ranked session)
+         keys = [ord('B'), ord('e'), ord('t'), 127, 127, 127, 10]
+         result = self._run_with_keys(sessions, keys)
+         assert result == "s1"
+@@ -540,3 +662,89 @@ class TestEdgeCases:
+         assert "just now" in output
+         assert "2h ago" in output
+         assert "3d ago" in output
++
++
++class TestSessionBrowseRanking:
++    """Ranking behavior for /resume session discovery."""
++
++    def test_session_sort_key_prefers_most_recent_session_when_query_empty(self):
++        now = time.time()
++        sessions = [
++            {
++                "id": "recent_other_project",
++                "title": "Recent other project",
++                "preview": "Most recent overall",
++                "last_active": now,
++                "started_at": now - 60,
++                "model_config": {"cwd": "/tmp/other-project"},
++            },
++            {
++                "id": "older_current_project",
++                "title": "Current repo work",
++                "preview": "Slightly older but same repo",
++                "last_active": now - 3600,
++                "started_at": now - 3660,
++                "model_config": {"cwd": "/work/hermes-agent"},
++            },
++        ]
++
++        ordered = sorted(sessions, key=lambda s: _session_sort_key(s, "", "/work/hermes-agent"))
++        assert ordered[0]["id"] == "recent_other_project"
++
++    def test_session_sort_key_prefers_current_project_when_query_present(self):
++        now = time.time()
++        sessions = [
++            {
++                "id": "recent_other_project",
++                "title": "Recent other project",
++                "preview": "Most recent overall",
++                "last_active": now,
++                "started_at": now - 60,
++                "model_config": {"cwd": "/tmp/other-project"},
++            },
++            {
++                "id": "older_current_project",
++                "title": "Current repo work",
++                "preview": "Slightly older but same repo",
++                "last_active": now - 3600,
++                "started_at": now - 3660,
++                "model_config": {"cwd": "/work/hermes-agent"},
++            },
++        ]
++
++        ordered = sorted(
++            sessions,
++            key=lambda s: _session_sort_key(s, "repo", "/work/hermes-agent"),
++        )
++        assert ordered[0]["id"] == "older_current_project"
++
++    def test_session_sort_key_prefers_title_match_over_recency(self):
++        now = time.time()
++        sessions = [
++            {
++                "id": "recent_partial",
++                "title": "General maintenance",
++                "preview": "running hermes in a different context",
++                "last_active": now,
++                "started_at": now - 60,
++            },
++            {
++                "id": "older_exact",
++                "title": "Running Hermes Agent",
++                "preview": "Exact title match should rank first",
++                "last_active": now - 7200,
++                "started_at": now - 7260,
++            },
++        ]
++
++        ordered = sorted(sessions, key=lambda s: _session_sort_key(s, "running hermes", ""))
++        assert ordered[0]["id"] == "older_exact"
++
++    def test_session_cwd_score_parses_model_config_json(self):
++        session = {
++            "id": "json_cfg",
++            "title": "Stored in sqlite",
++            "model_config": '{"cwd": "/srv/apps/hermes"}',
++        }
++
++        assert _session_cwd_score(session, "/srv/apps/hermes") > 0

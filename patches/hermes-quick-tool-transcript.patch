@@ -1,0 +1,211 @@
+diff --git a/cli.py b/cli.py
+index 8aa8bb03..816ddc74 100644
+--- a/cli.py
++++ b/cli.py
+@@ -68,6 +68,7 @@ from agent.usage_pricing import (
+ from hermes_cli.banner import _format_context_length, format_banner_version_label
+
+ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
++_FAST_TOOL_TRANSCRIPT_NAMES = frozenset({"todo", "memory", "session_search"})
+
+
+ # Load .env from ~/.hermes/.env first, then project root as dev fallback.
+@@ -2713,6 +2714,43 @@ class HermesCLI:
+         frame_idx = int(_time.monotonic() * 10) % len(_COMMAND_SPINNER_FRAMES)
+         return _COMMAND_SPINNER_FRAMES[frame_idx]
+
++    def _should_persist_tool_progress_line(self, function_name: Optional[str]) -> bool:
++        return (
++            bool(function_name)
++            and not function_name.startswith("_")
++            and function_name in _FAST_TOOL_TRANSCRIPT_NAMES
++        )
++
++    def _flush_live_boxes_for_tool_progress_line(self) -> None:
++        if (
++            getattr(self, "_stream_box_opened", False)
++            or getattr(self, "_reasoning_box_opened", False)
++            or getattr(self, "_stream_started", False)
++        ):
++            self._flush_stream()
++            self._reset_stream_state()
++        else:
++            self._close_reasoning_box()
++
++    def _emit_persistent_tool_progress_line(
++        self,
++        function_name: Optional[str],
++        label: str,
++        *,
++        emoji: Optional[str] = None,
++    ) -> None:
++        if not label or not self._should_persist_tool_progress_line(function_name):
++            return
++        self._flush_live_boxes_for_tool_progress_line()
++        if function_name == "todo":
++            _cprint(f"  ┊ {_ACCENT}📋 {label}{_RST}")
++            return
++        if emoji is None:
++            from agent.display import get_tool_emoji
++
++            emoji = get_tool_emoji(function_name or "")
++        _cprint(f"  ┊ {emoji} {label}")
++
+     @contextmanager
+     def _busy_command(self, status: str):
+         """Expose a temporary busy state in the TUI while a slash command runs."""
+@@ -6912,7 +6950,7 @@ class HermesCLI:
+     # Tool progress callback (audio cues for voice mode)
+     # ====================================================================
+
+-    def _on_tool_progress(self, event_type: str, function_name: str = None, preview: str = None, function_args: dict = None, **kwargs):
++    def _on_tool_progress(self, event_type: str, function_name: Optional[str] = None, preview: Optional[str] = None, function_args: Optional[dict] = None, **kwargs):
+         """Called on tool lifecycle events (tool.started, tool.completed, reasoning.available, etc.).
+
+         Updates the TUI spinner widget so the user can see what the agent
+@@ -6966,6 +7004,7 @@ class HermesCLI:
+             if _pl > 0 and len(label) > _pl:
+                 label = label[:_pl - 3] + "..."
+             self._spinner_text = f"{emoji} {label}"
++            self._emit_persistent_tool_progress_line(function_name, label, emoji=emoji)
+             self._tool_start_time = _time.monotonic()
+             # Store args for stacked scrollback line on completion
+             self._pending_tool_info.setdefault(function_name, []).append(
+diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
+index eabcd0f9..be4978e4 100644
+--- a/tests/cli/test_cli_status_bar.py
++++ b/tests/cli/test_cli_status_bar.py
+@@ -2,7 +2,9 @@ from datetime import datetime, timedelta
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+
+-from cli import HermesCLI
++import pytest
++
++from cli import HermesCLI, _ACCENT, _RST
+
+
+ def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
+@@ -11,6 +13,9 @@ def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
+     cli_obj.session_start = datetime.now() - timedelta(minutes=14, seconds=32)
+     cli_obj.conversation_history = [{"role": "user", "content": "hi"}]
+     cli_obj.agent = None
++    cli_obj._pending_tool_info = {}
++    cli_obj._last_scrollback_tool = ""
++    cli_obj.tool_progress_mode = "none"
+     return cli_obj
+
+
+@@ -415,3 +420,112 @@ class TestStatusBarWidthSource:
+         mock_get_app.assert_not_called()
+         mock_shutil.assert_not_called()
+         assert len(text) > 0
++
++
++class TestQuickToolTranscript:
++    def test_on_tool_progress_styles_todo_transcript_with_accent_prefix(self):
++        cli_obj = _make_cli()
++        cli_obj._spinner_text = ""
++        cli_obj._tool_start_time = 0.0
++        cli_obj._voice_mode = False
++        cli_obj._invalidate = MagicMock()
++        cli_obj._stream_box_opened = False
++        cli_obj._stream_started = False
++        cli_obj._reasoning_box_opened = False
++        cli_obj._close_reasoning_box = MagicMock()
++
++        with patch("cli._cprint") as mock_cprint:
++            cli_obj._on_tool_progress(
++                "tool.started",
++                "todo",
++                "planning 3 task(s)",
++                {"todos": [{"id": "t1"}, {"id": "t2"}, {"id": "t3"}]},
++            )
++
++        assert mock_cprint.call_count == 1
++        assert (
++            mock_cprint.call_args.args[0] == f"  ┊ {_ACCENT}📋 planning 3 task(s){_RST}"
++        )
++        assert cli_obj._spinner_text.endswith("planning 3 task(s)")
++        cli_obj._invalidate.assert_called_once()
++
++    @pytest.mark.parametrize(
++        ("function_name", "preview", "function_args"),
++        [
++            (
++                "memory",
++                '+user: "prefers dark mode"',
++                {"action": "add", "target": "user"},
++            ),
++            ("session_search", 'recall: "tmux hang"', {"query": "tmux hang"}),
++        ],
++    )
++    def test_on_tool_progress_persists_transcript_for_other_fast_tools(
++        self, function_name, preview, function_args
++    ):
++        cli_obj = _make_cli()
++        cli_obj._spinner_text = ""
++        cli_obj._tool_start_time = 0.0
++        cli_obj._voice_mode = False
++        cli_obj._invalidate = MagicMock()
++        cli_obj._stream_box_opened = False
++        cli_obj._stream_started = False
++        cli_obj._reasoning_box_opened = False
++        cli_obj._close_reasoning_box = MagicMock()
++
++        with patch("cli._cprint") as mock_cprint:
++            cli_obj._on_tool_progress(
++                "tool.started", function_name, preview, function_args
++            )
++
++        assert mock_cprint.call_count == 1
++        assert preview in mock_cprint.call_args.args[0]
++        assert str(_ACCENT) not in mock_cprint.call_args.args[0]
++        assert cli_obj._spinner_text.endswith(preview)
++        cli_obj._invalidate.assert_called_once()
++
++    @pytest.mark.parametrize(
++        ("function_name", "preview", "function_args"),
++        [
++            ("terminal", "$ pwd", {"command": "pwd"}),
++            ("read_file", "/etc/hosts", {"path": "/etc/hosts"}),
++        ],
++    )
++    def test_on_tool_progress_keeps_regular_tools_footer_only(
++        self, function_name, preview, function_args
++    ):
++        cli_obj = _make_cli()
++        cli_obj._spinner_text = ""
++        cli_obj._tool_start_time = 0.0
++        cli_obj._voice_mode = False
++        cli_obj._invalidate = MagicMock()
++
++        with patch("cli._cprint") as mock_cprint:
++            cli_obj._on_tool_progress(
++                "tool.started", function_name, preview, function_args
++            )
++
++        mock_cprint.assert_not_called()
++        assert cli_obj._spinner_text.endswith(preview)
++        cli_obj._invalidate.assert_called_once()
++
++    def test_on_tool_progress_flushes_open_stream_before_persisting_fast_tool(self):
++        cli_obj = _make_cli()
++        cli_obj._spinner_text = ""
++        cli_obj._tool_start_time = 0.0
++        cli_obj._voice_mode = False
++        cli_obj._invalidate = MagicMock()
++        cli_obj._stream_box_opened = True
++        cli_obj._stream_started = True
++        cli_obj._reasoning_box_opened = False
++        cli_obj._flush_stream = MagicMock()
++        cli_obj._reset_stream_state = MagicMock()
++
++        with patch("cli._cprint") as mock_cprint:
++            cli_obj._on_tool_progress(
++                "tool.started", "todo", "planning 1 task(s)", {"todos": [{"id": "t1"}]}
++            )
++
++        cli_obj._flush_stream.assert_called_once()
++        cli_obj._reset_stream_state.assert_called_once()
++        assert mock_cprint.call_count == 1

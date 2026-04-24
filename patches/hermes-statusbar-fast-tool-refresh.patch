@@ -1,0 +1,466 @@
+diff --git a/cli.py b/cli.py
+index 816ddc7..4047e1f 100644
+--- a/cli.py
++++ b/cli.py
+@@ -1911,2 +1911,4 @@ class HermesCLI:
+         self._background_task_counter = 0
++        self._delegate_subtask_total: int = 0
++        self._delegate_subtask_completed: set[int] = set()
+
+@@ -1936,2 +1938,74 @@ class HermesCLI:
+
++    def _get_todo_progress_label(self) -> Optional[str]:
++        agent = getattr(self, "agent", None)
++        store = getattr(agent, "_todo_store", None)
++        if not store or not hasattr(store, "read"):
++            return None
++        try:
++            items = store.read()
++        except Exception:
++            return None
++        if not items:
++            return None
++
++        visible_items = [
++            item
++            for item in items
++            if str(item.get("status", "")).strip().lower() != "cancelled"
++        ]
++        if not visible_items:
++            return None
++
++        completed = sum(
++            1
++            for item in visible_items
++            if str(item.get("status", "")).strip().lower() == "completed"
++        )
++        return f"\u4efb\u52a1\uff1a{completed}/{len(visible_items)}"
++
++    def _update_delegate_subtask_progress(
++        self,
++        task_index: Any = None,
++        task_count: Any = None,
++        *,
++        completed: bool = False,
++    ) -> None:
++        try:
++            total = int(task_count or 0)
++        except (TypeError, ValueError):
++            total = 0
++        try:
++            index = int(task_index) if task_index is not None else None
++        except (TypeError, ValueError):
++            index = None
++        if total <= 0:
++            return
++
++        finished = set(getattr(self, "_delegate_subtask_completed", set()) or set())
++        current_total = int(getattr(self, "_delegate_subtask_total", 0) or 0)
++        if (
++            current_total != total
++            or len(finished) >= current_total > 0
++            or (not completed and index == 0 and finished)
++        ):
++            finished = set()
++
++        if completed and index is not None and index >= 0:
++            finished.add(index)
++
++        self._delegate_subtask_total = total
++        self._delegate_subtask_completed = {
++            item_index for item_index in finished if 0 <= item_index < total
++        }
++
++    def _get_delegate_subtask_label(self) -> Optional[str]:
++        total = int(getattr(self, "_delegate_subtask_total", 0) or 0)
++        if total <= 0:
++            return None
++        completed = min(
++            total,
++            len(getattr(self, "_delegate_subtask_completed", set()) or set()),
++        )
++        return f"\u5b50\u4efb\u52a1\uff1a{completed}/{total}"
++
+     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
+@@ -1966,2 +2040,4 @@ class HermesCLI:
+             "compressions": 0,
++            "todo_progress_label": self._get_todo_progress_label(),
++            "subtask_progress_label": self._get_delegate_subtask_label(),
+         }
+@@ -2112,2 +2188,10 @@ class HermesCLI:
+             duration_label = snapshot["duration"]
++            progress_labels = [
++                label
++                for label in (
++                    snapshot.get("todo_progress_label"),
++                    snapshot.get("subtask_progress_label"),
++                )
++                if label
++            ]
+
+@@ -2119,2 +2203,3 @@ class HermesCLI:
+                 parts.append(duration_label)
++                parts.extend(progress_labels)
+                 return self._trim_status_bar_text(" · ".join(parts), width)
+@@ -2130,2 +2215,3 @@ class HermesCLI:
+             parts.append(duration_label)
++            parts.extend(progress_labels)
+             return self._trim_status_bar_text(" │ ".join(parts), width)
+@@ -2146,2 +2232,10 @@ class HermesCLI:
+             duration_label = snapshot["duration"]
++            progress_labels = [
++                label
++                for label in (
++                    snapshot.get("todo_progress_label"),
++                    snapshot.get("subtask_progress_label"),
++                )
++                if label
++            ]
+
+@@ -2168,2 +2262,9 @@ class HermesCLI:
+                     ]
++                    for label in progress_labels:
++                        frags.extend(
++                            [
++                                ("class:status-bar-dim", " · "),
++                                ("class:status-bar-dim", label),
++                            ]
++                        )
+                 else:
+@@ -2190,2 +2291,9 @@ class HermesCLI:
+                     ]
++                    for label in progress_labels:
++                        frags.extend(
++                            [
++                                ("class:status-bar-dim", " │ "),
++                                ("class:status-bar-dim", label),
++                            ]
++                        )
+
+@@ -6967,2 +7075,12 @@ class HermesCLI:
+         """
++        if event_type.startswith("subagent."):
++            self._update_delegate_subtask_progress(
++                kwargs.get("task_index"),
++                kwargs.get("task_count"),
++                completed=event_type == "subagent.complete",
++            )
++            self._invalidate(
++                min_interval=0.0 if event_type == "subagent.complete" else 0.25
++            )
++            return
+         if event_type == "tool.completed":
+@@ -6992,3 +7110,3 @@ class HermesCLI:
+                     pass
+-            self._invalidate()
++            self._invalidate(min_interval=0.0)
+             return
+diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
+index be4978e..2f07fef 100644
+--- a/tests/cli/test_cli_status_bar.py
++++ b/tests/cli/test_cli_status_bar.py
+@@ -7,2 +7,3 @@ import pytest
+ from cli import HermesCLI, _ACCENT, _RST
++from tools.todo_tool import TodoStore
+
+@@ -213,2 +214,90 @@ class TestCLIStatusBar:
+
++    def test_status_bar_snapshot_includes_todo_and_subtask_progress(self):
++        cli_obj = _attach_agent(
++            _make_cli(),
++            prompt_tokens=10_230,
++            completion_tokens=2_220,
++            total_tokens=12_450,
++            api_calls=7,
++            context_tokens=12_450,
++            context_length=200_000,
++        )
++        store = TodoStore()
++        store.write(
++            [
++                {"id": "t1", "content": "plan", "status": "completed"},
++                {"id": "t2", "content": "implement", "status": "in_progress"},
++                {"id": "t3", "content": "verify", "status": "pending"},
++            ]
++        )
++        cli_obj.agent._todo_store = store
++        cli_obj._delegate_subtask_total = 3
++        cli_obj._delegate_subtask_completed = {0}
++
++        snapshot = cli_obj._get_status_bar_snapshot()
++
++        assert snapshot["todo_progress_label"] == "\u4efb\u52a1\uff1a1/3"
++        assert snapshot["subtask_progress_label"] == "\u5b50\u4efb\u52a1\uff1a1/3"
++
++    def test_build_status_bar_text_appends_subtask_progress_last(self):
++        cli_obj = _attach_agent(
++            _make_cli(),
++            prompt_tokens=10_230,
++            completion_tokens=2_220,
++            total_tokens=12_450,
++            api_calls=7,
++            context_tokens=12_450,
++            context_length=200_000,
++        )
++        store = TodoStore()
++        store.write(
++            [
++                {"id": "t1", "content": "plan", "status": "completed"},
++                {"id": "t2", "content": "implement", "status": "in_progress"},
++                {"id": "t3", "content": "verify", "status": "pending"},
++            ]
++        )
++        cli_obj.agent._todo_store = store
++        cli_obj._delegate_subtask_total = 3
++        cli_obj._delegate_subtask_completed = {0, 1}
++
++        text = cli_obj._build_status_bar_text(width=120)
++
++        assert "\u4efb\u52a1\uff1a1/3" in text
++        assert text.endswith("\u5b50\u4efb\u52a1\uff1a2/3")
++        assert text.index("\u4efb\u52a1\uff1a1/3") < text.index("\u5b50\u4efb\u52a1\uff1a2/3")
++
++    def test_status_bar_fragments_append_subtask_progress_last(self):
++        cli_obj = _attach_agent(
++            _make_cli(),
++            prompt_tokens=10_230,
++            completion_tokens=2_220,
++            total_tokens=12_450,
++            api_calls=7,
++            context_tokens=12_450,
++            context_length=200_000,
++        )
++        cli_obj._status_bar_visible = True
++        store = TodoStore()
++        store.write(
++            [
++                {"id": "t1", "content": "plan", "status": "completed"},
++                {"id": "t2", "content": "implement", "status": "in_progress"},
++            ]
++        )
++        cli_obj.agent._todo_store = store
++        cli_obj._delegate_subtask_total = 2
++        cli_obj._delegate_subtask_completed = {0}
++
++        mock_app = MagicMock()
++        mock_app.output.get_size.return_value = MagicMock(columns=140)
++        with patch("prompt_toolkit.application.get_app", return_value=mock_app):
++            text = "".join(
++                fragment for _, fragment in cli_obj._get_status_bar_fragments()
++            )
++
++        assert "\u4efb\u52a1\uff1a1/2" in text
++        assert text.rstrip().endswith("\u5b50\u4efb\u52a1\uff1a1/2")
++        assert text.index("\u4efb\u52a1\uff1a1/2") < text.index("\u5b50\u4efb\u52a1\uff1a1/2")
++
+     def test_minimal_tui_chrome_threshold(self):
+@@ -531 +620,43 @@ class TestQuickToolTranscript:
+         assert mock_cprint.call_count == 1
++
++
++class TestStatusbarFastToolRefresh:
++    def test_on_tool_progress_invalidates_immediately_on_completion(self):
++        cli_obj = _make_cli()
++        cli_obj._tool_start_time = 1.0
++        cli_obj._invalidate = MagicMock()
++
++        cli_obj._on_tool_progress(
++            "tool.completed", "terminal", None, None, duration=0.2, is_error=False
++        )
++
++        cli_obj._invalidate.assert_called_once_with(min_interval=0.0)
++        assert cli_obj._tool_start_time == 0.0
++
++    def test_subagent_completion_updates_status_bar_progress(self):
++        cli_obj = _attach_agent(
++            _make_cli(),
++            prompt_tokens=10_230,
++            completion_tokens=2_220,
++            total_tokens=12_450,
++            api_calls=7,
++            context_tokens=12_450,
++            context_length=200_000,
++        )
++        cli_obj._invalidate = MagicMock()
++
++        cli_obj._on_tool_progress(
++            "subagent.start", task_index=0, task_count=3, goal="inspect"
++        )
++        cli_obj._on_tool_progress(
++            "subagent.complete",
++            task_index=0,
++            task_count=3,
++            goal="inspect",
++            status="completed",
++        )
++
++        text = cli_obj._build_status_bar_text(width=120)
++
++        assert "\u5b50\u4efb\u52a1\uff1a1/3" in text
++        assert cli_obj._invalidate.call_args_list[-1].kwargs == {"min_interval": 0.0}
+diff --git a/tests/cli/test_statusbar_fast_tool_refresh_runtime_patch.py b/tests/cli/test_statusbar_fast_tool_refresh_runtime_patch.py
+new file mode 100644
+index 00000000..bfd475dd
+--- /dev/null
++++ b/tests/cli/test_statusbar_fast_tool_refresh_runtime_patch.py
+@@ -0,0 +1,160 @@
++from datetime import datetime, timedelta
++from types import SimpleNamespace
++from unittest.mock import MagicMock, call, patch
++
++from cli import HermesCLI
++
++
++def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
++    cli_obj = HermesCLI.__new__(HermesCLI)
++    cli_obj.model = model
++    cli_obj.provider = "anthropic" if model.startswith("anthropic/") else None
++    cli_obj.requested_provider = cli_obj.provider
++    cli_obj._provider_source = ""
++    cli_obj.session_start = datetime.now() - timedelta(minutes=14, seconds=32)
++    cli_obj.conversation_history = [{"role": "user", "content": "hi"}]
++    cli_obj.agent = None
++    cli_obj.reasoning_config = None
++    cli_obj._status_bar_visible = False
++    cli_obj._background_tasks = {}
++    cli_obj._background_task_counter = 0
++    cli_obj._subagent_active_tasks = {}
++    cli_obj._subagent_task_counter = 0
++    cli_obj._pending_edit_snapshots = {}
++    cli_obj._inline_diffs_enabled = False
++    cli_obj._voice_mode = False
++    cli_obj._emit_persistent_tool_progress_line = lambda *args, **kwargs: None
++    cli_obj._pending_title = None
++    cli_obj._session_db = None
++    cli_obj.session_id = "session-1"
++    cli_obj._tmux_pane_title = ""
++    cli_obj._tmux_session_task_title = ""
++    cli_obj._tmux_task_title_locked = False
++    return cli_obj
++
++
++def _attach_agent(
++    cli_obj,
++    *,
++    prompt_tokens: int,
++    completion_tokens: int,
++    total_tokens: int,
++    api_calls: int,
++    context_tokens: int,
++    context_length: int,
++    compressions: int = 0,
++):
++    cli_obj.agent = SimpleNamespace(
++        model=cli_obj.model,
++        provider="anthropic" if cli_obj.model.startswith("anthropic/") else None,
++        base_url="",
++        session_input_tokens=prompt_tokens,
++        session_output_tokens=completion_tokens,
++        session_cache_read_tokens=0,
++        session_cache_write_tokens=0,
++        session_prompt_tokens=prompt_tokens,
++        session_completion_tokens=completion_tokens,
++        session_total_tokens=total_tokens,
++        session_api_calls=api_calls,
++        get_rate_limit_state=lambda: None,
++        context_compressor=SimpleNamespace(
++            last_prompt_tokens=context_tokens,
++            context_length=context_length,
++            compression_count=compressions,
++        ),
++    )
++    return cli_obj
++
++
++def _attach_todo_items(cli_obj, *items):
++    items = [
++        {"id": f"t{i}", "content": content, "status": status}
++        for i, (content, status) in enumerate(items, start=1)
++    ]
++    if cli_obj.agent is None:
++        cli_obj.agent = SimpleNamespace()
++    cli_obj.agent._todo_store = SimpleNamespace(read=lambda: [item.copy() for item in items])
++    return cli_obj
++
++
++class TestStatusbarFastToolRefreshRuntimePatch:
++    def test_status_bar_places_subtask_progress_at_primary_line_end(self):
++        cli_obj = _attach_todo_items(
++            _attach_agent(
++                _make_cli(model="DeepSeek-R1"),
++                prompt_tokens=10_230,
++                completion_tokens=2_220,
++                total_tokens=12_450,
++                api_calls=7,
++                context_tokens=12_450,
++                context_length=200_000,
++            ),
++            ("build", "completed"),
++            ("deploy", "in_progress"),
++            ("docs", "pending"),
++        )
++        cli_obj._subagent_task_counter = 1
++        cli_obj._subagent_active_tasks = {"sa-1": 1}
++        cli_obj._status_bar_visible = True
++        mock_app = MagicMock()
++        mock_app.output.get_size.return_value = MagicMock(columns=120)
++
++        with patch("prompt_toolkit.application.get_app", return_value=mock_app):
++            primary_fragments = cli_obj._get_status_bar_fragments()
++            secondary_fragments = cli_obj._get_status_bar_secondary_fragments()
++
++        primary_text = "".join(text for _, text in primary_fragments)
++        secondary_text = "".join(text for _, text in secondary_fragments)
++        assert "子任务：1/1" in primary_text
++        assert primary_text.rstrip().endswith("子任务：1/1")
++        assert "(2/3)" in secondary_text
++        assert "子任务：" not in secondary_text
++
++    def test_on_tool_progress_delegate_start_updates_subtask_counter_immediately(self):
++        cli_obj = _make_cli()
++        cli_obj._invalidate = MagicMock()
++        cli_obj._subagent_active_tasks = {}
++        cli_obj._subagent_task_counter = 0
++
++        cli_obj._on_tool_progress(
++            "tool.started",
++            "delegate_task",
++            "delegating",
++            {"goal": "inspect"},
++            tool_call_id="call-1",
++        )
++
++        assert cli_obj._subagent_active_tasks["call-1"] == 1
++        assert cli_obj._subagent_task_counter == 1
++        assert call(min_interval=0.0) in cli_obj._invalidate.call_args_list
++
++    def test_on_tool_progress_delegate_completion_removes_active_task_immediately(self):
++        cli_obj = _make_cli()
++        cli_obj._invalidate = MagicMock()
++        cli_obj._subagent_active_tasks = {"call-1": 1}
++        cli_obj._subagent_task_counter = 1
++        cli_obj._tool_start_time = 123.0
++
++        cli_obj._on_tool_progress(
++            "tool.completed",
++            "delegate_task",
++            None,
++            {},
++            tool_call_id="call-1",
++        )
++
++        assert cli_obj._subagent_active_tasks == {}
++        assert cli_obj._tool_start_time == 0.0
++        cli_obj._invalidate.assert_called_once_with(min_interval=0.0)
++
++    def test_chat_resets_stale_subtask_tracking_before_new_turn(self):
++        cli_obj = _make_cli()
++        cli_obj._subagent_active_tasks = {"old-call": 1}
++        cli_obj._subagent_task_counter = 4
++        cli_obj._ensure_runtime_credentials = lambda: False
++
++        result = cli_obj.chat("continue")
++
++        assert result is None
++        assert cli_obj._subagent_active_tasks == {}
++        assert cli_obj._subagent_task_counter == 0
