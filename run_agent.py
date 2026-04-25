@@ -4119,11 +4119,9 @@ class AIAgent:
                                 item_id = ri.get("id")
                                 if item_id and item_id in seen_item_ids:
                                     continue
-                                # Strip the "id" field — with store=False the
-                                # Responses API cannot look up items by ID and
-                                # returns 404.  The encrypted_content blob is
-                                # self-contained for reasoning chain continuity.
-                                replay_item = {k: v for k, v in ri.items() if k != "id"}
+                                replay_item = dict(ri)
+                                if item_id:
+                                    replay_item["id"] = item_id
                                 items.append(replay_item)
                                 if item_id:
                                     seen_item_ids.add(item_id)
@@ -4265,10 +4263,8 @@ class AIAgent:
                             continue
                         seen_ids.add(item_id)
                     reasoning_item = {"type": "reasoning", "encrypted_content": encrypted}
-                    # Do NOT include the "id" in the outgoing item — with
-                    # store=False (our default) the API tries to resolve the
-                    # id server-side and returns 404.  The id is still used
-                    # above for local deduplication via seen_ids.
+                    if isinstance(item_id, str) and item_id:
+                        reasoning_item["id"] = item_id
                     summary = item.get("summary")
                     if isinstance(summary, list):
                         reasoning_item["summary"] = summary
