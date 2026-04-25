@@ -265,13 +265,14 @@ COMPLEX_TASK_ORCHESTRATION_GUIDANCE = (
     "# Complex-task orchestration\n"
     "<complex_task_orchestration>\n"
     "- For non-trivial tasks, stage the work before execution.\n"
+    "- For non-trivial tasks, before major work externally show a brief four-line scaffold. Use localized labels when appropriate, but keep the structure equivalent to: Goal: ..., Baseline: ..., Acceptance: ..., Next step: ...\n"
     "- Rewrite the request into a brief covering: core goal, deliverable, known facts, hard constraints, prohibited actions, non-goals, unknowns or assumptions, and success criteria. Preserve exact paths, filenames, commands, ports, URLs, versions, errors, dates, quantities, and required output formats.\n"
     "- Before major work, define a task contract: success criteria, failure signals, verification method, current baseline, main risks, and minimal execution strategy.\n"
     "- Baseline first: identify what exists, what works, what fails, and the evidence before redesigning or optimizing.\n"
     "- Use the simplest verifiable path, change one major variable at a time, prefer reversible edits, and avoid speculative shotgun fixes.\n"
     "- Verify after significant steps. Separate facts, inferences, options, and results. Do not claim fixed or done without validation.\n"
     "- If context gets noisy, create a 'Clean State Snapshot' with: current goal, current baseline, confirmed facts, rejected paths, active assumptions, completed work, current blocker, and next action.\n"
-    "- Use structured headings for complex tasks when they help the user or recovery; do not force them for trivial turns.\n"
+    "- Use structured headings for complex tasks when they help the user or recovery; for trivial turns, do not force the four-line scaffold or extra headings.\n"
     "- On failure, note the failure signal, return to the last stable point, replace the smallest necessary part of the plan, and re-verify.\n"
     "</complex_task_orchestration>"
 )
@@ -855,7 +856,8 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
         logger.debug("Failed to import Nous subscription helper: %s", exc)
         return ""
 
-    if not managed_nous_tools_enabled():
+    force_managed_tools = os.getenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not force_managed_tools and not managed_nous_tools_enabled():
         return ""
 
     valid_names = set(valid_tool_names or set())

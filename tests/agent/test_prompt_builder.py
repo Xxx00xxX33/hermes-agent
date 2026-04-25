@@ -18,7 +18,6 @@ from agent.prompt_builder import (
     build_skills_system_prompt,
     build_nous_subscription_prompt,
     build_context_files_prompt,
-    build_environment_hints,
     CONTEXT_FILE_MAX_CHARS,
     DEFAULT_AGENT_IDENTITY,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
@@ -27,8 +26,8 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     DELEGATION_ORCHESTRATION_GUIDANCE,
+    COMPLEX_TASK_ORCHESTRATION_GUIDANCE,
     PLATFORM_HINTS,
-    WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -57,6 +56,17 @@ class TestGuidanceConstants:
         assert "isolated child processes" in text
         assert "do not stream raw data" in text
         assert "final acceptance checks" in text
+
+    def test_complex_task_guidance_requires_visible_scaffold(self):
+        text = COMPLEX_TASK_ORCHESTRATION_GUIDANCE
+        lowered = text.lower()
+        assert "four-line scaffold" in lowered
+        assert "externally show" in lowered
+        assert "Goal:" in text
+        assert "Baseline:" in text
+        assert "Acceptance:" in text
+        assert "Next step:" in text
+        assert "trivial turns" in lowered
 
 
 # =========================================================================
@@ -422,7 +432,7 @@ class TestBuildSkillsSystemPrompt:
 
 class TestBuildNousSubscriptionPrompt:
     def test_includes_active_subscription_features(self, monkeypatch):
-        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
+        monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
         monkeypatch.setattr(
             "hermes_cli.nous_subscription.get_nous_subscription_features",
             lambda config=None: NousSubscriptionFeatures(
@@ -446,7 +456,7 @@ class TestBuildNousSubscriptionPrompt:
         assert "do not ask the user for Firecrawl, FAL, OpenAI TTS, or Browser-Use API keys" in prompt
 
     def test_non_subscriber_prompt_includes_relevant_upgrade_guidance(self, monkeypatch):
-        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
+        monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
         monkeypatch.setattr(
             "hermes_cli.nous_subscription.get_nous_subscription_features",
             lambda config=None: NousSubscriptionFeatures(
@@ -469,7 +479,7 @@ class TestBuildNousSubscriptionPrompt:
         assert "Do not mention subscription unless" in prompt
 
     def test_feature_flag_off_returns_empty_prompt(self, monkeypatch):
-        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: False)
+        monkeypatch.delenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", raising=False)
 
         prompt = build_nous_subscription_prompt({"web_search"})
 
@@ -782,29 +792,6 @@ class TestPromptBuilderConstants:
 
 
 # =========================================================================
-# Environment hints
-# =========================================================================
-
-class TestEnvironmentHints:
-    def test_wsl_hint_constant_mentions_mnt(self):
-        assert "/mnt/c/" in WSL_ENVIRONMENT_HINT
-        assert "WSL" in WSL_ENVIRONMENT_HINT
-
-    def test_build_environment_hints_on_wsl(self, monkeypatch):
-        import agent.prompt_builder as _pb
-        monkeypatch.setattr(_pb, "is_wsl", lambda: True)
-        result = _pb.build_environment_hints()
-        assert "/mnt/" in result
-        assert "WSL" in result
-
-    def test_build_environment_hints_not_wsl(self, monkeypatch):
-        import agent.prompt_builder as _pb
-        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
-        result = _pb.build_environment_hints()
-        assert result == ""
-
-
-# =========================================================================
 # Conditional skill activation
 # =========================================================================
 
@@ -1027,12 +1014,6 @@ class TestOpenAIModelExecutionGuidance:
         assert "missing_context" in text or "missing context" in text
         assert "hallucinate" in text or "guess" in text
 
-    def test_guidance_uses_xml_tags(self):
-        assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-        assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-        assert "<verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-        assert "</verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-
     def test_guidance_covers_background_task_strategy(self):
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
         assert "background" in text
@@ -1055,6 +1036,12 @@ class TestOpenAIModelExecutionGuidance:
         assert "needed right away" in text
         assert "dependency-blocking" in text
         assert any(term in text for term in ("ram-constrained", "memory-heavy", "resource-heavy"))
+
+    def test_guidance_uses_xml_tags(self):
+        assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert "<verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert "</verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
 
     def test_guidance_is_string(self):
         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
