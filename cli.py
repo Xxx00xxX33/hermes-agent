@@ -51,6 +51,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit import print_formatted_text as _pt_print
 from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
+from prompt_toolkit.lexers import Lexer
 try:
     from prompt_toolkit.cursor_shapes import CursorShape
     _STEADY_CURSOR = CursorShape.BLOCK  # Non-blinking block cursor
@@ -1080,6 +1081,72 @@ def _sanitize_resumed_text(text: str) -> str:
 
     cleaned = strip_ansi(text)
     return "".join(ch for ch in cleaned if ch in "\n\r\t" or ord(ch) >= 32)
+
+
+_TRANSCRIPT_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_TRANSCRIPT_SEPARATOR_CHARS = frozenset("─━═╭╮╰╯┌┐└┘├┤┬┴┼┊│┃┄┈╌╍╎╏ ")
+_TRANSCRIPT_META_PREFIXES = (
+    "provider:",
+    "context:",
+    "max output:",
+    "cost:",
+    "capabilities:",
+    "prompt caching:",
+    "saved to config.yaml",
+    "(session only",
+)
+
+
+def _style_tui_transcript_line(line: str):
+    """Return prompt_toolkit fragments for one transcript line.
+
+    The live TUI transcript stores plain text after ANSI/control sanitization, so
+    the TextArea needs semantic colors at render time instead of inheriting one
+    pale global foreground.  Keep this classifier deliberately narrow: only
+    Hermes-authored wrapper lines get accent colors; assistant/tool bodies stay
+    neutral for readability.
+    """
+    text = line or ""
+    stripped = text.strip()
+    if not stripped:
+        return [("class:transcript", text)]
+
+    # If a raw ANSI fragment ever reaches the TextArea, avoid adding a second
+    # semantic color on top of it.  The normal TUI path strips ANSI before this.
+    if _TRANSCRIPT_ANSI_RE.search(text):
+        return [("class:transcript", _TRANSCRIPT_ANSI_RE.sub("", text))]
+
+    lower = stripped.lower()
+    if len(stripped) >= 3 and all(ch in _TRANSCRIPT_SEPARATOR_CHARS for ch in stripped):
+        return [("class:transcript-separator", text)]
+    if stripped.startswith(("✗", "✖", "❌")) or lower.startswith(("error", "failed", "traceback")):
+        return [("class:transcript-error", text)]
+    if stripped.startswith("⚠") or "⚠" in stripped or lower.startswith(("warning:", "warn:")):
+        return [("class:transcript-warning", text)]
+    if stripped.startswith(("✓", "✔")):
+        return [("class:transcript-notice", text)]
+    if stripped.startswith("Initializing agent"):
+        return [("class:transcript-progress", text)]
+    if stripped.startswith("┊") or " ┊ " in text:
+        return [("class:transcript-progress", text)]
+    if lower.startswith(_TRANSCRIPT_META_PREFIXES):
+        return [("class:transcript-meta", text)]
+    if stripped.startswith(("●", "❯")):
+        return [("class:transcript-user", text)]
+    return [("class:transcript", text)]
+
+
+class _TranscriptSemanticLexer(Lexer):
+    """Semantic prompt_toolkit lexer for the TUI transcript TextArea."""
+
+    def lex_document(self, document):
+        def get_line(line_number: int):
+            try:
+                return _style_tui_transcript_line(document.lines[line_number])
+            except IndexError:
+                return []
+
+        return get_line
 
 
 def _sanitize_resumed_content(content: Any) -> Any:
@@ -6097,14 +6164,11 @@ class HermesCLI:
         display = display_hermes_home()
 
         profiles_parent = Path.home() / ".hermes" / "profiles"
-        if home.parent.name == "profiles":
-            profile_name = home.name
-        else:
-            try:
-                rel = home.relative_to(profiles_parent)
-                profile_name = str(rel).split("/")[0]
-            except ValueError:
-                profile_name = None
+        try:
+            rel = home.relative_to(profiles_parent)
+            profile_name = str(rel).split("/")[0]
+        except ValueError:
+            profile_name = None
 
         print()
         if profile_name:
@@ -12045,6 +12109,7 @@ class HermesCLI:
             wrap_lines=True,
             scrollbar=False,
             height=Dimension(weight=1),
+            lexer=_TranscriptSemanticLexer(),
             style="class:transcript",
         )
         self._tui_transcript_area = transcript_area
@@ -12077,7 +12142,15 @@ class HermesCLI:
 
         # Style for the application
         self._tui_style_base = {
-            'transcript': '#FFF8DC',
+            # Message transcript: neutral body with semantic accents.
+            'transcript': '#EAF2FF',
+            'transcript-user': '#9CDCFE bold',
+            'transcript-notice': '#8EF0A4 bold',
+            'transcript-meta': '#C7D2E5',
+            'transcript-warning': '#FFD166 bold',
+            'transcript-error': '#FF7B93 bold',
+            'transcript-progress': '#8CCFFF bold',
+            'transcript-separator': '#7C8DA8',
             'input-area': '#FFF8DC',
             'placeholder': '#555555 italic',
             'prompt': '#FFF8DC',

@@ -111,3 +111,37 @@ def test_cprint_line_adds_one_newline_for_line_oriented_tui_notices():
         call("already newline\n"),
         call("\n"),
     ]
+
+
+def test_tui_transcript_semantic_lexer_styles_line_oriented_notices():
+    from prompt_toolkit.document import Document
+
+    from cli import _TranscriptSemanticLexer
+
+    document = Document(
+        "  ✓ Model switched: gpt-5.5\n"
+        "    Provider: custom\n"
+        "    Context: 200,000 tokens\n"
+        "    ⚠ Auto-corrected `gpt5.5` → `gpt-5.5`\n"
+        "Initializing agent...\n"
+        "  ┊ 📋 planning 3 task(s)\n"
+        "────────────────────────────────────────\n"
+        "ordinary assistant text"
+    )
+
+    line = _TranscriptSemanticLexer().lex_document(document)
+
+    assert line(0) == [("class:transcript-notice", "  ✓ Model switched: gpt-5.5")]
+    assert line(1) == [("class:transcript-meta", "    Provider: custom")]
+    assert line(2) == [("class:transcript-meta", "    Context: 200,000 tokens")]
+    assert line(3) == [("class:transcript-warning", "    ⚠ Auto-corrected `gpt5.5` → `gpt-5.5`")]
+    assert line(4) == [("class:transcript-progress", "Initializing agent...")]
+    assert line(5) == [("class:transcript-progress", "  ┊ 📋 planning 3 task(s)")]
+    assert line(6) == [("class:transcript-separator", "────────────────────────────────────────")]
+    assert line(7) == [("class:transcript", "ordinary assistant text")]
+
+
+def test_tui_transcript_semantic_lexer_strips_raw_ansi_without_recoloring():
+    from cli import _style_tui_transcript_line
+
+    assert _style_tui_transcript_line("\x1b[31mraw red\x1b[0m") == [("class:transcript", "raw red")]
