@@ -154,7 +154,7 @@ class TestCLIStatusBar:
         assert "lucienfc-gpt" in text
         assert "high" in text
         assert "(2/3)" not in text
-        assert text.rstrip().endswith("子任务：5/5")
+        assert "子任务：" not in text
 
     def test_input_height_counts_wide_characters_using_cell_width(self):
         cli_obj = _make_cli()
@@ -342,10 +342,10 @@ class TestCLIStatusBar:
         assert "DeepSeek-R1" in primary_text
         assert "lucienfc-gpt" in primary_text
         assert "custom" not in primary_text
-        assert "子任务：5/5" in primary_text
-        assert primary_text.rstrip().endswith("子任务：5/5")
+        assert "子任务：" not in primary_text
         assert "(2/3)" in secondary_text
-        assert "子任务：" not in secondary_text
+        assert "子任务：2/5" in secondary_text
+        assert secondary_text.index("(2/3)") < secondary_text.index("子任务：2/5")
 
     def test_status_bar_primary_line_places_subtask_progress_after_background_label(self):
         cli_obj = _attach_todo_items(
@@ -384,11 +384,10 @@ class TestCLIStatusBar:
         primary_text = "".join(text for _, text in primary_fragments)
         secondary_text = "".join(text for _, text in secondary_fragments)
         assert "后台任务：2/5" in primary_text
-        assert "子任务：5/5" in primary_text
-        assert primary_text.rstrip().endswith("子任务：5/5")
-        assert primary_text.rfind("子任务：5/5") > primary_text.rfind("后台任务：2/5")
+        assert "子任务：" not in primary_text
         assert "(2/3)" in secondary_text
-        assert "子任务：" not in secondary_text
+        assert "子任务：2/5" in secondary_text
+        assert secondary_text.index("(2/3)") < secondary_text.index("子任务：2/5")
 
     def test_status_bar_primary_line_shows_background_task_counts_from_cli_tracking(self):
         cli_obj = _attach_background_tasks(
@@ -565,7 +564,7 @@ class TestCLIStatusBar:
             )
 
         assert mock_cprint.call_count == 1
-        assert mock_cprint.call_args.args[0] == f"  ┊ {_ACCENT}📋 planning 3 task(s){_RST}"
+        assert mock_cprint.call_args.args[0] == f"  ┊ {_ACCENT}📋 planning 3 task(s){_RST}\n"
         assert cli_obj._spinner_text.endswith("planning 3 task(s)")
         cli_obj._invalidate.assert_called_once()
 
@@ -1221,6 +1220,14 @@ class TestStatusBarWidthSource:
 
 
 class TestToolProgressRefresh:
+    def test_active_delegate_subtask_does_not_count_as_completed(self):
+        label, style = HermesCLI._get_status_bar_subagent_task_label(
+            {"total": 1, "completed": 0, "active": 1}
+        )
+
+        assert label == "子任务：0/1"
+        assert style == "class:status-bar-strong"
+
     def test_delegate_task_start_and_complete_updates_subtask_counts(self):
         cli_obj = _make_cli(model="gpt-5.4")
         cli_obj._status_bar_visible = True

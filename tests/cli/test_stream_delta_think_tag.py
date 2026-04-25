@@ -24,6 +24,7 @@ def _make_cli_stub():
     cli._deferred_content = ""
     cli._stream_text_ansi = ""
     cli._stream_needs_break = False
+    cli._stream_last_was_newline = True
     cli._emitted = []
 
     # Mock _emit_stream_text to capture output
@@ -110,6 +111,29 @@ class TestRealReasoningBlock:
         cli = _make_cli_stub()
         cli._stream_delta("   <think>")
         assert cli._in_reasoning_block
+
+
+def test_emit_stream_text_preserves_newlines_between_streamed_lines():
+    from cli import HermesCLI
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.show_reasoning = False
+    cli._reasoning_box_opened = False
+    cli._stream_box_opened = True
+    cli._stream_buf = ""
+    cli._stream_text_ansi = ""
+    cli._stream_last_was_newline = True
+    cli._reasoning_debug_event = lambda *args, **kwargs: None
+    cli._close_reasoning_box = lambda: None
+
+    emitted = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("cli._cprint", lambda text: emitted.append(text))
+        cli._emit_stream_text("第一行\n第二行\n")
+
+    assert emitted == ["第一行\n", "第二行\n"]
+    assert cli._stream_buf == ""
+    assert cli._stream_last_was_newline is True
 
 
 class TestFlushRecovery:

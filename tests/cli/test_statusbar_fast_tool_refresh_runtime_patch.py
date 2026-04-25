@@ -105,10 +105,10 @@ class TestStatusbarFastToolRefreshRuntimePatch:
 
         primary_text = "".join(text for _, text in primary_fragments)
         secondary_text = "".join(text for _, text in secondary_fragments)
-        assert "子任务：1/1" in primary_text
-        assert primary_text.rstrip().endswith("子任务：1/1")
+        assert "子任务：" not in primary_text
         assert "(2/3)" in secondary_text
-        assert "子任务：" not in secondary_text
+        assert "子任务：0/1" in secondary_text
+        assert secondary_text.index("(2/3)") < secondary_text.index("子任务：0/1")
 
     def test_on_tool_progress_delegate_start_updates_subtask_counter_immediately(self):
         cli_obj = _make_cli()
