@@ -358,6 +358,171 @@ def test_delegate_progress_display_surfaces_omit_raw_child_previews():
     assert progress_events or spinner.print_above.call_args_list
 
 
+def test_delegate_batch_surfaces_omit_raw_child_outputs_and_progress():
+    parent = _make_parent(session_db=MagicMock())
+    parent._session_db.record_session_event.side_effect = (
+        lambda *args, **kwargs: kwargs.get("event_id", "evt-recorded")
+    )
+    spinner = MagicMock()
+    parent._delegate_spinner = spinner
+    progress_events = []
+
+    def parent_progress(*args, **kwargs):
+        progress_events.append({"args": args, "kwargs": kwargs})
+
+    parent.tool_progress_callback = parent_progress
+    raw_preview = f"batch raw progress {RAW_CONTEXT_SENTINEL}"
+    raw_thinking = f"batch raw reasoning {RAW_CONTEXT_SENTINEL}"
+    oversized = RAW_CONTEXT_SENTINEL * 400
+    raw_error = f"batch raw child error stderr {RAW_CONTEXT_SENTINEL}"
+    built_children = []
+    build_lock = threading.Lock()
+
+    with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+        os.environ,
+        {"HERMES_HOME": str(Path(tmpdir) / ".hermes")},
+    ):
+        with patch("run_agent.AIAgent") as MockAgent:
+            def build_child(*args, **kwargs):
+                with build_lock:
+                    task_index = len(built_children)
+                    built_children.append(task_index)
+                child = MagicMock()
+                child.model = "claude-sonnet-4-6"
+                child.session_id = f"sid-child-{task_index}"
+                child.session_prompt_tokens = task_index + 1
+                child.session_completion_tokens = task_index + 2
+                child.tool_progress_callback = kwargs.get("tool_progress_callback")
+                child.thinking_callback = kwargs.get("thinking_callback")
+
+                def run_conversation(**_run_kwargs):
+                    callback = child.tool_progress_callback
+                    assert callback is not None
+                    user_message = str(_run_kwargs.get("user_message", ""))
+                    callback(
+                        "subagent.start",
+                        preview=raw_preview,
+                        message=raw_preview,
+                        args={"cmd": raw_preview},
+                    )
+                    callback(
+                        "tool.started",
+                        tool_name="terminal",
+                        preview=raw_preview,
+                        args={"cmd": raw_preview},
+                    )
+                    if child.thinking_callback:
+                        child.thinking_callback(raw_thinking)
+                    if "oversized child" in user_message:
+                        callback(
+                            "subagent.complete",
+                            preview=raw_preview,
+                            summary=raw_preview,
+                            details={"stdout": raw_preview},
+                            status="completed",
+                        )
+                        return {
+                            "final_response": oversized,
+                            "completed": True,
+                            "interrupted": False,
+                            "api_calls": 2,
+                            "messages": [
+                                {
+                                    "role": "assistant",
+                                    "tool_calls": [
+                                        {
+                                            "id": "tc-raw",
+                                            "function": {
+                                                "name": "terminal",
+                                                "arguments": raw_preview,
+                                            },
+                                        }
+                                    ],
+                                },
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": "tc-raw",
+                                    "content": raw_preview,
+                                },
+                            ],
+                        }
+                    assert "failed child" in user_message
+                    callback(
+                        "subagent.complete",
+                        preview=raw_preview,
+                        summary=raw_preview,
+                        error=raw_error,
+                        message=raw_error,
+                        details={"stderr": raw_error},
+                        status="failed",
+                    )
+                    return {
+                        "final_response": "",
+                        "completed": False,
+                        "interrupted": False,
+                        "api_calls": 1,
+                        "messages": [
+                            {
+                                "role": "tool",
+                                "tool_call_id": "tc-error",
+                                "content": raw_error,
+                            }
+                        ],
+                        "error": raw_error,
+                    }
+
+                child.run_conversation.side_effect = run_conversation
+                return child
+
+            MockAgent.side_effect = build_child
+
+            result = _decode(delegate_task(
+                tasks=[
+                    {"goal": "Batch parent-safe oversized child"},
+                    {"goal": "Batch parent-safe failed child"},
+                ],
+                parent_agent=parent,
+            ))
+
+        artifact_paths = [
+            Path(entry["summary_retrieval_handle"]["locator"]["artifact_path"])
+            for entry in result["results"]
+            if "summary_retrieval_handle" in entry
+        ]
+
+        _assert_no_sentinel(result)
+        _assert_no_sentinel(progress_events)
+        _assert_no_sentinel([
+            {"args": call.args, "kwargs": call.kwargs}
+            for call in spinner.print_above.call_args_list
+        ])
+        _assert_no_banned_parent_keys(result)
+
+        entries = sorted(result["results"], key=lambda item: item["task_index"])
+        assert [entry["task_index"] for entry in entries] == [0, 1]
+        assert entries[0]["status"] == "completed"
+        assert entries[0]["summary_truncated"] is True
+        assert "omitted from parent context" in entries[0]["summary"]
+        assert entries[1]["status"] == "failed"
+        assert entries[1]["error_type"] == "child_error"
+        assert entries[1]["error_chars"] == len(raw_error)
+        assert "raw error details omitted" in entries[1]["error"]
+
+        assert parent._session_db.record_session_event.call_count == 1
+        _, kwargs = parent._session_db.record_session_event.call_args
+        _assert_no_sentinel({
+            "summary": kwargs["summary"],
+            "payload": kwargs["payload"],
+            "retrieval_handles": kwargs["retrieval_handles"],
+            "searchable_text": kwargs["searchable_text"],
+        })
+        assert artifact_paths
+        assert artifact_paths[0].exists()
+        assert artifact_paths[0].read_text(encoding="utf-8") == oversized
+
+    assert progress_events or spinner.print_above.call_args_list
+
+
 def test_retrieval_resolve_returns_metadata_only_for_delegate_only_artifact(session_db, tmp_path):
     artifact = tmp_path / "raw-child-response.txt"
     artifact.write_text(RAW_CONTEXT_SENTINEL, encoding="utf-8")
