@@ -1,11 +1,11 @@
 diff --git a/agent/model_metadata.py b/agent/model_metadata.py
-index 81bac6c9..e055a53a 100644
+index 03f70b3f..2efaa361 100644
 --- a/agent/model_metadata.py
 +++ b/agent/model_metadata.py
-@@ -963,6 +963,39 @@ def get_model_context_length(
+@@ -939,6 +939,39 @@ def get_model_context_length(
      if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
          return config_context_length
-
+ 
 +    # 0b. Config-file override (main model context_length)
 +    #
 +    # Some OpenAI-compatible endpoints do not expose context metadata in /models.
@@ -43,13 +43,13 @@ index 81bac6c9..e055a53a 100644
      # "model-name") so cache lookups and server queries use the bare ID that
      # local servers actually know about.  Ollama "model:tag" colons are preserved.
 diff --git a/tests/agent/test_model_metadata.py b/tests/agent/test_model_metadata.py
-index 6a0eab15..e7710061 100644
+index df680fb2..3abbdda3 100644
 --- a/tests/agent/test_model_metadata.py
 +++ b/tests/agent/test_model_metadata.py
-@@ -375,6 +375,72 @@ class TestGetModelContextLength:
-
+@@ -373,6 +373,72 @@ class TestGetModelContextLength:
+ 
          assert result == 200000
-
+ 
 +    @patch("agent.model_metadata.fetch_model_metadata")
 +    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
 +    @patch("agent.model_metadata.get_cached_context_length")
@@ -116,6 +116,35 @@ index 6a0eab15..e7710061 100644
 +        mock_cached.assert_called_once_with("gpt-5.4", "https://different.example/v1")
 +        mock_endpoint_fetch.assert_called_once_with("https://different.example/v1", api_key="")
 +
-
+ 
  # =========================================================================
  # _strip_provider_prefix — Ollama model:tag vs provider:model
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 2efaa361..b8f71248 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -107,6 +107,7 @@ DEFAULT_CONTEXT_LENGTHS = {
+     "claude": 200000,
+     # OpenAI
+     "gpt-4.1": 1047576,
++    "gpt-5.5": 200000,
+     "gpt-5": 128000,
+     "gpt-4": 128000,
+     # Google
+diff --git a/tests/agent/test_model_metadata.py b/tests/agent/test_model_metadata.py
+index 3abbdda3..76fb3080 100644
+--- a/tests/agent/test_model_metadata.py
++++ b/tests/agent/test_model_metadata.py
+@@ -225,6 +225,12 @@ class TestGetModelContextLength:
+         mock_fetch.return_value = {}
+         assert get_model_context_length("openai/gpt-4o") == 128000
+ 
++    @patch("agent.model_metadata.fetch_model_metadata")
++    def test_gpt_5_5_context_length(self, mock_fetch):
++        """gpt-5.5 should not fall back to the generic gpt-5 128K default."""
++        mock_fetch.return_value = {}
++        assert get_model_context_length("gpt-5.5") == 200000
++
+     @patch("agent.model_metadata.fetch_model_metadata")
+     def test_qwen3_coder_plus_context_length(self, mock_fetch):
+         """qwen3-coder-plus has a 1M context window, not the generic 128K Qwen default."""
