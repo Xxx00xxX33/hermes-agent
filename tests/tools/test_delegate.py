@@ -12,9 +12,11 @@ Run with:  python -m pytest tests/test_delegate.py -v
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -506,6 +508,75 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(entry["summary_omitted_chars"], len(oversized))
             self.assertIn("omitted from parent context", entry["summary"])
             self.assertNotIn(raw_sentinel, entry["summary"])
+
+    def test_oversized_child_summary_records_safe_retrieval_metadata(self):
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "sid-parent"
+        parent._session_db = MagicMock()
+        parent._session_db.record_session_event.return_value = "evt-recorded"
+        raw_sentinel = "RAW_DELEGATION_SENTINEL"
+        oversized = raw_sentinel * 400
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch.dict(os.environ, {"HERMES_HOME": str(Path(tmpdir) / ".hermes")}):
+            with patch("run_agent.AIAgent") as MockAgent:
+                mock_child = MagicMock()
+                mock_child.model = "claude-sonnet-4-6"
+                mock_child.session_id = "sid-child"
+                mock_child.session_prompt_tokens = 0
+                mock_child.session_completion_tokens = 0
+                mock_child.run_conversation.return_value = {
+                    "final_response": oversized,
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+                MockAgent.return_value = mock_child
+
+                result = json.loads(delegate_task(goal="Summarize raw output", parent_agent=parent))
+
+            entry = result["results"][0]
+            flattened = json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+            self.assertNotIn(raw_sentinel, flattened)
+            self.assertEqual(entry["summary_event_id"], "evt-recorded")
+            handle = entry["summary_retrieval_handle"]
+            self.assertTrue(handle["handle_id"].startswith("rh_"))
+            self.assertEqual(handle["source_type"], "session_event")
+            self.assertEqual(handle["metadata"]["raw_chars"], len(oversized))
+            self.assertEqual(handle["metadata"]["raw_bytes"], len(oversized.encode("utf-8")))
+            self.assertEqual(handle["locator"]["session_id"], "sid-parent")
+            self.assertEqual(handle["locator"]["child_session_id"], "sid-child")
+
+            artifact_path = Path(handle["locator"]["artifact_path"])
+            self.assertTrue(artifact_path.exists())
+            self.assertEqual(artifact_path.read_text(encoding="utf-8"), oversized)
+
+            parent._session_db.record_session_event.assert_called_once()
+            args, kwargs = parent._session_db.record_session_event.call_args
+            self.assertEqual(args[:2], ("sid-parent", "delegation_child_response"))
+            self.assertIn("response omitted", kwargs["searchable_text"])
+            self.assertNotIn(raw_sentinel, kwargs["searchable_text"])
+            self.assertEqual(kwargs["retrieval_handles"], [handle])
+            self.assertEqual(kwargs["payload"]["raw_chars"], len(oversized))
+            self.assertEqual(kwargs["payload"]["raw_bytes"], len(oversized.encode("utf-8")))
+            self.assertEqual(kwargs["payload"]["artifact_path"], str(artifact_path))
+
+            safe_event_surface = {
+                "summary": kwargs["summary"],
+                "payload": kwargs["payload"],
+                "retrieval_handles": kwargs["retrieval_handles"],
+                "source_type": kwargs["source_type"],
+                "source_id": kwargs["source_id"],
+                "event_id": kwargs["event_id"],
+                "searchable_text": kwargs["searchable_text"],
+            }
+            self.assertNotIn(raw_sentinel, json.dumps(
+                safe_event_surface,
+                ensure_ascii=False,
+                sort_keys=True,
+            ))
 
     def test_tool_trace_detects_error(self):
         """Tool results containing 'error' should be marked as error status."""

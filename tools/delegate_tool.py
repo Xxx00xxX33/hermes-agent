@@ -20,10 +20,15 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
+
+from agent.context_references import make_retrieval_handle
+from hermes_constants import get_hermes_home
 
 from toolsets import TOOLSETS
 
@@ -149,6 +154,134 @@ def _parent_safe_child_summary(summary: Any) -> tuple[str, bool, int]:
         True,
         raw_chars,
     )
+
+
+def _safe_artifact_component(value: str | None, fallback: str) -> str:
+    """Return a filesystem-safe artifact path component."""
+    text = value if isinstance(value, str) and value.strip() else fallback
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", text)[:160] or fallback
+
+
+def _write_omitted_child_response_artifact(
+    *,
+    raw_response: str,
+    session_id: str,
+    task_index: int,
+    event_id: str,
+) -> str | None:
+    """Persist an omitted child response outside the parent prompt."""
+    try:
+        safe_session_id = _safe_artifact_component(session_id, "session")
+        safe_event_id = _safe_artifact_component(event_id, "event")
+        artifact_dir = (
+            get_hermes_home()
+            / "session_events"
+            / "delegation_child_responses"
+            / safe_session_id
+        )
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifact_dir / f"task_{task_index}_{safe_event_id}.txt"
+        artifact_path.write_text(raw_response, encoding="utf-8")
+        return str(artifact_path)
+    except OSError as exc:
+        logger.warning("Could not persist omitted child response artifact: %s", exc)
+        return None
+
+
+def _persist_omitted_child_response(
+    *,
+    raw_response: Any,
+    parent_agent,
+    child,
+    task_index: int,
+    goal: str,
+) -> dict[str, Any]:
+    """Record safe retrieval metadata for an omitted child final response.
+
+    The raw response is written outside the parent-visible result and indexed as
+    session-event searchable text.  The returned mapping contains only safe
+    event/handle metadata for the parent context.
+    """
+    session_id = getattr(parent_agent, "session_id", None)
+    session_db = getattr(parent_agent, "_session_db", None)
+    if not isinstance(session_id, str) or not session_id.strip() or session_db is None:
+        return {}
+
+    raw_text = "" if raw_response is None else str(raw_response)
+    raw_bytes = len(raw_text.encode("utf-8"))
+    session_id = session_id.strip()
+    child_session_id = getattr(child, "session_id", None)
+    if not isinstance(child_session_id, str):
+        child_session_id = None
+
+    event_id = f"evt_delegate_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    artifact_path = _write_omitted_child_response_artifact(
+        raw_response=raw_text,
+        session_id=session_id,
+        task_index=task_index,
+        event_id=event_id,
+    )
+
+    locator: dict[str, Any] = {
+        "session_id": session_id,
+        "event_type": "delegation_child_response",
+        "task_index": task_index,
+    }
+    if child_session_id:
+        locator["child_session_id"] = child_session_id
+    if artifact_path:
+        locator["artifact_path"] = artifact_path
+
+    handle = make_retrieval_handle(
+        "session_event",
+        event_id,
+        locator=locator,
+        metadata={
+            "task_index": task_index,
+            "raw_chars": len(raw_text),
+            "raw_bytes": raw_bytes,
+            "child_session_id": child_session_id,
+        },
+    )
+    handle_dict = handle.to_dict()
+    summary = (
+        f"Oversized delegation child response for task {task_index} "
+        f"({len(raw_text):,} characters) stored outside parent context."
+    )
+    safe_search_text = (
+        "Oversized child delegation response omitted; "
+        f"task_index={task_index}; "
+        f"child_session_id={child_session_id or 'unknown'}; "
+        f"raw_chars={len(raw_text)}; raw_bytes={raw_bytes}; "
+        "artifact available via retrieval handle."
+    )
+
+    try:
+        recorded_event_id = session_db.record_session_event(
+            session_id,
+            "delegation_child_response",
+            summary=summary,
+            payload={
+                "task_index": task_index,
+                "raw_chars": len(raw_text),
+                "raw_bytes": raw_bytes,
+                "child_session_id": child_session_id,
+                "artifact_path": artifact_path,
+            },
+            retrieval_handles=[handle_dict],
+            source_type="delegation_child",
+            source_id=child_session_id or f"task-{task_index}",
+            event_id=event_id,
+            searchable_text=safe_search_text,
+        )
+    except Exception as exc:
+        logger.warning("Could not record omitted child response event: %s", exc)
+        return {}
+
+    return {
+        "summary_event_id": recorded_event_id if isinstance(recorded_event_id, str) else event_id,
+        "summary_retrieval_handle": handle_dict,
+    }
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
@@ -543,8 +676,9 @@ def _run_single_child(
 
         duration = round(time.monotonic() - child_start, 2)
 
+        raw_final_response = result.get("final_response")
         summary, summary_truncated, summary_chars = _parent_safe_child_summary(
-            result.get("final_response")
+            raw_final_response
         )
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
@@ -629,6 +763,13 @@ def _run_single_child(
         if summary_truncated:
             entry["summary_truncated"] = True
             entry["summary_omitted_chars"] = summary_chars
+            entry.update(_persist_omitted_child_response(
+                raw_response=raw_final_response,
+                parent_agent=parent_agent,
+                child=child,
+                task_index=task_index,
+                goal=goal,
+            ))
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
