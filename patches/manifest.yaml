@@ -13,8 +13,7 @@ bundle:
     patch: patches/hermes-cli-tmux-task-title.patch
     purpose: Keep tmux pane titles aligned to the first meaningful task title.
     verifies:
-      - tests/cli/test_cli_status_bar.py
-      - tests/agent/test_title_generator.py
+      - tests/cli/test_tmux_task_title.py
 
   - id: working-indicator
     patch: patches/hermes-cli-working-indicator.patch
@@ -43,6 +42,18 @@ bundle:
       - tests/run_agent/test_run_agent_codex_responses.py
       - tests/tools/test_delegate.py
 
+
+  - id: context-isolation-hardening
+    patch: patches/hermes-context-isolation-hardening.patch
+    purpose: Preserve parent-safe context isolation, retrieval/session-search handles, and toolset regressions.
+    verifies:
+      - tests/agent/test_context_references.py
+      - tests/test_hermes_state.py
+      - tests/test_model_tools.py
+      - tests/test_toolsets.py
+      - tests/tools/test_retrieval_resolve.py
+      - tests/tools/test_session_search.py
+
   - id: branch-provider-routing-regression
     patch: patches/hermes-branch-provider-routing-regression.patch
     purpose: Keep /branch sessions inheriting the active provider/base_url/api_mode routing metadata.
@@ -55,6 +66,7 @@ bundle:
     verifies:
       - tests/cli/test_cli_provider_resolution.py
       - tests/cli/test_cli_new_session.py
+      - tests/gateway/test_model_command_custom_providers.py
 
   - id: tmux-scrollback-gap
     patch: patches/hermes-tmux-scrollback-gap.patch
@@ -79,9 +91,15 @@ bundle:
     verifies:
       - tests/agent/test_auxiliary_client.py
 
+  - id: title-generator-reasoning
+    patch: patches/hermes-title-generator-reasoning.patch
+    purpose: Preserve auxiliary.title reasoning-effort overrides and unsupported-provider fallback during automatic session title generation.
+    verifies:
+      - tests/agent/test_title_generator.py
+
   - id: model-context-config-override
     patch: patches/hermes-model-context-config-override.patch
-    purpose: Honour configured model.context_length for the matching main OpenAI-compatible endpoint/model.
+    purpose: Honour configured model.context_length for the matching main OpenAI-compatible endpoint/model and keep gpt-5.5 from falling back to generic gpt-5 context.
     verifies:
       - tests/agent/test_model_metadata.py
 
@@ -89,13 +107,21 @@ bundle:
     patch: patches/hermes-quick-tool-transcript.patch
     purpose: Persist quick-tool transcript context across the local Hermes CLI flow.
     verifies:
+      - tests/cli/test_quick_tool_transcript.py
+
+
+  - id: statusbar-second-line-progress
+    patch: patches/hermes-statusbar-second-line-progress.patch
+    purpose: Keep parent todo progress off status-bar line 1 and append it to the winning line-2 task text instead.
+    verifies:
       - tests/cli/test_cli_status_bar.py
+      - tests/cli/test_statusbar_fast_tool_refresh.py
 
   - id: statusbar-fast-tool-refresh
     patch: patches/hermes-statusbar-fast-tool-refresh.patch
     purpose: Preserve immediate final TUI repaint for fast tool completion and keep delegate_task subtask progress appended at line-1 end without replacing parent todo progress.
     verifies:
-      - tests/cli/test_cli_status_bar.py
+      - tests/cli/test_statusbar_fast_tool_refresh.py
 
   - id: memory-palace-provider
     patch: patches/hermes-memory-palace-provider.patch
@@ -103,8 +129,19 @@ bundle:
     verifies:
       - tests/plugins/memory/test_memory_palace_provider.py
 
+  - id: acceptance-framework
+    patch: patches/hermes-acceptance-framework.patch
+    purpose: Preserve the local acceptance contract/result engine, CLI/gateway acceptance status surfaces, persistence regressions, and canonical acceptance shard runner coverage.
+    verifies:
+      - tests/agent/test_acceptance.py
+      - tests/test_hermes_state_acceptance.py
+      - tests/test_run_agent_acceptance_shards_script.py
+      - tests/cli/test_cli_status_command.py
+      - tests/gateway/test_status_command.py
+
   - id: local-customization-governance
     patch: patches/hermes-local-customization-governance.patch
     purpose: Keep local patch-governance helpers, verification scripts, and coverage tests aligned with the canonical bundle.
     verifies:
       - tests/patches/test_local_customization_manifest.py
+      - tests/patches/test_local_customization_scripts.py

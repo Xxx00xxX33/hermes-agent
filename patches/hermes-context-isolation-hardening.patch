@@ -1,0 +1,1885 @@
+diff --git a/agent/context_references.py b/agent/context_references.py
+index 7ecb90c4..fac13296 100644
+--- a/agent/context_references.py
++++ b/agent/context_references.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import hashlib
+ import inspect
+ import json
+ import mimetypes
+@@ -9,7 +10,7 @@ import re
+ import subprocess
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Awaitable, Callable
++from typing import Any, Awaitable, Callable
+ 
+ from agent.model_metadata import estimate_tokens_rough
+ 
+@@ -48,11 +49,125 @@ class ContextReference:
+     line_end: int | None = None
+ 
+ 
++def _stable_handle_id(source_type: str, source_id: str, locator: dict[str, Any] | None = None) -> str:
++    """Build a deterministic retrieval handle id without hashing raw payloads."""
++    basis = json.dumps(
++        {
++            "source_type": source_type,
++            "source_id": source_id,
++            "locator": locator or {},
++        },
++        ensure_ascii=False,
++        sort_keys=True,
++        default=str,
++        separators=(",", ":"),
++    )
++    return f"rh_{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:20]}"
++
++
++@dataclass(frozen=True)
++class RetrievalHandle:
++    """Compact pointer to retrievable context that keeps raw data out of prompts."""
++
++    handle_id: str
++    source_type: str
++    source_id: str
++    locator: dict[str, Any] = field(default_factory=dict)
++    metadata: dict[str, Any] = field(default_factory=dict)
++    created_at: float | None = None
++
++    def to_dict(self) -> dict[str, Any]:
++        data: dict[str, Any] = {
++            "handle_id": self.handle_id,
++            "source_type": self.source_type,
++            "source_id": self.source_id,
++            "locator": dict(self.locator),
++            "metadata": dict(self.metadata),
++        }
++        if self.created_at is not None:
++            data["created_at"] = self.created_at
++        return data
++
++    @classmethod
++    def from_dict(cls, data: dict[str, Any]) -> "RetrievalHandle":
++        return cls(
++            handle_id=str(data["handle_id"]),
++            source_type=str(data["source_type"]),
++            source_id=str(data["source_id"]),
++            locator=dict(data.get("locator") or {}),
++            metadata=dict(data.get("metadata") or {}),
++            created_at=data.get("created_at"),
++        )
++
++
++@dataclass(frozen=True)
++class SessionEvent:
++    """Summary-level session event that references raw details by handle."""
++
++    event_id: str
++    event_type: str
++    session_id: str
++    payload: dict[str, Any] = field(default_factory=dict)
++    retrieval_handles: list[RetrievalHandle] = field(default_factory=list)
++    summary: str | None = None
++    created_at: float | None = None
++
++    def to_dict(self) -> dict[str, Any]:
++        data: dict[str, Any] = {
++            "event_id": self.event_id,
++            "event_type": self.event_type,
++            "session_id": self.session_id,
++            "payload": dict(self.payload),
++            "retrieval_handles": [handle.to_dict() for handle in self.retrieval_handles],
++        }
++        if self.summary is not None:
++            data["summary"] = self.summary
++        if self.created_at is not None:
++            data["created_at"] = self.created_at
++        return data
++
++    @classmethod
++    def from_dict(cls, data: dict[str, Any]) -> "SessionEvent":
++        return cls(
++            event_id=str(data["event_id"]),
++            event_type=str(data["event_type"]),
++            session_id=str(data["session_id"]),
++            payload=dict(data.get("payload") or {}),
++            retrieval_handles=[
++                RetrievalHandle.from_dict(handle)
++                for handle in data.get("retrieval_handles") or []
++            ],
++            summary=data.get("summary"),
++            created_at=data.get("created_at"),
++        )
++
++
++def make_retrieval_handle(
++    source_type: str,
++    source_id: str,
++    *,
++    locator: dict[str, Any] | None = None,
++    metadata: dict[str, Any] | None = None,
++    handle_id: str | None = None,
++    created_at: float | None = None,
++) -> RetrievalHandle:
++    """Create a stable retrieval handle from identifiers, never raw content."""
++    return RetrievalHandle(
++        handle_id=handle_id or _stable_handle_id(source_type, source_id, locator),
++        source_type=source_type,
++        source_id=source_id,
++        locator=dict(locator or {}),
++        metadata=dict(metadata or {}),
++        created_at=created_at,
++    )
++
++
+ @dataclass
+ class ContextReferenceResult:
+     message: str
+     original_message: str
+     references: list[ContextReference] = field(default_factory=list)
++    retrieval_handles: list[RetrievalHandle] = field(default_factory=list)
+     warnings: list[str] = field(default_factory=list)
+     injected_tokens: int = 0
+     expanded: bool = False
+diff --git a/docs/context-isolation.md b/docs/context-isolation.md
+new file mode 100644
+index 00000000..ed87bc88
+--- /dev/null
++++ b/docs/context-isolation.md
+@@ -0,0 +1,417 @@
++# Hermes Context Isolation
++
++Date: 2026-04-25
++Repo: `/root/.hermes/hermes-agent`
++Live runtime: `/root/.hermes/releases/hermes-agent-custom-20260418_115717-rebuild`
++Status: implemented parent-safe context isolation baseline, with follow-up hardening listed below
++
++## Goal
++
++Hermes should keep the main agent's context focused on planning, synthesis, and validation. Dirty or high-volume work should happen in isolated child/subagent contexts, and raw data should not be hydrated into the parent prompt unless the user explicitly asks for a small, targeted result.
++
++The durable invariant is:
++
++> Parent context receives safe summaries, metadata, handles, locators, validation state, and decisions. Raw tool output, oversized child responses, logs, transcripts, file dumps, stdout/stderr, and artifact bodies stay outside the parent context and are inspected through explicit delegation or targeted tooling.
++
++This document describes the current implementation boundaries and the rules future changes must preserve.
++
++## Scope
++
++This is a design snapshot for the Naranja Hermes context-isolation customization. It covers:
++
++- `delegate_task` child/subagent isolation
++- bounded child final responses
++- persisted artifacts for omitted child responses
++- parent-safe `SessionEvent` and `RetrievalHandle` metadata
++- `session_search` recall behavior
++- metadata-only `retrieval_resolve`
++- artifact inspection policy for delegated child final-response artifacts
++- verification requirements for maintenance and live runtime trees
++
++It does not replace tests. Any change to these surfaces must include regression coverage for raw-data non-leakage.
++
++## Parent vs. child responsibilities
++
++### Parent agent
++
++The parent agent is responsible for:
++
++- understanding the user goal
++- planning the work
++- deciding what must be delegated
++- synthesizing child summaries
++- validating results and evidence
++- returning the final answer
++
++Parent-visible data should be compact and safe:
++
++- short summaries
++- status fields
++- counts and byte/character sizes
++- safe metadata
++- safe artifact locators
++- retrieval handles
++- event IDs
++- validation outcomes
++
++### Child/subagent
++
++A child agent is responsible for dirty work:
++
++- tool-heavy exploration
++- code inspection and edits
++- tests and command execution
++- raw artifact inspection
++- large-output handling
++- focused debugging or review
++
++Children run with isolated conversation history and their own task/session context. Their intermediate tool calls and raw results are not appended to the parent's conversation history.
++
++## Core data model
++
++Implemented in `agent/context_references.py`.
++
++### `RetrievalHandle`
++
++A `RetrievalHandle` is a compact pointer to retrievable context. It is identified by a stable handle ID derived from safe identifiers and locators, not raw payloads.
++
++Important fields:
++
++- `handle_id`
++- `source_type`
++- `source_id`
++- `locator`
++- `metadata`
++- `created_at`
++
++Rules:
++
++- `metadata` may contain safe size fields such as `raw_chars`, `raw_bytes`, and `raw_size`.
++- `metadata` must not contain raw output, body/content text, transcripts, stdout/stderr, snippets, previews, or messages.
++- `locator` may point to an artifact, but the parent must treat the locator as a pointer, not as permission to hydrate the artifact body into context.
++
++### `SessionEvent`
++
++A `SessionEvent` is a summary-level event that can be searched and resolved later.
++
++Important fields:
++
++- `event_id`
++- `event_type`
++- `session_id`
++- `summary`
++- `payload`
++- `retrieval_handles`
++- `created_at`
++
++Rules:
++
++- `summary` should be human-readable and safe.
++- `payload` should hold safe metadata, status, counts, and locators.
++- `retrieval_handles` should point to raw or bulky details indirectly.
++- `searchable_text` recorded in the session database must remain a safe breadcrumb, not a raw payload copy.
++
++## Delegation boundary
++
++Implemented in `tools/delegate_tool.py`.
++
++`delegate_task` spawns one or more child `AIAgent` instances with:
++
++- a fresh conversation
++- isolated task/session context
++- restricted toolsets
++- no parent conversation history
++- `skip_context_files=True`
++- `skip_memory=True`
++- no `clarify` callback
++- a depth limit that prevents recursive delegation beyond the configured boundary
++
++Blocked child tools include:
++
++- `delegate_task`
++- `clarify`
++- `memory`
++- `send_message`
++- `execute_code`
++
++The child system prompt instructs subagents to provide concise summaries with evidence and validation status, and not to paste raw logs, large file contents, command dumps, or other bulky data.
++
++## Child final-response handling
++
++Implemented in `tools/delegate_tool.py`.
++
++The parent-safe child summary limit is enforced by `_parent_safe_child_summary(...)`.
++
++Current behavior:
++
++- Child final responses at or below `_PARENT_CHILD_SUMMARY_MAX_CHARS` are returned to the parent as summaries.
++- Oversized child final responses are omitted from the parent-visible result.
++- The parent receives an omission notice plus safe size metadata.
++- When the parent has a session ID and session DB, the omitted response is persisted as an artifact outside the parent prompt.
++
++Parent-visible fields for omitted child responses may include:
++
++- `summary_truncated`
++- `summary_omitted_chars`
++- `summary_chars`
++- `summary_event_id`
++- `summary_retrieval_handle`
++- `raw_chars`
++- `raw_bytes`
++
++The raw child final response must not appear in:
++
++- the `delegate_task` JSON result
++- `SessionEvent.summary`
++- `SessionEvent.payload`
++- `searchable_text`
++- `RetrievalHandle.metadata`
++- final parent answer unless explicitly summarized in a small, targeted way
++
++## Omitted child-response artifacts
++
++Implemented in `tools/delegate_tool.py`.
++
++Oversized child final responses are written under the active Hermes home:
++
++```text
++session_events/delegation_child_responses/<session_id>/task_<task_index>_<event_id>.txt
++```
++
++The artifact body contains the raw omitted child final response. The parent-visible event and handle contain only safe metadata and a locator.
++
++Current delegated child final-response artifact metadata:
++
++```text
++artifact_kind = delegation_child_final_response
++artifact_access_policy = delegate_only
++parent_access = metadata_only
++```
++
++The safe search breadcrumb may mention:
++
++```text
++artifact_access_policy=delegate_only
++```
++
++It must not include the raw child response.
++
++## Session search boundary
++
++Implemented in `tools/session_search_tool.py` and `hermes_state.py`.
++
++`session_search` supports two recall surfaces:
++
++1. Session event search results
++2. Conversation/session summary search results
++
++Session event results are formatted with sanitized payloads and sanitized retrieval handles. Unsafe metadata keys are dropped, including keys containing:
++
++- `raw`
++- `body`
++- `content`
++- `searchable_text`
++- `snippet`
++- `preview`
++- `stdout`
++- `stderr`
++- `output`
++- `text`
++- `message`
++- `transcript`
++
++Safe raw-size metadata keys are allowed:
++
++- `raw_chars`
++- `raw_bytes`
++- `raw_size`
++
++Known limitation: the legacy conversation summary path can fall back to a bounded raw preview when summarization is unavailable. That fallback is intentionally short, but it is not as strong as the session-event metadata-only contract. Future hardening should replace that fallback with a safer summary/error surface for contexts where raw-free recall is mandatory.
++
++## Retrieval resolution boundary
++
++Implemented in `tools/retrieval_resolve_tool.py`.
++
++`retrieval_resolve` resolves an `event_id`, a `handle_id`, or both into safe metadata and artifact locators.
++
++Hard rules:
++
++- `current_session_id` is required before lookup.
++- Lookup is scoped to the current session.
++- The tool never returns raw artifact contents.
++- The tool never returns `searchable_text`, snippets, previews, stdout/stderr, body/content/message fields, transcripts, or raw output fields.
++- Safe raw-size metadata may be returned.
++
++Returned result sections can include:
++
++- `event`
++- `retrieval_handles`
++- `matched_handle`
++- `payload_metadata`
++- `artifacts`
++- `artifact_inspection`
++- `raw_size`
++- `guidance`
++
++Sanitization is key-name based. Do not add new parent-visible keys containing unsafe tokens unless the sanitizer and tests are updated deliberately.
++
++Important naming rule:
++
++- Use `artifact_access_policy` for safe policy metadata.
++- Do not rename it to `content_access_policy` without changing sanitizer behavior, because keys containing `content` are intentionally treated as unsafe.
++
++## Artifact inspection contract
++
++Implemented in `tools/retrieval_resolve_tool.py`.
++
++When `retrieval_resolve` sees delegated child final-response artifact metadata, it annotates artifact locators with:
++
++```text
++artifact_access_policy = delegate_only
++parent_access = metadata_only
++inspection_route = delegate_task
++```
++
++It also returns an `artifact_inspection` contract similar to:
++
++```json
++{
++  "artifact_access_policy": "delegate_only",
++  "parent_access": "metadata_only",
++  "recommended_tool": "delegate_task",
++  "recommended_toolsets": ["file"],
++  "instruction": "Do not read artifact contents into the parent context. Delegate a focused child/subagent with the artifact locator and request a concise summary, evidence counts, or validation result only."
++}
++```
++
++Rules:
++
++- Parent should not read `delegate_only` artifact contents directly into its context.
++- Parent should delegate artifact inspection to a child/subagent.
++- Child should return a concise summary, evidence count, validation result, or minimal targeted excerpt only when required by the user task.
++- The artifact locator is safe metadata, not raw-content permission.
++
++Current limitation: this is a contract-level guard. It does not yet hard-block every possible parent-side file read of a `delegate_only` artifact. Future hardening should add a warning or enforcement layer at file/artifact read boundaries.
++
++## Context-reference boundary
++
++Implemented in `agent/context_references.py`.
++
++`@file`, `@folder`, `@git`, `@diff`, `@staged`, and `@url` references can inject selected context into prompts. They are governed by:
++
++- workspace-root checks
++- sensitive path denial
++- token budget checks
++- binary-file rejection
++- warning/block surfaces
++
++This mechanism is separate from delegation artifacts. Future changes must avoid treating a `delegate_only` artifact path as an ordinary parent-side `@file` attachment without an explicit safety decision.
++
++## Verification and regression coverage
++
++Current relevant tests include:
++
++- `tests/tools/test_delegate.py`
++- `tests/tools/test_retrieval_resolve.py`
++- `tests/tools/test_session_search.py`
++
++The tests should cover these invariants:
++
++- oversized child responses are omitted from parent-visible JSON
++- raw child sentinel data is not present in safe event surfaces
++- `searchable_text` remains a safe breadcrumb
++- retrieval handle metadata exposes policy and size fields, not raw data
++- `retrieval_resolve` requires current session scope
++- `retrieval_resolve` returns metadata and locators only
++- artifact inspection policy routes raw inspection through `delegate_task`
++
++For Naranja Hermes work, repository tests alone are not enough. After changes that can affect live Hermes behavior, run the full live verifier from a neutral directory:
++
++```bash
++cd /tmp
++/root/.local/bin/hermes-verify-live-runtime --full
++```
++
++The live runtime currently imports from:
++
++```text
++/root/.hermes/releases/hermes-agent-custom-20260418_115717-rebuild
++```
++
++Maintenance checkout changes under:
++
++```text
++/root/.hermes/hermes-agent
++```
++
++must be mirrored into the live runtime when the user-visible Hermes behavior is expected to change.
++
++## Extension checklist
++
++When adding or modifying context-bearing surfaces, answer these questions before implementation is considered complete:
++
++1. Can raw text, stdout/stderr, body/content, transcript, snippet, preview, or message fields reach the parent context?
++2. Is any raw or bulky data copied into `searchable_text`?
++3. Are raw-size fields separated from raw content fields?
++4. Does the surface expose a safe retrieval handle instead of raw payloads?
++5. Are artifact locators marked with an access policy?
++6. Does `delegate_only` content route through child/subagent inspection?
++7. Are lookups scoped to the current session where applicable?
++8. Do tests include a unique raw sentinel and assert it is absent from parent-visible results?
++9. Does the live runtime verifier pass from `/tmp`?
++10. If the change affects both maintenance and live runtime trees, are both updated and checked clean?
++
++## Recommended next hardening phases
++
++### 1. Dedicated context-isolation verifier
++
++Add a focused verifier or test suite such as:
++
++```text
++tests/context_isolation/
++```
++
++or:
++
++```text
++hermes-verify-context-isolation
++```
++
++It should centralize sentinel-based tests for raw non-leakage across delegation, session search, retrieval resolution, callbacks, and error paths.
++
++### 2. Direct-read guard for `delegate_only` artifacts
++
++Add a soft warning or hard guard when parent-side file/artifact tools attempt to read artifacts marked:
++
++```text
++artifact_access_policy = delegate_only
++```
++
++Start with warnings or explicit guidance to avoid breaking legitimate user-requested file reads. Promote to enforcement only after tests cover expected workflows.
++
++### 3. Batch delegation and callback hardening
++
++Expand raw-sentinel tests to cover:
++
++- multiple oversized child outputs
++- batch aggregation
++- progress callbacks
++- display callbacks
++- `_memory_manager.on_delegation(...)`
++- child exception/error paths
++- debug logging surfaces
++
++### 4. Session recall fallback hardening
++
++Replace or gate the bounded raw preview fallback in `session_search` when auxiliary summarization is unavailable. Prefer returning a safe error, event-only metadata, or a small synthetic summary that does not expose raw transcript text.
++
++### 5. Release-chain safety
++
++Document and/or automate the synchronization path between:
++
++```text
++/root/.hermes/hermes-agent
++/root/.hermes/releases/hermes-agent-custom-20260418_115717-rebuild
++```
++
++Future release rebuilds should preserve the context-isolation commits or fail verification clearly.
+diff --git a/model_tools.py b/model_tools.py
+index 5ec806e7..48f904b5 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -323,7 +323,7 @@ def get_tool_definitions(
+ # because they need agent-level state (TodoStore, MemoryStore, etc.).
+ # The registry still holds their schemas; dispatch just returns a stub error
+ # so if something slips through, the LLM sees a sensible message.
+-_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
++_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "retrieval_resolve", "delegate_task"}
+ _READ_SEARCH_TOOLS = {"read_file", "search_files"}
+ 
+ 
+diff --git a/tests/agent/test_context_references.py b/tests/agent/test_context_references.py
+index ea5579c5..0bc0f9e8 100644
+--- a/tests/agent/test_context_references.py
++++ b/tests/agent/test_context_references.py
+@@ -308,3 +308,58 @@ async def test_blocks_sensitive_home_and_hermes_paths(tmp_path: Path, monkeypatc
+     assert "API_KEY=super-secret" not in result.message
+     assert "PRIVATE-KEY" not in result.message
+     assert any("sensitive credential" in warning for warning in result.warnings)
++
++# =========================================================================
++# Retrieval handles and session events
++# =========================================================================
++
++
++def test_retrieval_handle_round_trips_without_raw_payload():
++    from agent.context_references import RetrievalHandle, make_retrieval_handle
++
++    handle = make_retrieval_handle(
++        "session_event",
++        "evt-1",
++        locator={"message_id": 7},
++        metadata={"title": "pytest validation", "status": "passed"},
++        created_at=123.0,
++    )
++
++    assert handle.handle_id.startswith("rh_")
++    assert "raw" not in handle.to_dict()
++    restored = RetrievalHandle.from_dict(handle.to_dict())
++    assert restored == handle
++
++
++def test_context_reference_result_accepts_retrieval_handles():
++    from agent.context_references import ContextReferenceResult, make_retrieval_handle
++
++    handle = make_retrieval_handle("tool_result", "tool-1")
++    result = ContextReferenceResult(
++        message="Summary only",
++        original_message="@file README.md",
++        retrieval_handles=[handle],
++    )
++
++    assert result.message == "Summary only"
++    assert result.retrieval_handles == [handle]
++
++
++def test_session_event_round_trips_handles_and_summary():
++    from agent.context_references import SessionEvent, make_retrieval_handle
++
++    handle = make_retrieval_handle("session_event", "evt-validation")
++    event = SessionEvent(
++        event_id="evt-validation",
++        event_type="validation",
++        session_id="s1",
++        summary="pytest passed",
++        payload={"status": "passed"},
++        retrieval_handles=[handle],
++        created_at=456.0,
++    )
++
++    data = event.to_dict()
++    assert data["summary"] == "pytest passed"
++    assert data["retrieval_handles"][0]["handle_id"] == handle.handle_id
++    assert SessionEvent.from_dict(data) == event
+diff --git a/tests/test_hermes_state.py b/tests/test_hermes_state.py
+index d54d7b9f..668310e4 100644
+--- a/tests/test_hermes_state.py
++++ b/tests/test_hermes_state.py
+@@ -1070,7 +1070,7 @@ class TestSchemaInit:
+     def test_schema_version(self, db):
+         cursor = db._conn.execute("SELECT version FROM schema_version")
+         version = cursor.fetchone()[0]
+-        assert version == 6
++        assert version == 8
+ 
+     def test_title_column_exists(self, db):
+         """Verify the title column was created in the sessions table."""
+@@ -1126,12 +1126,12 @@ class TestSchemaInit:
+         conn.commit()
+         conn.close()
+ 
+-        # Open with SessionDB — should migrate to v6
++        # Open with SessionDB — should migrate to current schema
+         migrated_db = SessionDB(db_path=db_path)
+ 
+         # Verify migration
+         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
+-        assert cursor.fetchone()[0] == 6
++        assert cursor.fetchone()[0] == 8
+ 
+         # Verify title column exists and is NULL for existing sessions
+         session = migrated_db.get_session("existing")
+@@ -1510,3 +1510,239 @@ class TestConcurrentWriteSafety:
+         assert "30" in src, (
+             "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
+         )
++
++# =========================================================================
++# Session event storage
++# =========================================================================
++
++
++class TestSessionEvents:
++    def test_record_and_get_session_event_with_handle(self, db):
++        db.create_session(session_id="s1", source="cli")
++        event_id = db.record_session_event(
++            "s1",
++            "validation",
++            summary="pytest prompt builder passed",
++            payload={"status": "passed", "tool": "pytest"},
++            retrieval_handles=[{
++                "handle_id": "rh-validation",
++                "source_type": "tool_result",
++                "source_id": "pytest-1",
++                "metadata": {"title": "pytest output"},
++            }],
++            source_type="tool_result",
++            source_id="pytest-1",
++            created_at=100.0,
++        )
++
++        assert event_id.startswith("evt_")
++        events = db.get_session_events("s1")
++        assert len(events) == 1
++        assert events[0]["event_type"] == "validation"
++        assert events[0]["payload"] == {"status": "passed", "tool": "pytest"}
++        assert events[0]["retrieval_handles"][0]["handle_id"] == "rh-validation"
++        assert "searchable_text" not in events[0]
++
++    def test_search_session_events_returns_summary_and_handles(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.record_session_event(
++            "s1",
++            "decision",
++            summary="Use retrieval handles for compression guides",
++            payload={"decision": "use handles"},
++            retrieval_handles=[{
++                "handle_id": "rh-decision",
++                "source_type": "session_event",
++                "source_id": "evt-decision",
++            }],
++            event_id="evt-decision",
++            created_at=101.0,
++        )
++
++        results = db.search_session_events("retrieval handles")
++        assert len(results) == 1
++        assert results[0]["event_id"] == "evt-decision"
++        assert results[0]["retrieval_handles"][0]["handle_id"] == "rh-decision"
++        assert "searchable_text" not in results[0]
++        assert "snippet" not in results[0]
++
++    def test_search_session_events_filters_by_type(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.record_session_event("s1", "decision", summary="compression handle policy")
++        db.record_session_event("s1", "validation", summary="compression test passed")
++
++        results = db.search_session_events("compression", event_type="validation")
++        assert len(results) == 1
++        assert results[0]["event_type"] == "validation"
++
++    def test_search_session_events_does_not_leak_raw_searchable_text(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.record_session_event(
++            "s1",
++            "tool_result",
++            summary="bounded public summary",
++            searchable_text="SECRET_RAW_CONTENT only exists in indexed raw text",
++        )
++
++        results = db.search_session_events("SECRET_RAW_CONTENT")
++        assert len(results) == 1
++        flattened = str(results[0])
++        assert "SECRET_RAW_CONTENT" not in flattened
++        assert "searchable_text" not in results[0]
++        assert "snippet" not in results[0]
++
++    def test_get_session_event_by_id_returns_single_safe_event(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.record_session_event(
++            "s1",
++            "tool_result",
++            summary="bounded public summary",
++            payload={"tool": "terminal"},
++            retrieval_handles=[{"handle_id": "rh-one"}],
++            event_id="evt-one",
++            searchable_text="SECRET_RAW_CONTENT indexed only",
++        )
++
++        event = db.get_session_event_by_id("evt-one", session_id="s1")
++
++        assert event is not None
++        assert event["event_id"] == "evt-one"
++        assert event["retrieval_handles"][0]["handle_id"] == "rh-one"
++        assert "searchable_text" not in event
++        assert "SECRET_RAW_CONTENT" not in str(event)
++
++    def test_get_session_event_by_id_respects_session_scope(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.create_session(session_id="s2", source="cli")
++        db.record_session_event("s2", "tool_result", event_id="evt-other")
++
++        assert db.get_session_event_by_id("evt-other", session_id="s1") is None
++
++    def test_get_session_event_by_handle_id_returns_single_safe_event(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.record_session_event(
++            "s1",
++            "tool_result",
++            retrieval_handles=[{"handle_id": "rh-one", "metadata": {"raw_chars": 10}}],
++            event_id="evt-one",
++            searchable_text="SECRET_RAW_CONTENT indexed only",
++        )
++
++        event = db.get_session_event_by_handle_id("rh-one", session_id="s1")
++
++        assert event is not None
++        assert event["event_id"] == "evt-one"
++        assert event["retrieval_handles"][0]["handle_id"] == "rh-one"
++        assert "searchable_text" not in event
++        assert "SECRET_RAW_CONTENT" not in str(event)
++
++    def test_get_session_event_by_handle_id_respects_session_scope(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.create_session(session_id="s2", source="cli")
++        db.record_session_event(
++            "s2",
++            "tool_result",
++            retrieval_handles=[{"handle_id": "rh-other"}],
++            event_id="evt-other",
++        )
++
++        assert db.get_session_event_by_handle_id("rh-other", session_id="s1") is None
++
++    def test_get_session_event_by_handle_id_fails_closed_on_ambiguity(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.record_session_event(
++            "s1",
++            "tool_result",
++            retrieval_handles=[{"handle_id": "rh-duplicate"}],
++            event_id="evt-one",
++        )
++        db.record_session_event(
++            "s1",
++            "tool_result",
++            retrieval_handles=[{"handle_id": "rh-duplicate"}],
++            event_id="evt-two",
++        )
++
++        assert db.get_session_event_by_handle_id("rh-duplicate", session_id="s1") is None
++
++def test_migration_from_v7_adds_session_events_and_search(tmp_path):
++    import sqlite3
++
++    db_path = tmp_path / "migrate_v7_state.db"
++    conn = sqlite3.connect(str(db_path))
++    conn.executescript("""
++        CREATE TABLE schema_version (version INTEGER NOT NULL);
++        INSERT INTO schema_version (version) VALUES (7);
++
++        CREATE TABLE sessions (
++            id TEXT PRIMARY KEY,
++            source TEXT NOT NULL,
++            user_id TEXT,
++            model TEXT,
++            model_config TEXT,
++            system_prompt TEXT,
++            parent_session_id TEXT,
++            started_at REAL NOT NULL,
++            ended_at REAL,
++            end_reason TEXT,
++            message_count INTEGER DEFAULT 0,
++            tool_call_count INTEGER DEFAULT 0,
++            input_tokens INTEGER DEFAULT 0,
++            output_tokens INTEGER DEFAULT 0,
++            cache_read_tokens INTEGER DEFAULT 0,
++            cache_write_tokens INTEGER DEFAULT 0,
++            reasoning_tokens INTEGER DEFAULT 0,
++            billing_provider TEXT,
++            billing_base_url TEXT,
++            billing_mode TEXT,
++            estimated_cost_usd REAL,
++            actual_cost_usd REAL,
++            cost_status TEXT,
++            cost_source TEXT,
++            pricing_version TEXT,
++            title TEXT
++        );
++
++        CREATE TABLE messages (
++            id INTEGER PRIMARY KEY AUTOINCREMENT,
++            session_id TEXT NOT NULL,
++            role TEXT NOT NULL,
++            content TEXT,
++            tool_call_id TEXT,
++            tool_calls TEXT,
++            tool_name TEXT,
++            timestamp REAL NOT NULL,
++            token_count INTEGER,
++            finish_reason TEXT,
++            reasoning TEXT,
++            reasoning_details TEXT,
++            codex_reasoning_items TEXT
++        );
++
++        CREATE VIRTUAL TABLE messages_fts USING fts5(
++            content,
++            content=messages,
++            content_rowid=id
++        );
++    """)
++    conn.execute(
++        "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
++        ("s1", "cli", 1000.0),
++    )
++    conn.commit()
++    conn.close()
++
++    migrated_db = SessionDB(db_path=db_path)
++    try:
++        assert migrated_db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
++        migrated_db.record_session_event(
++            "s1",
++            "decision",
++            summary="migration event search works",
++            event_id="evt-migrated",
++        )
++        results = migrated_db.search_session_events("migration event")
++        assert len(results) == 1
++        assert results[0]["event_id"] == "evt-migrated"
++    finally:
++        migrated_db.close()
+diff --git a/tests/test_model_tools.py b/tests/test_model_tools.py
+index bb8a79ab..661ed4cf 100644
+--- a/tests/test_model_tools.py
++++ b/tests/test_model_tools.py
+@@ -84,6 +84,7 @@ class TestAgentLoopTools:
+         assert "todo" in _AGENT_LOOP_TOOLS
+         assert "memory" in _AGENT_LOOP_TOOLS
+         assert "session_search" in _AGENT_LOOP_TOOLS
++        assert "retrieval_resolve" in _AGENT_LOOP_TOOLS
+         assert "delegate_task" in _AGENT_LOOP_TOOLS
+ 
+     def test_no_regular_tools_in_set(self):
+@@ -222,3 +223,8 @@ class TestBackwardCompat:
+     def test_tool_to_toolset_map(self):
+         assert isinstance(TOOL_TO_TOOLSET_MAP, dict)
+         assert len(TOOL_TO_TOOLSET_MAP) > 0
++
++    def test_retrieval_resolve_is_registered_with_session_search_toolset(self):
++        names = get_all_tool_names()
++        assert "retrieval_resolve" in names
++        assert get_toolset_for_tool("retrieval_resolve") == "session_search"
+diff --git a/tests/test_toolsets.py b/tests/test_toolsets.py
+index 9a982bb5..8fd797b2 100644
+--- a/tests/test_toolsets.py
++++ b/tests/test_toolsets.py
+@@ -32,6 +32,12 @@ class TestGetToolset:
+         assert ts is not None
+         assert "web_search" in ts["tools"]
+ 
++    def test_session_search_toolset_includes_retrieval_resolve(self):
++        ts = get_toolset("session_search")
++        assert ts is not None
++        assert "session_search" in ts["tools"]
++        assert "retrieval_resolve" in ts["tools"]
++
+     def test_unknown_returns_none(self):
+         assert get_toolset("nonexistent") is None
+ 
+@@ -205,6 +211,10 @@ class TestToolsetConsistency:
+         for ts in tool_sets[1:]:
+             assert ts == tool_sets[0]
+ 
++    def test_core_platforms_include_retrieval_resolve(self):
++        for name in ("hermes-cli", "hermes-acp", "hermes-api-server"):
++            assert "retrieval_resolve" in resolve_toolset(name)
++
+ 
+ class TestPluginToolsets:
+     def test_get_all_toolsets_includes_plugin_toolset(self, monkeypatch):
+diff --git a/tests/tools/test_retrieval_resolve.py b/tests/tools/test_retrieval_resolve.py
+new file mode 100644
+index 00000000..c748b620
+--- /dev/null
++++ b/tests/tools/test_retrieval_resolve.py
+@@ -0,0 +1,256 @@
++"""Tests for metadata-only retrieval_resolve tool."""
++
++import json
++
++import pytest
++
++from hermes_state import SessionDB
++from tools.retrieval_resolve_tool import retrieval_resolve
++
++RAW_SENTINEL = "RETRIEVAL_RESOLVE_RAW_SENTINEL"
++BANNED_KEYS = {
++    "searchable_text",
++    "snippet",
++    "snippets",
++    "preview",
++    "previews",
++    "stdout",
++    "stderr",
++    "output",
++    "body",
++    "content",
++    "text",
++    "message",
++    "raw_output",
++    "raw_body",
++}
++
++
++@pytest.fixture()
++def db(tmp_path):
++    db_path = tmp_path / "state.db"
++    session_db = SessionDB(db_path=db_path)
++    yield session_db
++    session_db.close()
++
++
++def _record_event(db, session_id="sid-current", event_id="evt-current", handle_id="rh-current", artifact_path="/tmp/artifact.txt"):
++    db.create_session(session_id=session_id, source="cli")
++    return db.record_session_event(
++        session_id,
++        "tool_result",
++        summary="bounded public summary",
++        payload={
++            "tool": "terminal",
++            "status": "stored",
++            "artifact_path": artifact_path,
++            "raw_chars": 2048,
++            "artifact_kind": "delegation_child_final_response",
++            "artifact_access_policy": "delegate_only",
++            "parent_access": "metadata_only",
++            "raw_output": RAW_SENTINEL,
++            "content": RAW_SENTINEL,
++            "nested": {"safe": "kept", "stderr": RAW_SENTINEL},
++        },
++        retrieval_handles=[
++            {
++                "handle_id": handle_id,
++                "source_type": "session_event",
++                "source_id": event_id,
++                "locator": {
++                    "artifact_path": artifact_path,
++                    "sandbox_artifact_path": "/sandbox/artifact.txt",
++                    "preview": RAW_SENTINEL,
++                    "url": "https://example.test/file?token=secret&ok=yes",
++                },
++                "metadata": {
++                    "tool": "terminal",
++                    "raw_chars": 2048,
++                    "artifact_kind": "delegation_child_final_response",
++                    "artifact_access_policy": "delegate_only",
++                    "parent_access": "metadata_only",
++                    "raw_body": RAW_SENTINEL,
++                    "safe_note": "safe metadata",
++                },
++            }
++        ],
++        source_type="tool_call",
++        source_id="call-1",
++        event_id=event_id,
++        searchable_text=f"{RAW_SENTINEL} indexed-only raw text",
++        created_at=1710000000.0,
++    )
++
++
++def _decode(result):
++    return json.loads(result)
++
++
++def _flatten(value):
++    return json.dumps(value, ensure_ascii=False, sort_keys=True)
++
++
++def _assert_no_banned_keys(value):
++    if isinstance(value, dict):
++        for key, item in value.items():
++            assert key not in BANNED_KEYS
++            assert key.lower() not in BANNED_KEYS
++            _assert_no_banned_keys(item)
++    elif isinstance(value, list):
++        for item in value:
++            _assert_no_banned_keys(item)
++
++
++class TestRetrievalResolve:
++    def test_requires_event_or_handle_id(self, db):
++        result = _decode(retrieval_resolve(db=db, current_session_id="sid-current"))
++        assert result["success"] is False
++        assert "event_id" in result["error"]
++
++    def test_missing_session_scope_fails_closed_for_event_and_handle(self, db):
++        _record_event(db)
++
++        event_result = _decode(retrieval_resolve(event_id="evt-current", db=db))
++        handle_result = _decode(retrieval_resolve(handle_id="rh-current", db=db))
++        blank_result = _decode(retrieval_resolve(
++            event_id="evt-current",
++            db=db,
++            current_session_id="  ",
++        ))
++
++        assert event_result["success"] is False
++        assert handle_result["success"] is False
++        assert blank_result["success"] is False
++        assert "session id" in event_result["error"].lower()
++        assert "session id" in handle_result["error"].lower()
++        assert "session id" in blank_result["error"].lower()
++        for result in (event_result, handle_result, blank_result):
++            flattened = _flatten(result)
++            assert "evt-current" not in flattened
++            assert "rh-current" not in flattened
++
++    def test_resolves_by_event_id_without_raw_leakage(self, db, tmp_path):
++        artifact = tmp_path / "artifact.txt"
++        artifact.write_text(RAW_SENTINEL)
++        _record_event(db, artifact_path=str(artifact))
++
++        result = _decode(retrieval_resolve(event_id="evt-current", db=db, current_session_id="sid-current"))
++
++        assert result["success"] is True
++        assert result["event"]["event_id"] == "evt-current"
++        assert result["event"]["event_type"] == "tool_result"
++        assert result["retrieval_handles"][0]["handle_id"] == "rh-current"
++        assert result["payload_metadata"]["raw_chars"] == 2048
++        assert result["payload_metadata"]["artifact_kind"] == "delegation_child_final_response"
++        assert result["payload_metadata"]["artifact_access_policy"] == "delegate_only"
++        assert result["payload_metadata"]["parent_access"] == "metadata_only"
++        assert result["payload_metadata"]["nested"]["safe"] == "kept"
++        assert result["raw_size"]["raw_chars"] == 2048
++        assert result["artifacts"][0]["artifact_access_policy"] == "delegate_only"
++        assert result["artifacts"][0]["parent_access"] == "metadata_only"
++        assert result["artifacts"][0]["inspection_route"] == "delegate_task"
++        assert result["artifact_inspection"]["recommended_tool"] == "delegate_task"
++        assert result["artifact_inspection"]["recommended_toolsets"] == ["file"]
++        assert result["artifact_inspection"]["parent_access"] == "metadata_only"
++        assert str(artifact) in _flatten(result)
++        flattened = _flatten(result)
++        assert RAW_SENTINEL not in flattened
++        assert "secret" not in flattened
++        assert "token=secret" not in flattened
++        _assert_no_banned_keys(result)
++
++    def test_resolves_by_handle_id(self, db):
++        _record_event(db)
++
++        result = _decode(retrieval_resolve(handle_id="rh-current", db=db, current_session_id="sid-current"))
++
++        assert result["success"] is True
++        assert result["event"]["event_id"] == "evt-current"
++        assert result["matched_handle"]["handle_id"] == "rh-current"
++        assert result["matched_handle"]["metadata"]["safe_note"] == "safe metadata"
++        assert result["matched_handle"]["metadata"]["artifact_access_policy"] == "delegate_only"
++        assert result["matched_handle"]["metadata"]["parent_access"] == "metadata_only"
++
++    def test_resolves_when_event_and_handle_match(self, db):
++        _record_event(db)
++
++        result = _decode(retrieval_resolve(
++            event_id="evt-current",
++            handle_id="rh-current",
++            db=db,
++            current_session_id="sid-current",
++        ))
++
++        assert result["success"] is True
++        assert result["event"]["event_id"] == "evt-current"
++        assert result["matched_handle"]["handle_id"] == "rh-current"
++
++    def test_conflict_fails_closed_without_partial_metadata(self, db):
++        _record_event(db, event_id="evt-current", handle_id="rh-current")
++        _record_event(db, event_id="evt-other", handle_id="rh-other", artifact_path="/tmp/other.txt")
++
++        result = _decode(retrieval_resolve(
++            event_id="evt-current",
++            handle_id="rh-other",
++            db=db,
++            current_session_id="sid-current",
++        ))
++
++        assert result["success"] is False
++        assert "retrieval metadata" in result["error"]
++        flattened = _flatten(result)
++        assert "evt-current" not in flattened
++        assert "rh-other" not in flattened
++
++    def test_missing_event_or_handle_fails_closed(self, db):
++        _record_event(db)
++
++        missing_event = _decode(retrieval_resolve(
++            event_id="evt-missing",
++            db=db,
++            current_session_id="sid-current",
++        ))
++        missing_handle = _decode(retrieval_resolve(
++            handle_id="rh-missing",
++            db=db,
++            current_session_id="sid-current",
++        ))
++
++        assert missing_event["success"] is False
++        assert missing_handle["success"] is False
++        assert "retrieval metadata" in missing_event["error"]
++        assert "retrieval metadata" in missing_handle["error"]
++
++    def test_other_session_event_and_handle_are_not_resolved(self, db):
++        _record_event(db, session_id="sid-other", event_id="evt-other", handle_id="rh-other")
++
++        event_result = _decode(retrieval_resolve(
++            event_id="evt-other",
++            db=db,
++            current_session_id="sid-current",
++        ))
++        handle_result = _decode(retrieval_resolve(
++            handle_id="rh-other",
++            db=db,
++            current_session_id="sid-current",
++        ))
++
++        assert event_result["success"] is False
++        assert handle_result["success"] is False
++        assert "evt-other" not in _flatten(event_result)
++        assert "rh-other" not in _flatten(handle_result)
++
++    def test_ambiguous_handle_fails_closed(self, db):
++        _record_event(db, event_id="evt-one", handle_id="rh-duplicate")
++        _record_event(db, event_id="evt-two", handle_id="rh-duplicate", artifact_path="/tmp/two.txt")
++
++        result = _decode(retrieval_resolve(
++            handle_id="rh-duplicate",
++            db=db,
++            current_session_id="sid-current",
++        ))
++
++        assert result["success"] is False
++        assert "retrieval metadata" in result["error"]
++        assert "evt-one" not in _flatten(result)
++        assert "evt-two" not in _flatten(result)
+diff --git a/tests/tools/test_session_search.py b/tests/tools/test_session_search.py
+index f5d75bb9..0b86d1a7 100644
+--- a/tests/tools/test_session_search.py
++++ b/tests/tools/test_session_search.py
+@@ -375,3 +375,102 @@ class TestSessionSearch:
+         assert result["count"] == 0
+         assert result["results"] == []
+         assert result["sessions_searched"] == 0
++
++
++class TestSessionSearchSessionEvents:
++    def test_keyword_search_returns_parent_safe_session_event_hits(self):
++        from unittest.mock import MagicMock
++        from tools.session_search_tool import session_search
++
++        mock_db = MagicMock()
++        mock_db.search_messages.return_value = []
++        mock_db.search_session_events.return_value = [
++            {
++                "event_id": "evt-tool-1",
++                "session_id": "sid-current",
++                "event_type": "tool_result",
++                "source_type": "tool_call",
++                "source_id": "call-1",
++                "summary": "bounded public summary",
++                "created_at": 1710000000.0,
++                "payload": {
++                    "tool": "terminal",
++                    "raw_chars": 1024,
++                    "raw_output": "SESSION_EVENT_RAW_SENTINEL",
++                    "preview": "SESSION_EVENT_RAW_SENTINEL",
++                    "safe_note": "artifact available",
++                },
++                "retrieval_handles": [
++                    {
++                        "handle_id": "rh-tool-1",
++                        "source_type": "session_event",
++                        "source_id": "evt-tool-1",
++                        "locator": {"artifact_path": "/tmp/artifact.txt"},
++                        "metadata": {
++                            "tool": "terminal",
++                            "raw_chars": 1024,
++                            "raw_body": "SESSION_EVENT_RAW_SENTINEL",
++                        },
++                    }
++                ],
++            }
++        ]
++
++        result = json.loads(session_search(query="rawterm", db=mock_db, current_session_id="sid-current"))
++
++        assert result["success"] is True
++        assert result["count"] == 0
++        assert result["event_count"] == 1
++        assert result["event_results"][0]["kind"] == "session_event"
++        assert result["event_results"][0]["event_id"] == "evt-tool-1"
++        assert result["event_results"][0]["retrieval_handles"][0]["handle_id"] == "rh-tool-1"
++        assert result["event_results"][0]["payload"]["raw_chars"] == 1024
++        assert result["event_results"][0]["retrieval_handles"][0]["metadata"]["raw_chars"] == 1024
++        flattened = json.dumps(result, ensure_ascii=False)
++        assert "SESSION_EVENT_RAW_SENTINEL" not in flattened
++        assert "searchable_text" not in flattened
++        assert "snippet" not in flattened
++        assert "raw_output" not in flattened
++        assert "raw_body" not in flattened
++        mock_db.search_session_events.assert_called_once_with(query="rawterm", limit=3)
++
++    def test_session_event_hits_are_included_with_session_summaries(self):
++        from unittest.mock import AsyncMock, MagicMock, patch
++        from tools.session_search_tool import session_search
++
++        mock_db = MagicMock()
++        mock_db.search_session_events.return_value = [
++            {
++                "event_id": "evt-validation",
++                "session_id": "sid-event",
++                "event_type": "validation",
++                "summary": "pytest passed",
++                "payload": {"status": "passed"},
++                "retrieval_handles": [],
++                "created_at": 1710000001.0,
++            }
++        ]
++        mock_db.search_messages.return_value = [
++            {
++                "session_id": "sid-message",
++                "content": "phase six",
++                "source": "cli",
++                "session_started": 1709500000,
++                "model": "test",
++            }
++        ]
++        mock_db.get_session.return_value = {"parent_session_id": None}
++        mock_db.get_messages_as_conversation.return_value = [
++            {"role": "user", "content": "phase six recall"},
++            {"role": "assistant", "content": "implemented safe recall"},
++        ]
++
++        with patch("tools.session_search_tool._summarize_session", new_callable=AsyncMock) as mock_summarize:
++            mock_summarize.return_value = "safe session summary"
++            result = json.loads(session_search(query="phase six", db=mock_db))
++
++        assert result["success"] is True
++        assert result["count"] == 1
++        assert result["event_count"] == 1
++        assert result["results"][0]["summary"] == "safe session summary"
++        assert result["event_results"][0]["summary"] == "pytest passed"
+diff --git a/tools/retrieval_resolve_tool.py b/tools/retrieval_resolve_tool.py
+new file mode 100644
+index 00000000..e3d6e6df
+--- /dev/null
++++ b/tools/retrieval_resolve_tool.py
+@@ -0,0 +1,369 @@
++#!/usr/bin/env python3
++"""Metadata-only retrieval handle resolution for parent-safe recall."""
++
++from __future__ import annotations
++
++import json
++from typing import Any, Dict, Iterable, List
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
++
++from tools.registry import registry, tool_error
++
++_MAX_SAFE_TEXT_CHARS = 500
++_SAFE_RAW_METADATA_KEYS = {"raw_chars", "raw_bytes", "raw_size"}
++_UNSAFE_KEY_TOKENS = (
++    "raw",
++    "body",
++    "content",
++    "searchable_text",
++    "snippet",
++    "preview",
++    "stdout",
++    "stderr",
++    "output",
++    "transcript",
++    "text",
++    "message",
++)
++_SENSITIVE_QUERY_TOKENS = (
++    "token",
++    "key",
++    "secret",
++    "signature",
++    "sig",
++    "auth",
++    "credential",
++    "password",
++)
++_SAFE_LOCATOR_KEYS = {
++    "artifact_path",
++    "sandbox_artifact_path",
++    "path",
++    "uri",
++    "url",
++    "line_start",
++    "line_end",
++    "byte_start",
++    "byte_end",
++    "offset",
++    "length",
++}
++
++
++RETRIEVAL_RESOLVE_SCHEMA = {
++    "name": "retrieval_resolve",
++    "description": (
++        "Resolve a session event or retrieval handle into parent-safe metadata and artifact "
++        "locators. This tool never returns raw artifact contents, searchable text, snippets, "
++        "stdout/stderr, previews, or message/body/content fields. Use it after session_search "
++        "returns an event_id or handle_id and you need safe metadata. If artifact contents "
++        "must be inspected, follow the returned artifact_inspection contract and delegate "
++        "that work to a child/subagent rather than reading raw content into the parent context."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "event_id": {
++                "type": "string",
++                "description": "Session event ID to resolve. Optional if handle_id is provided.",
++            },
++            "handle_id": {
++                "type": "string",
++                "description": "Retrieval handle ID to resolve. Optional if event_id is provided.",
++            },
++        },
++        "required": [],
++    },
++}
++
++
++def _is_unsafe_key(key: str) -> bool:
++    lowered = key.lower()
++    if lowered in _SAFE_RAW_METADATA_KEYS:
++        return False
++    return any(token in lowered for token in _UNSAFE_KEY_TOKENS)
++
++
++def _truncate_safe_value(value: Any, max_chars: int = _MAX_SAFE_TEXT_CHARS) -> Any:
++    if value is None or isinstance(value, (bool, int, float)):
++        return value
++    if isinstance(value, str):
++        safe = _redact_locator_string(value)
++        return safe if len(safe) <= max_chars else safe[:max_chars] + "…[truncated]"
++    if isinstance(value, list):
++        return [_truncate_safe_value(item, max_chars=max_chars) for item in value[:20]]
++    if isinstance(value, dict):
++        return _sanitize_mapping(value, max_chars=max_chars)
++    return str(value)[:max_chars]
++
++
++def _redact_locator_string(value: str) -> str:
++    parsed = urlsplit(value)
++    if not parsed.scheme or not parsed.netloc or not parsed.query:
++        return value
++    redacted = []
++    changed = False
++    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
++        if any(token in key.lower() for token in _SENSITIVE_QUERY_TOKENS):
++            redacted.append((key, "[redacted]"))
++            changed = True
++        else:
++            redacted.append((key, item))
++    if not changed:
++        return value
++    return urlunsplit((
++        parsed.scheme,
++        parsed.netloc,
++        parsed.path,
++        urlencode(redacted, doseq=True),
++        parsed.fragment,
++    ))
++
++
++def _sanitize_mapping(value: Dict[str, Any], max_chars: int = _MAX_SAFE_TEXT_CHARS) -> Dict[str, Any]:
++    sanitized: Dict[str, Any] = {}
++    for key, item in value.items():
++        key_text = str(key)
++        if _is_unsafe_key(key_text):
++            continue
++        sanitized[key_text] = _truncate_safe_value(item, max_chars=max_chars)
++    return sanitized
++
++
++def _sanitize_locator(locator: Dict[str, Any]) -> Dict[str, Any]:
++    sanitized: Dict[str, Any] = {}
++    for key, item in locator.items():
++        key_text = str(key)
++        lowered = key_text.lower()
++        if lowered not in _SAFE_LOCATOR_KEYS or _is_unsafe_key(key_text):
++            continue
++        sanitized[key_text] = _truncate_safe_value(item)
++    return sanitized
++
++
++def _safe_handle(handle: Dict[str, Any]) -> Dict[str, Any]:
++    result = {
++        "handle_id": _truncate_safe_value(handle.get("handle_id")),
++        "source_type": _truncate_safe_value(handle.get("source_type")),
++        "source_id": _truncate_safe_value(handle.get("source_id")),
++        "locator": _sanitize_locator(handle.get("locator") or {}),
++        "metadata": _sanitize_mapping(handle.get("metadata") or {}),
++        "created_at": _truncate_safe_value(handle.get("created_at")),
++    }
++    return {key: value for key, value in result.items() if value not in (None, {}, [])}
++
++
++def _safe_event(event: Dict[str, Any]) -> Dict[str, Any]:
++    result = {
++        "event_id": _truncate_safe_value(event.get("event_id")),
++        "session_id": _truncate_safe_value(event.get("session_id")),
++        "event_type": _truncate_safe_value(event.get("event_type")),
++        "source_type": _truncate_safe_value(event.get("source_type")),
++        "source_id": _truncate_safe_value(event.get("source_id")),
++        "created_at": _truncate_safe_value(event.get("created_at")),
++        "summary": _truncate_safe_value(event.get("summary")),
++    }
++    return {key: value for key, value in result.items() if value is not None}
++
++
++def _matching_handle(event: Dict[str, Any], handle_id: str | None) -> Dict[str, Any] | None:
++    handles = event.get("retrieval_handles") or []
++    if not handle_id:
++        return handles[0] if handles else None
++    for handle in handles:
++        if isinstance(handle, dict) and handle.get("handle_id") == handle_id:
++            return handle
++    return None
++
++
++def _artifact_content_policy(handles: Iterable[Dict[str, Any]], payload: Dict[str, Any]) -> str | None:
++    """Return the safest content-access policy carried by event metadata."""
++    sources: list[Dict[str, Any]] = [payload]
++    for handle in handles:
++        if not isinstance(handle, dict):
++            continue
++        for key in ("metadata", "locator"):
++            value = handle.get(key)
++            if isinstance(value, dict):
++                sources.append(value)
++
++    for source in sources:
++        policy = source.get("artifact_access_policy")
++        if isinstance(policy, str) and policy.strip():
++            return _truncate_safe_value(policy.strip())
++        artifact_kind = source.get("artifact_kind")
++        if artifact_kind == "delegation_child_final_response":
++            return "delegate_only"
++    return None
++
++
++def _safe_artifacts(handles: Iterable[Dict[str, Any]], payload: Dict[str, Any]) -> List[Dict[str, Any]]:
++    artifacts: List[Dict[str, Any]] = []
++    handles = list(handles)
++    policy = _artifact_content_policy(handles, payload)
++    seen = set()
++    for source in [payload, *(handle.get("locator") or {} for handle in handles)]:
++        if not isinstance(source, dict):
++            continue
++        artifact = {}
++        for key in ("artifact_path", "sandbox_artifact_path"):
++            value = source.get(key)
++            if isinstance(value, str):
++                artifact[key] = _redact_locator_string(value)
++        if artifact:
++            if policy:
++                artifact["artifact_access_policy"] = policy
++            if policy == "delegate_only":
++                artifact["parent_access"] = "metadata_only"
++                artifact["inspection_route"] = "delegate_task"
++            marker = tuple(sorted(artifact.items()))
++            if marker not in seen:
++                seen.add(marker)
++                artifacts.append(artifact)
++    return artifacts
++
++
++def _artifact_inspection_contract(artifacts: List[Dict[str, Any]]) -> Dict[str, Any] | None:
++    if not artifacts:
++        return None
++    delegate_only = any(
++        artifact.get("artifact_access_policy") == "delegate_only"
++        for artifact in artifacts
++    )
++    return {
++        "artifact_access_policy": "delegate_only" if delegate_only else "explicit_only",
++        "parent_access": "metadata_only",
++        "recommended_tool": "delegate_task",
++        "recommended_toolsets": ["file"],
++        "instruction": (
++            "Do not read artifact contents into the parent context. Delegate a focused "
++            "child/subagent with the artifact locator and request a concise summary, "
++            "evidence counts, or validation result only."
++        ),
++    }
++
++
++def _raw_size_metadata(event: Dict[str, Any], handles: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
++    sizes: Dict[str, Any] = {}
++    payload = event.get("payload") or {}
++    if isinstance(payload, dict):
++        for key in _SAFE_RAW_METADATA_KEYS:
++            if key in payload:
++                sizes[key] = payload[key]
++    for handle in handles:
++        metadata = handle.get("metadata") if isinstance(handle, dict) else None
++        if not isinstance(metadata, dict):
++            continue
++        for key in _SAFE_RAW_METADATA_KEYS:
++            if key in metadata and key not in sizes:
++                sizes[key] = metadata[key]
++    return sizes
++
++
++def _resolve_event(event_id: str | None, handle_id: str | None, db, current_session_id: str | None):
++    event_by_event_id = None
++    event_by_handle_id = None
++
++    if event_id:
++        get_by_event_id = getattr(db, "get_session_event_by_id", None)
++        if not callable(get_by_event_id):
++            return None, "Session database does not support event lookup."
++        event_by_event_id = get_by_event_id(event_id, session_id=current_session_id)
++
++    if handle_id:
++        get_by_handle_id = getattr(db, "get_session_event_by_handle_id", None)
++        if not callable(get_by_handle_id):
++            return None, "Session database does not support handle lookup."
++        event_by_handle_id = get_by_handle_id(handle_id, session_id=current_session_id)
++
++    if event_id and not event_by_event_id:
++        return None, "No matching retrieval metadata found."
++    if handle_id and not event_by_handle_id:
++        return None, "No matching retrieval metadata found."
++
++    if event_by_event_id and event_by_handle_id:
++        if event_by_event_id.get("event_id") != event_by_handle_id.get("event_id"):
++            return None, "No matching retrieval metadata found."
++        return event_by_event_id, None
++
++    return event_by_event_id or event_by_handle_id, None
++
++
++def retrieval_resolve(
++    event_id: str | None = None,
++    handle_id: str | None = None,
++    db=None,
++    current_session_id: str | None = None,
++) -> str:
++    """Resolve an event/handle into safe metadata and locators only."""
++    event_id = event_id.strip() if isinstance(event_id, str) else None
++    handle_id = handle_id.strip() if isinstance(handle_id, str) else None
++    current_session_id = current_session_id.strip() if isinstance(current_session_id, str) else None
++    if not event_id and not handle_id:
++        return tool_error("Provide event_id, handle_id, or both.", success=False)
++    if not current_session_id:
++        return tool_error("Current session id required.", success=False)
++    if db is None:
++        return tool_error("Session database not available.", success=False)
++
++    try:
++        event, error = _resolve_event(event_id, handle_id, db, current_session_id)
++        if error or not event:
++            return tool_error(error or "No matching retrieval metadata found.", success=False)
++
++        handles = [handle for handle in (event.get("retrieval_handles") or []) if isinstance(handle, dict)]
++        matched_handle = _matching_handle(event, handle_id)
++        if handle_id and not matched_handle:
++            return tool_error("No matching retrieval metadata found.", success=False)
++
++        safe_handles = [_safe_handle(handle) for handle in handles]
++        payload_metadata = _sanitize_mapping(event.get("payload") or {})
++        artifacts = _safe_artifacts(handles, event.get("payload") or {})
++        raw_sizes = _raw_size_metadata(event, handles)
++
++        result: Dict[str, Any] = {
++            "success": True,
++            "kind": "retrieval_resolution",
++            "event": _safe_event(event),
++            "retrieval_handles": safe_handles,
++            "payload_metadata": payload_metadata,
++            "guidance": (
++                "Raw content is not returned. Inspect artifacts only through explicit "
++                "delegation or targeted file/artifact tools when the user task requires it."
++            ),
++        }
++        if matched_handle:
++            result["matched_handle"] = _safe_handle(matched_handle)
++        if artifacts:
++            result["artifacts"] = artifacts
++            artifact_contract = _artifact_inspection_contract(artifacts)
++            if artifact_contract:
++                result["artifact_inspection"] = artifact_contract
++        if raw_sizes:
++            result["raw_size"] = raw_sizes
++        return json.dumps(result, ensure_ascii=False)
++    except Exception as exc:
++        return tool_error(f"Failed to resolve retrieval metadata: {exc}", success=False)
++
++
++def check_retrieval_resolve_requirements() -> bool:
++    try:
++        from hermes_state import DEFAULT_DB_PATH
++        return DEFAULT_DB_PATH.parent.exists()
++    except ImportError:
++        return False
++
++
++registry.register(
++    name="retrieval_resolve",
++    toolset="session_search",
++    schema=RETRIEVAL_RESOLVE_SCHEMA,
++    handler=lambda args, **kw: retrieval_resolve(
++        event_id=args.get("event_id"),
++        handle_id=args.get("handle_id"),
++        db=kw.get("db"),
++        current_session_id=kw.get("current_session_id"),
++    ),
++    check_fn=check_retrieval_resolve_requirements,
++    emoji="🧭",
++)
+diff --git a/tools/session_search_tool.py b/tools/session_search_tool.py
+index 1398bdff..daae59ee 100644
+--- a/tools/session_search_tool.py
++++ b/tools/session_search_tool.py
+@@ -53,6 +53,84 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
+     return str(ts)
+ 
+ 
++
++def _truncate_safe_text(value: Any, max_chars: int = 500) -> Any:
++    """Return a bounded, JSON-safe value for parent-facing recall metadata."""
++    if value is None or isinstance(value, (bool, int, float)):
++        return value
++    if isinstance(value, str):
++        return value if len(value) <= max_chars else value[:max_chars] + "…[truncated]"
++    if isinstance(value, list):
++        return [_truncate_safe_text(item, max_chars=max_chars) for item in value[:20]]
++    if isinstance(value, dict):
++        return _sanitize_event_mapping(value, max_chars=max_chars)
++    return str(value)[:max_chars]
++
++
++_SAFE_RAW_EVENT_METADATA_KEYS = {"raw_chars", "raw_bytes", "raw_size"}
++
++
++_UNSAFE_EVENT_METADATA_KEYS = (
++    "raw",
++    "body",
++    "content",
++    "searchable_text",
++    "snippet",
++    "preview",
++    "stdout",
++    "stderr",
++    "output",
++    "text",
++    "message",
++    "transcript",
++)
++
++
++def _sanitize_event_mapping(value: Dict[str, Any], max_chars: int = 500) -> Dict[str, Any]:
++    """Drop fields likely to carry raw payloads from parent-facing event metadata."""
++    sanitized: Dict[str, Any] = {}
++    for key, item in value.items():
++        key_text = str(key)
++        lowered = key_text.lower()
++        if lowered not in _SAFE_RAW_EVENT_METADATA_KEYS and any(
++            token in lowered for token in _UNSAFE_EVENT_METADATA_KEYS
++        ):
++            continue
++        sanitized[key_text] = _truncate_safe_text(item, max_chars=max_chars)
++    return sanitized
++
++
++def _format_session_event_result(event: Dict[str, Any]) -> Dict[str, Any]:
++    """Serialize a session_event search hit without raw searchable text or snippets."""
++    handles = event.get("retrieval_handles") or []
++    safe_handles = []
++    for handle in handles:
++        if not isinstance(handle, dict):
++            continue
++        safe_handles.append({
++            "handle_id": handle.get("handle_id"),
++            "source_type": handle.get("source_type"),
++            "source_id": handle.get("source_id"),
++            "locator": _sanitize_event_mapping(handle.get("locator") or {}),
++            "metadata": _sanitize_event_mapping(handle.get("metadata") or {}),
++        })
++
++    payload = _sanitize_event_mapping(event.get("payload") or {})
++    result = {
++        "kind": "session_event",
++        "event_id": event.get("event_id"),
++        "session_id": event.get("session_id"),
++        "event_type": event.get("event_type"),
++        "source_type": event.get("source_type"),
++        "source_id": event.get("source_id"),
++        "when": _format_timestamp(event.get("created_at")),
++        "summary": _truncate_safe_text(event.get("summary")),
++        "payload": payload,
++        "retrieval_handles": safe_handles,
++    }
++    return {key: value for key, value in result.items() if value not in (None, [], {})}
++
++
+ def _format_conversation(messages: List[Dict[str, Any]]) -> str:
+     """Format session messages into a readable transcript for summarization."""
+     parts = []
+@@ -328,6 +406,22 @@ def session_search(
+     query = query.strip()
+ 
+     try:
++        event_results = []
++        search_events = getattr(db, "search_session_events", None)
++        if callable(search_events):
++            try:
++                event_results = [
++                    _format_session_event_result(event)
++                    for event in search_events(query=query, limit=limit)
++                ]
++            except Exception as e:
++                logging.warning(
++                    "Session event search failed; continuing with message search: %s",
++                    e,
++                    exc_info=True,
++                )
++                event_results = []
++
+         # Parse role filter
+         role_list = None
+         if role_filter and role_filter.strip():
+@@ -347,8 +441,14 @@ def session_search(
+                 "success": True,
+                 "query": query,
+                 "results": [],
++                "event_results": event_results,
+                 "count": 0,
+-                "message": "No matching sessions found.",
++                "event_count": len(event_results),
++                "message": (
++                    "No matching sessions found."
++                    if not event_results
++                    else "No matching sessions found; returned matching session events."
++                ),
+             }, ensure_ascii=False)
+ 
+         # Resolve child sessions to their parent — delegation stores detailed
+@@ -479,7 +579,9 @@ def session_search(
+             "success": True,
+             "query": query,
+             "results": summaries,
++            "event_results": event_results,
+             "count": len(summaries),
++            "event_count": len(event_results),
+             "sessions_searched": len(seen_sessions),
+         }, ensure_ascii=False)
+ 
+diff --git a/toolsets.py b/toolsets.py
+index 6ac8d078..b2730a55 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -49,7 +49,7 @@ _HERMES_CORE_TOOLS = [
+     # Planning & memory
+     "todo", "memory",
+     # Session history search
+-    "session_search",
++    "session_search", "retrieval_resolve",
+     # Clarifying questions
+     "clarify",
+     # Code execution + delegation
+@@ -170,7 +170,7 @@ TOOLSETS = {
+     
+     "session_search": {
+         "description": "Search and recall past conversations with summarization",
+-        "tools": ["session_search"],
++        "tools": ["session_search", "retrieval_resolve"],
+         "includes": []
+     },
+     
+@@ -251,7 +251,7 @@ TOOLSETS = {
+             "browser_press", "browser_get_images",
+             "browser_vision", "browser_console",
+             "todo", "memory",
+-            "session_search",
++            "session_search", "retrieval_resolve",
+             "execute_code", "delegate_task",
+         ],
+         "includes": []
+@@ -278,7 +278,7 @@ TOOLSETS = {
+             # Planning & memory
+             "todo", "memory",
+             # Session history search
+-            "session_search",
++            "session_search", "retrieval_resolve",
+             # Code execution + delegation
+             "execute_code", "delegate_task",
+             # Cronjob management

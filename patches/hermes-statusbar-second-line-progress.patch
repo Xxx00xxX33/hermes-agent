@@ -1,0 +1,524 @@
+diff --git a/cli.py b/cli.py
+index adb10266..01acfc77 100644
+--- a/cli.py
++++ b/cli.py
+@@ -3230,7 +3328,6 @@ class HermesCLI:
+                 getattr(self, "reasoning_config", None),
+                 compact=width < 52,
+             )
+-            progress_label, _ = self._get_status_bar_progress_label(self._get_status_bar_todo_snapshot())
+             subagent_label, _ = self._get_status_bar_subagent_task_label(
+                 self._get_status_bar_subagent_task_snapshot()
+             )
+@@ -3242,8 +3339,6 @@ class HermesCLI:
+                 separator = " · "
+                 parts = [f"⚕ {snapshot['model_short']}"]
+                 optional_parts = []
+-                if progress_label:
+-                    optional_parts.append(progress_label)
+                 optional_parts.extend([provider_label, reasoning_label])
+                 if background_label:
+                     optional_parts.append(background_label)
+@@ -3260,8 +3355,6 @@ class HermesCLI:
+ 
+                 parts = [f"⚕ {snapshot['model_short']}"]
+                 optional_parts = []
+-                if progress_label:
+-                    optional_parts.append(progress_label)
+                 optional_parts.extend([provider_label, reasoning_label, context_label, percent_label])
+                 if background_label:
+                     optional_parts.append(background_label)
+@@ -3329,7 +3422,6 @@ class HermesCLI:
+                 getattr(self, "reasoning_config", None),
+                 compact=width < 52,
+             )
+-            progress_label, progress_style = self._get_status_bar_progress_label(self._get_status_bar_todo_snapshot())
+             subagent_label, subagent_style = self._get_status_bar_subagent_task_label(
+                 self._get_status_bar_subagent_task_snapshot()
+             )
+@@ -3347,11 +3439,6 @@ class HermesCLI:
+                 ("class:status-bar-strong", snapshot["model_short"]),
+             ]
+             optional_groups = []
+-            if progress_label:
+-                optional_groups.append([
+-                    ("class:status-bar-dim", separator),
+-                    (progress_style, progress_label),
+-                ])
+             optional_groups.append([
+                 ("class:status-bar-dim", separator),
+                 ("class:status-bar-dim", provider_label),
+@@ -3389,13 +3476,33 @@ class HermesCLI:
+             todo_items = self._get_status_bar_todo_items()
+             active_todo_items = self._get_status_bar_active_todo_items()
+             saved_task_title = self._get_status_bar_saved_task_title()
++            progress_label, progress_style = self._get_status_bar_progress_label(
++                self._get_status_bar_todo_snapshot()
++            )
+             if active_todo_items:
+-                task_fragments = self._get_status_bar_active_task_fragments(
+-                    active_todo_items,
+-                    compact=width < 76,
+-                )
++                if saved_task_title:
++                    active_saved_title = {
++                        **active_todo_items[0],
++                        "content": saved_task_title,
++                    }
++                    task_fragments = self._get_status_bar_named_task_fragments(active_saved_title)
++                else:
++                    task_fragments = self._get_status_bar_active_task_fragments(
++                        active_todo_items,
++                        compact=width < 76,
++                    )
+             elif saved_task_title:
+-                task_fragments = [("class:status-bar-strong", saved_task_title)]
++                fallback_todo_item = self._select_status_bar_fallback_todo_item(todo_items)
++                if fallback_todo_item:
++                    saved_title_fragments = self._get_status_bar_named_task_fragments(
++                        {
++                            **fallback_todo_item,
++                            "content": saved_task_title,
++                        }
++                    )
++                    task_fragments = saved_title_fragments
++                else:
++                    task_fragments = [("class:status-bar-strong", saved_task_title)]
+             elif todo_items:
+                 task_fragments = self._get_status_bar_named_task_fragments(
+                     self._select_status_bar_fallback_todo_item(todo_items)
+@@ -3410,6 +3517,13 @@ class HermesCLI:
+                 ("class:status-bar", " "),
+                 *task_fragments,
+             ]
++            if progress_label:
++                primary_frags.extend(
++                    [
++                        ("class:status-bar", " "),
++                        (progress_style, progress_label),
++                    ]
++                )
+             optional_groups = []
+             if width >= 76:
+                 optional_groups.append([
+diff --git a/tests/cli/test_cli_status_bar.py b/tests/cli/test_cli_status_bar.py
+index 7843eb1b..1451ddb7 100644
+--- a/tests/cli/test_cli_status_bar.py
++++ b/tests/cli/test_cli_status_bar.py
+@@ -153,7 +153,7 @@ class TestCLIStatusBar:
+         assert "DeepSeek-R1" in text
+         assert "lucienfc-gpt" in text
+         assert "high" in text
+-        assert "(2/3)" in text
++        assert "(2/3)" not in text
+         assert text.rstrip().endswith("子任务：2/5")
+ 
+     def test_input_height_counts_wide_characters_using_cell_width(self):
+@@ -379,6 +341,7 @@ class TestCLIStatusBar:
+             fragments = cli_obj._get_status_bar_fragments()
+ 
+         text = "".join(text for _, text in fragments)
++        assert "(2/3)" not in text
+         assert "后台任务：2/5" in text
+         assert "子任务：2/5" in text
+         assert text.rfind("子任务：2/5") > text.rfind("后台任务：2/5")
+@@ -724,27 +665,23 @@ class TestCLIStatusBar:
+                 api_calls=7,
+                 context_tokens=12_450,
+                 context_length=200_000,
+-                compressions=1,
+             ),
+             ("Load relevant Hermes skill/instructions for local CLI status bar maintenance", "in_progress"),
+-            ("Inspect Hermes status bar rendering code", "pending"),
+         )
+         cli_obj._status_bar_visible = True
+ 
+         mock_app = MagicMock()
+-        mock_app.output.get_size.return_value = MagicMock(columns=90)
++        mock_app.output.get_size.return_value = MagicMock(columns=70)
+         with patch("prompt_toolkit.application.get_app", return_value=mock_app):
+             fragments = cli_obj._get_status_bar_secondary_fragments()
+ 
+         text = "".join(text for _, text in fragments)
+-        assert "[>] Load relevant Hermes skill/instructions for local CLI status bar maintenance" in text
+-        assert "12.4K/200K" not in text
+-        assert "[█" not in text
++        assert "skill/instructions" in text
+ 
+-    def test_status_bar_secondary_line_uses_available_width_for_long_task_on_narrow_terminal(self):
++    def test_status_bar_primary_line_keeps_provider_visible_without_todo_progress_when_no_subtasks_exist(self):
+         cli_obj = _attach_todo_items(
+             _attach_agent(
+-                _make_cli(),
++                _make_cli(model="claude-sonnet-4-20250514"),
+                 prompt_tokens=10_230,
+                 completion_tokens=2_220,
+                 total_tokens=12_450,
+@@ -752,19 +689,29 @@ class TestCLIStatusBar:
+                 context_tokens=12_450,
+                 context_length=200_000,
+             ),
+-            ("Load relevant Hermes skill/instructions for local CLI status bar maintenance", "in_progress"),
++            ("build", "completed"),
++            ("deploy", "in_progress"),
++            ("docs", "pending"),
+         )
++        cli_obj.provider = "custom"
++        cli_obj.requested_provider = "custom"
++        cli_obj._provider_source = "custom_provider:octopus-gpt"
++        cli_obj.agent.provider = "custom"
++        cli_obj.reasoning_config = {"enabled": True, "effort": "high"}
+         cli_obj._status_bar_visible = True
+ 
+         mock_app = MagicMock()
+-        mock_app.output.get_size.return_value = MagicMock(columns=70)
++        mock_app.output.get_size.return_value = MagicMock(columns=50)
+         with patch("prompt_toolkit.application.get_app", return_value=mock_app):
+-            fragments = cli_obj._get_status_bar_secondary_fragments()
++            fragments = cli_obj._get_status_bar_fragments()
+ 
+         text = "".join(text for _, text in fragments)
+-        assert "skill/instructions" in text
++        assert "claude-sonnet-4-20250514" in text
++        assert "(2/3)" not in text
++        assert "octopus-gpt" in text
++        assert "high" in text
+ 
+-    def test_status_bar_primary_line_keeps_provider_visible_with_todo_progress_when_no_subtasks_exist(self):
++    def test_status_bar_secondary_line_shows_progress_suffix_for_active_todo_when_primary_line_omits_it(self):
+         cli_obj = _attach_todo_items(
+             _attach_agent(
+                 _make_cli(model="claude-sonnet-4-20250514"),
+@@ -779,21 +726,16 @@ class TestCLIStatusBar:
+             ("deploy", "in_progress"),
+             ("docs", "pending"),
+         )
+-        cli_obj.provider = "custom"
+-        cli_obj.requested_provider = "custom"
+-        cli_obj._provider_source = "custom_provider:octopus-gpt"
+-        cli_obj.agent.provider = "custom"
+-        cli_obj.reasoning_config = {"enabled": True, "effort": "high"}
+         cli_obj._status_bar_visible = True
+ 
+         mock_app = MagicMock()
+-        mock_app.output.get_size.return_value = MagicMock(columns=50)
++        mock_app.output.get_size.return_value = MagicMock(columns=90)
+         with patch("prompt_toolkit.application.get_app", return_value=mock_app):
+-            fragments = cli_obj._get_status_bar_fragments()
++            fragments = cli_obj._get_status_bar_secondary_fragments()
+ 
+         text = "".join(text for _, text in fragments)
+-        assert "claude-sonnet-4-20250514" in text
+-        assert "(2/3)" in text
++        assert "[X] deploy (2/3)" in text
++        assert "(2/3) [X] deploy" not in text
+ 
+     def test_status_bar_secondary_line_shows_task_name_instead_of_todo_summary_when_no_active_task(self):
+         cli_obj = _attach_todo_items(
+@@ -819,7 +761,7 @@ class TestCLIStatusBar:
+             fragments = cli_obj._get_status_bar_secondary_fragments()
+ 
+         text = "".join(text for _, text in fragments)
+-        assert "调查状态栏任务进度显示问题" in text
++        assert "[ ] 调查状态栏任务进度显示问题 (1/3)" in text
+         assert "todo 1/3" not in text
+         assert "td 1/3" not in text
+         assert "active --" not in text
+@@ -853,207 +795,111 @@ class TestCLIStatusBar:
+         assert "td 1/3" not in text
+         assert "active --" not in text
+ 
+-
+-class TestCLITmuxTaskTitle:
+-    def test_summarize_prompt_task_filters_domains_and_keeps_core_theme(self):
+-        cli_obj = _make_cli()
+-
+-        title = cli_obj._summarize_prompt_task(
+-            "tmux在屏幕右下角的标题永远是lucienfc.con，我希望可以实时显示当前任务的标题，"
+-            "注意不是todo的任务进度，而是总结prompt下达的任务"
+-        )
+-
+-        assert title == "实时显示当前任务的标题 / 总结prompt下达的任务"
+-        assert "lucienfc.con" not in title
+-
+-    def test_get_prompt_task_title_skips_modifier_only_followups(self):
+-        cli_obj = _make_cli()
+-        cli_obj.conversation_history = [
+-            {
+-                "role": "user",
+-                "content": "tmux在屏幕右下角的标题永远是lucienfc.con，我希望可以实时显示当前任务的标题，注意不是todo的任务进度，而是总结prompt下达的任务",
+-            },
+-            {"role": "assistant", "content": "好的"},
+-            {"role": "user", "content": "另外不需要显示时间和日期"},
+-        ]
+-
+-        assert cli_obj._get_prompt_task_title() == "实时显示当前任务的标题 / 总结prompt下达的任务"
+-
+-    def test_summarize_prompt_task_prefers_requested_change_over_complaint_text(self):
+-        cli_obj = _make_cli()
+-
+-        title = cli_obj._summarize_prompt_task(
+-            "做一个修改，在总结标题时，不应该显示网址，因为会占用太多空间。"
+-            "另外，目前显示的标题“另外不需要显示时间和日期”没有意义，对总结这个session当前做的任务主题没有帮助"
+-        )
+-
+-        assert title == "在总结标题时 / 不应该显示网址"
+-
+-    def test_get_prompt_task_title_summarizes_multiline_prompt(self):
+-        cli_obj = _make_cli()
+-        cli_obj.conversation_history = []
+-
+-        title = cli_obj._get_prompt_task_title("修复 tmux 右下角标题\n不要显示时间和日期\n实时显示当前任务")
+-
+-        assert title == "修复 tmux 右下角标题 / 实时显示当前任务"
+-
+-    def test_summarize_prompt_task_strips_observation_prefixes_and_keeps_short_task_name(self):
+-        cli_obj = _make_cli()
+-
+-        title = cli_obj._summarize_prompt_task(
+-            "做个修改：我注意到现在右下角标题有点长，希望右下角只保留任务名，不要这些口头前缀"
++    def test_status_bar_secondary_line_prefixes_saved_title_with_progress_label(self):
++        cli_obj = _attach_todo_items(
++            _attach_agent(
++                _make_cli(),
++                prompt_tokens=10_230,
++                completion_tokens=2_220,
++                total_tokens=12_450,
++                api_calls=7,
++                context_tokens=12_450,
++                context_length=200_000,
++            ),
++            ("build", "completed"),
++            ("deploy", "completed"),
++            ("docs", "completed"),
++            ("verify", "completed"),
+         )
++        cli_obj._tmux_session_task_title = "调查状态栏任务进度显示问题"
++        cli_obj._status_bar_visible = True
+ 
+-        assert title == "右下角只保留任务名"
++        mock_app = MagicMock()
++        mock_app.output.get_size.return_value = MagicMock(columns=90)
++        with patch("prompt_toolkit.application.get_app", return_value=mock_app):
++            fragments = cli_obj._get_status_bar_secondary_fragments()
+ 
+-    def test_summarize_prompt_task_prefers_cleanup_request_over_background_complaint(self):
+-        cli_obj = _make_cli()
++        text = "".join(text for _, text in fragments)
++        assert "[√] 调查状态栏任务进度显示问题 (4/4)" in text
+ 
+-        title = cli_obj._summarize_prompt_task(
+-            "我注意到似乎更新这个标题会在后台多开一个hermes实例，我希望有一个资源回收机制，避免被僵尸后台浪费系统资源"
++    def test_status_bar_secondary_line_prefixes_saved_title_with_active_marker(self):
++        cli_obj = _attach_todo_items(
++            _attach_agent(
++                _make_cli(),
++                prompt_tokens=10_230,
++                completion_tokens=2_220,
++                total_tokens=12_450,
++                api_calls=7,
++                context_tokens=12_450,
++                context_length=200_000,
++            ),
++            ("build", "completed"),
++            ("deploy", "in_progress"),
++            ("docs", "pending"),
+         )
++        cli_obj._tmux_session_task_title = "调查状态栏任务进度显示问题"
++        cli_obj._status_bar_visible = True
+ 
+-        assert title == "资源回收机制"
++        mock_app = MagicMock()
++        mock_app.output.get_size.return_value = MagicMock(columns=90)
++        with patch("prompt_toolkit.application.get_app", return_value=mock_app):
++            fragments = cli_obj._get_status_bar_secondary_fragments()
+ 
+-    def test_summarize_prompt_task_rejects_context_compaction_summary_prefix(self):
+-        cli_obj = _make_cli()
++        text = "".join(text for _, text in fragments)
++        assert "[X] deploy (2/3)" not in text
++        assert "[X] 调查状态栏任务进度显示问题 (2/3)" in text
+ 
+-        title = cli_obj._summarize_prompt_task(
+-            "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted to save context space. "
+-            "The summary below describes work that was already completed, and the current session state may still reflect that work."
++    def test_status_bar_secondary_line_prefixes_saved_title_with_pending_marker(self):
++        cli_obj = _attach_todo_items(
++            _attach_agent(
++                _make_cli(),
++                prompt_tokens=10_230,
++                completion_tokens=2_220,
++                total_tokens=12_450,
++                api_calls=7,
++                context_tokens=12_450,
++                context_length=200_000,
++            ),
++            ("build", "completed"),
++            ("deploy", "pending"),
++            ("docs", "pending"),
+         )
++        cli_obj._tmux_session_task_title = "调查状态栏任务进度显示问题"
++        cli_obj._status_bar_visible = True
+ 
+-        assert title == ""
++        mock_app = MagicMock()
++        mock_app.output.get_size.return_value = MagicMock(columns=90)
++        with patch("prompt_toolkit.application.get_app", return_value=mock_app):
++            fragments = cli_obj._get_status_bar_secondary_fragments()
+ 
+-    def test_summarize_prompt_task_rejects_python_mock_repr(self):
+-        cli_obj = _make_cli()
++        text = "".join(text for _, text in fragments)
++        assert "[ ] 调查状态栏任务进度显示问题 (1/3)" in text
+ 
+-        title = cli_obj._summarize_prompt_task(
+-            "<MagicMock name='_session_title()' id='133736162728528'>"
++    def test_status_bar_secondary_line_prefixes_fallback_todo_with_progress_label(self):
++        cli_obj = _attach_todo_items(
++            _attach_agent(
++                _make_cli(),
++                prompt_tokens=10_230,
++                completion_tokens=2_220,
++                total_tokens=12_450,
++                api_calls=7,
++                context_tokens=12_450,
++                context_length=200_000,
++            ),
++            ("build", "completed"),
++            ("deploy", "completed"),
++            ("docs", "completed"),
++            ("verify", "completed"),
+         )
++        cli_obj._status_bar_visible = True
+ 
+-        assert title == ""
+-
+-    def test_get_saved_tmux_task_title_skips_compaction_history_and_prefers_session_title(self):
+-        cli_obj = _make_cli()
+-        cli_obj.conversation_history = [
+-            {
+-                "role": "user",
+-                "content": "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted to save context space. "
+-                "The summary below describes work that was already completed.",
+-            }
+-        ]
+-        cli_obj._session_db = MagicMock()
+-        cli_obj._session_db.get_session_title.return_value = "检查hermes4实例上下文压缩 #5"
+-
+-        assert cli_obj._get_saved_tmux_task_title() == "检查hermes4实例上下文压缩 #5"
+-
+-    def test_get_prompt_task_title_locks_to_first_prompt_per_session(self):
+-        cli_obj = _make_cli()
+-        cli_obj.conversation_history = []
+-        cli_obj._session_db = MagicMock()
+-        cli_obj._session_db.get_session_title.return_value = None
+-
+-        first_title = cli_obj._get_prompt_task_title("tmux在右下角实时显示当前任务标题，不要显示时间和日期")
+-        cli_obj.conversation_history.append({"role": "user", "content": "tmux在右下角实时显示当前任务标题，不要显示时间和日期"})
+-        cli_obj._session_db.get_session_title.return_value = first_title
+-
+-        followup_title = cli_obj._get_prompt_task_title("另外加一个资源回收机制，避免僵尸后台")
+-
+-        assert first_title == "tmux在右下角实时显示当前任务标题"
+-        assert followup_title == first_title
+-        cli_obj._session_db.set_session_title.assert_called_once_with("session-1", first_title)
+-
+-    def test_sync_tmux_pane_title_updates_current_pane_once_per_session(self):
+-        cli_obj = _make_cli()
+-        cli_obj.conversation_history = []
+-
+-        with patch.dict("os.environ", {"TMUX_PANE": "%9"}, clear=False), patch("subprocess.run") as mock_run:
+-            title = cli_obj._sync_tmux_pane_title("tmux在右下角实时显示当前任务标题，不要显示时间和日期")
+-            cli_obj.conversation_history.append({"role": "user", "content": "tmux在右下角实时显示当前任务标题，不要显示时间和日期"})
+-            followup = cli_obj._sync_tmux_pane_title("另外加一个资源回收机制，避免僵尸后台")
+-
+-        assert title == "tmux在右下角实时显示当前任务标题"
+-        assert followup == title
+-        # Startup can sync the title once, then the first user prompt locks it.
+-        # We only require that follow-up prompts do not change the title.
+-        assert mock_run.call_count >= 1
+-        args, kwargs = mock_run.call_args
+-        assert args[0] == ["tmux", "select-pane", "-t", "%9", "-T", title]
+-        assert kwargs["check"] is False
+-        assert kwargs["timeout"] == 1.0
+-
+-    def test_sync_tmux_pane_title_does_not_clobber_existing_title_with_fallback(self):
+-        """Regression: restarting Hermes inside the same tmux pane should not
+-        overwrite an existing meaningful title with the fallback string.
+-
+-        This covers the startup path where Hermes calls _sync_tmux_pane_title()
+-        before any user prompt is sent.
+-        """
+-        cli_obj = _make_cli()
+-        cli_obj.conversation_history = []
+-        cli_obj._tmux_pane_title = "已有标题"
+-
+-        with patch.dict("os.environ", {"TMUX_PANE": "%9"}, clear=False), patch("subprocess.run") as mock_run:
+-            title = cli_obj._sync_tmux_pane_title(task_source=None, fallback="Hermes", force=False)
+-
+-        assert title == "已有标题"
+-        assert mock_run.call_count == 0
+-
+-    def test_prime_tmux_pane_title_cache_preserves_visible_title_without_locking_new_session(self):
+-        cli_obj = _make_cli()
+-        cli_obj.conversation_history = []
+-
+-        with patch.dict(
+-            "os.environ",
+-            {"TMUX": "/tmp/tmux-1000/default,1234,0", "TMUX_PANE": "%9"},
+-            clear=False,
+-        ), patch("subprocess.check_output", return_value="旧任务标题\n"):
+-            primed = cli_obj._prime_tmux_pane_title_cache(fallback="Hermes")
+-
+-        assert primed == "旧任务标题"
+-        assert cli_obj._tmux_pane_title == "旧任务标题"
+-        assert cli_obj._tmux_session_task_title == ""
+-        assert cli_obj._tmux_task_title_locked is False
+-
+-        with patch.dict("os.environ", {"TMUX_PANE": "%9"}, clear=False), patch("subprocess.run") as mock_run:
+-            title = cli_obj._sync_tmux_pane_title("新的任务标题")
+-
+-        assert title == "新的任务标题"
+-        assert cli_obj._tmux_session_task_title == "新的任务标题"
+-        assert cli_obj._tmux_task_title_locked is True
+-        args, kwargs = mock_run.call_args
+-        assert args[0] == ["tmux", "select-pane", "-t", "%9", "-T", "新的任务标题"]
+-        assert kwargs["check"] is False
+-        assert kwargs["timeout"] == 1.0
+-
+-    def test_tmux_title_enforces_30_chinese_char_limit_by_width(self):
+-        cli_obj = _make_cli()
+-        cli_obj.conversation_history = []
+-
+-        # 31 Chinese characters (CJK width≈62 columns) should be truncated.
+-        raw_title = "一" * 31
+-        with patch.dict("os.environ", {"TMUX_PANE": "%9"}, clear=False), patch("subprocess.run") as mock_run:
+-            title = cli_obj._sync_tmux_pane_title(raw_title)
+-
+-        assert title != raw_title
+-        assert cli_obj._title_display_width(title) <= 60
+-        assert mock_run.call_count == 1
+-
+-    def test_tmux_title_preserves_two_clauses_when_truncating(self):
+-        cli_obj = _make_cli()
+-        cli_obj.conversation_history = []
+-
+-        long_two_clause = (
+-            "修复tmux右下角标题总结显示策略" * 3
+-            + " / "
+-            + "限制长度30个中文字符以内并保持信息完整" * 2
+-        )
+-        with patch.dict("os.environ", {"TMUX_PANE": "%9"}, clear=False), patch("subprocess.run"):
+-            title = cli_obj._sync_tmux_pane_title(long_two_clause)
++        mock_app = MagicMock()
++        mock_app.output.get_size.return_value = MagicMock(columns=90)
++        with patch("prompt_toolkit.application.get_app", return_value=mock_app):
++            fragments = cli_obj._get_status_bar_secondary_fragments()
+ 
+-        assert " / " in title
+-        assert cli_obj._title_display_width(title) <= 60
++        text = "".join(text for _, text in fragments)
++        assert "[√] verify (4/4)" in text
+ 
+ 
+ class TestCLIUsageReport:
