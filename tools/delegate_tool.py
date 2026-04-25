@@ -198,9 +198,9 @@ def _persist_omitted_child_response(
 ) -> dict[str, Any]:
     """Record safe retrieval metadata for an omitted child final response.
 
-    The raw response is written outside the parent-visible result and indexed as
-    session-event searchable text.  The returned mapping contains only safe
-    event/handle metadata for the parent context.
+    The raw response is written outside the parent-visible result.  Only a
+    safe searchable breadcrumb and safe event/handle metadata are returned
+    to the parent context.
     """
     session_id = getattr(parent_agent, "session_id", None)
     session_db = getattr(parent_agent, "_session_db", None)
@@ -241,6 +241,9 @@ def _persist_omitted_child_response(
             "raw_chars": len(raw_text),
             "raw_bytes": raw_bytes,
             "child_session_id": child_session_id,
+            "artifact_kind": "delegation_child_final_response",
+            "artifact_access_policy": "delegate_only",
+            "parent_access": "metadata_only",
         },
     )
     handle_dict = handle.to_dict()
@@ -253,7 +256,8 @@ def _persist_omitted_child_response(
         f"task_index={task_index}; "
         f"child_session_id={child_session_id or 'unknown'}; "
         f"raw_chars={len(raw_text)}; raw_bytes={raw_bytes}; "
-        "artifact available via retrieval handle."
+        "artifact available via retrieval handle; "
+        "artifact_access_policy=delegate_only."
     )
 
     try:
@@ -267,6 +271,9 @@ def _persist_omitted_child_response(
                 "raw_bytes": raw_bytes,
                 "child_session_id": child_session_id,
                 "artifact_path": artifact_path,
+                "artifact_kind": "delegation_child_final_response",
+                "artifact_access_policy": "delegate_only",
+                "parent_access": "metadata_only",
             },
             retrieval_handles=[handle_dict],
             source_type="delegation_child",

@@ -56,8 +56,9 @@ RETRIEVAL_RESOLVE_SCHEMA = {
         "Resolve a session event or retrieval handle into parent-safe metadata and artifact "
         "locators. This tool never returns raw artifact contents, searchable text, snippets, "
         "stdout/stderr, previews, or message/body/content fields. Use it after session_search "
-        "returns an event_id or handle_id and you need safe metadata before delegating any raw "
-        "inspection."
+        "returns an event_id or handle_id and you need safe metadata. If artifact contents "
+        "must be inspected, follow the returned artifact_inspection contract and delegate "
+        "that work to a child/subagent rather than reading raw content into the parent context."
     ),
     "parameters": {
         "type": "object",
@@ -175,8 +176,31 @@ def _matching_handle(event: Dict[str, Any], handle_id: str | None) -> Dict[str, 
     return None
 
 
+def _artifact_content_policy(handles: Iterable[Dict[str, Any]], payload: Dict[str, Any]) -> str | None:
+    """Return the safest content-access policy carried by event metadata."""
+    sources: list[Dict[str, Any]] = [payload]
+    for handle in handles:
+        if not isinstance(handle, dict):
+            continue
+        for key in ("metadata", "locator"):
+            value = handle.get(key)
+            if isinstance(value, dict):
+                sources.append(value)
+
+    for source in sources:
+        policy = source.get("artifact_access_policy")
+        if isinstance(policy, str) and policy.strip():
+            return _truncate_safe_value(policy.strip())
+        artifact_kind = source.get("artifact_kind")
+        if artifact_kind == "delegation_child_final_response":
+            return "delegate_only"
+    return None
+
+
 def _safe_artifacts(handles: Iterable[Dict[str, Any]], payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     artifacts: List[Dict[str, Any]] = []
+    handles = list(handles)
+    policy = _artifact_content_policy(handles, payload)
     seen = set()
     for source in [payload, *(handle.get("locator") or {} for handle in handles)]:
         if not isinstance(source, dict):
@@ -187,11 +211,36 @@ def _safe_artifacts(handles: Iterable[Dict[str, Any]], payload: Dict[str, Any]) 
             if isinstance(value, str):
                 artifact[key] = _redact_locator_string(value)
         if artifact:
+            if policy:
+                artifact["artifact_access_policy"] = policy
+            if policy == "delegate_only":
+                artifact["parent_access"] = "metadata_only"
+                artifact["inspection_route"] = "delegate_task"
             marker = tuple(sorted(artifact.items()))
             if marker not in seen:
                 seen.add(marker)
                 artifacts.append(artifact)
     return artifacts
+
+
+def _artifact_inspection_contract(artifacts: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not artifacts:
+        return None
+    delegate_only = any(
+        artifact.get("artifact_access_policy") == "delegate_only"
+        for artifact in artifacts
+    )
+    return {
+        "artifact_access_policy": "delegate_only" if delegate_only else "explicit_only",
+        "parent_access": "metadata_only",
+        "recommended_tool": "delegate_task",
+        "recommended_toolsets": ["file"],
+        "instruction": (
+            "Do not read artifact contents into the parent context. Delegate a focused "
+            "child/subagent with the artifact locator and request a concise summary, "
+            "evidence counts, or validation result only."
+        ),
+    }
 
 
 def _raw_size_metadata(event: Dict[str, Any], handles: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
@@ -287,6 +336,9 @@ def retrieval_resolve(
             result["matched_handle"] = _safe_handle(matched_handle)
         if artifacts:
             result["artifacts"] = artifacts
+            artifact_contract = _artifact_inspection_contract(artifacts)
+            if artifact_contract:
+                result["artifact_inspection"] = artifact_contract
         if raw_sizes:
             result["raw_size"] = raw_sizes
         return json.dumps(result, ensure_ascii=False)

@@ -45,6 +45,9 @@ def _record_event(db, session_id="sid-current", event_id="evt-current", handle_i
             "status": "stored",
             "artifact_path": artifact_path,
             "raw_chars": 2048,
+            "artifact_kind": "delegation_child_final_response",
+            "artifact_access_policy": "delegate_only",
+            "parent_access": "metadata_only",
             "raw_output": RAW_SENTINEL,
             "content": RAW_SENTINEL,
             "nested": {"safe": "kept", "stderr": RAW_SENTINEL},
@@ -63,6 +66,9 @@ def _record_event(db, session_id="sid-current", event_id="evt-current", handle_i
                 "metadata": {
                     "tool": "terminal",
                     "raw_chars": 2048,
+                    "artifact_kind": "delegation_child_final_response",
+                    "artifact_access_policy": "delegate_only",
+                    "parent_access": "metadata_only",
                     "raw_body": RAW_SENTINEL,
                     "safe_note": "safe metadata",
                 },
@@ -135,8 +141,17 @@ class TestRetrievalResolve:
         assert result["event"]["event_type"] == "tool_result"
         assert result["retrieval_handles"][0]["handle_id"] == "rh-current"
         assert result["payload_metadata"]["raw_chars"] == 2048
+        assert result["payload_metadata"]["artifact_kind"] == "delegation_child_final_response"
+        assert result["payload_metadata"]["artifact_access_policy"] == "delegate_only"
+        assert result["payload_metadata"]["parent_access"] == "metadata_only"
         assert result["payload_metadata"]["nested"]["safe"] == "kept"
         assert result["raw_size"]["raw_chars"] == 2048
+        assert result["artifacts"][0]["artifact_access_policy"] == "delegate_only"
+        assert result["artifacts"][0]["parent_access"] == "metadata_only"
+        assert result["artifacts"][0]["inspection_route"] == "delegate_task"
+        assert result["artifact_inspection"]["recommended_tool"] == "delegate_task"
+        assert result["artifact_inspection"]["recommended_toolsets"] == ["file"]
+        assert result["artifact_inspection"]["parent_access"] == "metadata_only"
         assert str(artifact) in _flatten(result)
         flattened = _flatten(result)
         assert RAW_SENTINEL not in flattened
@@ -153,6 +168,8 @@ class TestRetrievalResolve:
         assert result["event"]["event_id"] == "evt-current"
         assert result["matched_handle"]["handle_id"] == "rh-current"
         assert result["matched_handle"]["metadata"]["safe_note"] == "safe metadata"
+        assert result["matched_handle"]["metadata"]["artifact_access_policy"] == "delegate_only"
+        assert result["matched_handle"]["metadata"]["parent_access"] == "metadata_only"
 
     def test_resolves_when_event_and_handle_match(self, db):
         _record_event(db)

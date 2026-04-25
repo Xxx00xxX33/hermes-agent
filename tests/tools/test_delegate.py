@@ -546,6 +546,9 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(handle["source_type"], "session_event")
             self.assertEqual(handle["metadata"]["raw_chars"], len(oversized))
             self.assertEqual(handle["metadata"]["raw_bytes"], len(oversized.encode("utf-8")))
+            self.assertEqual(handle["metadata"]["artifact_kind"], "delegation_child_final_response")
+            self.assertEqual(handle["metadata"]["artifact_access_policy"], "delegate_only")
+            self.assertEqual(handle["metadata"]["parent_access"], "metadata_only")
             self.assertEqual(handle["locator"]["session_id"], "sid-parent")
             self.assertEqual(handle["locator"]["child_session_id"], "sid-child")
 
@@ -557,11 +560,15 @@ class TestDelegateObservability(unittest.TestCase):
             args, kwargs = parent._session_db.record_session_event.call_args
             self.assertEqual(args[:2], ("sid-parent", "delegation_child_response"))
             self.assertIn("response omitted", kwargs["searchable_text"])
+            self.assertIn("artifact_access_policy=delegate_only", kwargs["searchable_text"])
             self.assertNotIn(raw_sentinel, kwargs["searchable_text"])
             self.assertEqual(kwargs["retrieval_handles"], [handle])
             self.assertEqual(kwargs["payload"]["raw_chars"], len(oversized))
             self.assertEqual(kwargs["payload"]["raw_bytes"], len(oversized.encode("utf-8")))
             self.assertEqual(kwargs["payload"]["artifact_path"], str(artifact_path))
+            self.assertEqual(kwargs["payload"]["artifact_kind"], "delegation_child_final_response")
+            self.assertEqual(kwargs["payload"]["artifact_access_policy"], "delegate_only")
+            self.assertEqual(kwargs["payload"]["parent_access"], "metadata_only")
 
             safe_event_surface = {
                 "summary": kwargs["summary"],
