@@ -26,6 +26,7 @@ from tools.delegate_tool import (
     delegate_task,
     _build_child_agent,
     _build_child_system_prompt,
+    _parent_safe_child_summary,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -95,6 +96,31 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("- Validation status", prompt)
         self.assertIn("- Unresolved issues", prompt)
         self.assertIn("- Any files you created or modified", prompt)
+
+    def test_warns_that_oversized_child_responses_are_omitted(self):
+        prompt = _build_child_system_prompt("Investigate failure")
+        self.assertIn("Do not paste raw logs", prompt)
+        self.assertIn("Oversized child final responses are omitted", prompt)
+
+
+class TestParentSafeChildSummary(unittest.TestCase):
+    def test_short_summary_passes_through(self):
+        summary, truncated, raw_chars = _parent_safe_child_summary("short result")
+
+        self.assertEqual(summary, "short result")
+        self.assertFalse(truncated)
+        self.assertEqual(raw_chars, len("short result"))
+
+    def test_oversized_summary_is_omitted_from_parent_context(self):
+        raw_sentinel = "RAW_DELEGATION_SENTINEL"
+        oversized = raw_sentinel * 400
+
+        summary, truncated, raw_chars = _parent_safe_child_summary(oversized)
+
+        self.assertTrue(truncated)
+        self.assertEqual(raw_chars, len(oversized))
+        self.assertIn("omitted from parent context", summary)
+        self.assertNotIn(raw_sentinel, summary)
 
 
 class TestStripBlockedTools(unittest.TestCase):
@@ -451,6 +477,35 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertIn("args_bytes", entry["tool_trace"][0])
             self.assertIn("result_bytes", entry["tool_trace"][0])
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
+
+    def test_oversized_child_summary_is_omitted_from_delegate_result(self):
+        parent = _make_mock_parent(depth=0)
+        raw_sentinel = "RAW_DELEGATION_SENTINEL"
+        oversized = raw_sentinel * 400
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": oversized,
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Summarize raw output", parent_agent=parent))
+            entry = result["results"][0]
+
+            self.assertEqual(entry["status"], "completed")
+            self.assertTrue(entry["summary_truncated"])
+            self.assertEqual(entry["summary_chars"], len(oversized))
+            self.assertEqual(entry["summary_omitted_chars"], len(oversized))
+            self.assertIn("omitted from parent context", entry["summary"])
+            self.assertNotIn(raw_sentinel, entry["summary"])
 
     def test_tool_trace_detects_error(self):
         """Tool results containing 'error' should be marked as error status."""

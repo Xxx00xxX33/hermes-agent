@@ -51,6 +51,7 @@ _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+_PARENT_CHILD_SUMMARY_MAX_CHARS = 6_000
 
 
 def _get_max_concurrent_children() -> int:
@@ -118,9 +119,36 @@ def _build_child_system_prompt(
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
         "Be thorough but concise -- your response is returned to the "
-        "parent agent as a summary."
+        "parent agent as a summary. Do not paste raw logs, large file "
+        "contents, command dumps, or other bulky data; report locators, "
+        "counts, and the smallest evidence needed instead. Oversized "
+        "child final responses are omitted from the parent context."
     )
     return "\n".join(parts)
+
+
+def _parent_safe_child_summary(summary: Any) -> tuple[str, bool, int]:
+    """Return a bounded child summary suitable for the parent context.
+
+    Subagents are instructed to summarize, but Phase 8 makes that contract
+    enforceable: if a child accidentally returns a huge final response, do not
+    pass that raw blob into the parent.  The parent keeps size metadata and can
+    delegate a targeted follow-up if details are genuinely needed.
+    """
+    if summary is None:
+        return "", False, 0
+    text = str(summary)
+    raw_chars = len(text)
+    if raw_chars <= _PARENT_CHILD_SUMMARY_MAX_CHARS:
+        return text, False, raw_chars
+    return (
+        "[Subagent final response omitted from parent context because it "
+        f"exceeded {_PARENT_CHILD_SUMMARY_MAX_CHARS} characters. "
+        "Request a targeted follow-up delegation or inspect retrieval "
+        "handles/artifacts when details are required.]",
+        True,
+        raw_chars,
+    )
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
@@ -515,7 +543,9 @@ def _run_single_child(
 
         duration = round(time.monotonic() - child_start, 2)
 
-        summary = result.get("final_response") or ""
+        summary, summary_truncated, summary_chars = _parent_safe_child_summary(
+            result.get("final_response")
+        )
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
@@ -585,6 +615,7 @@ def _run_single_child(
             "task_index": task_index,
             "status": status,
             "summary": summary,
+            "summary_chars": summary_chars,
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
@@ -595,6 +626,9 @@ def _run_single_child(
             },
             "tool_trace": tool_trace,
         }
+        if summary_truncated:
+            entry["summary_truncated"] = True
+            entry["summary_omitted_chars"] = summary_chars
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
