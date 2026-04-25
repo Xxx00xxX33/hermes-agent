@@ -195,6 +195,115 @@ def _parent_safe_child_error(
     }
 
 
+def _parent_safe_child_progress_text(value: Any, *, label: str) -> str:
+    """Return display-safe metadata for child-origin progress text.
+
+    Child progress previews, thinking snippets, and completion snippets can
+    contain raw tool args, file contents, stderr, or provider bodies.  Parent
+    displays and gateway callbacks get only omission metadata.
+    """
+    if value is None:
+        return ""
+    raw_text = str(value)
+    if not raw_text:
+        return ""
+    raw_bytes = len(raw_text.encode("utf-8"))
+    return (
+        f"{label} omitted from parent context "
+        f"({len(raw_text)} chars, {raw_bytes} bytes)"
+    )
+
+
+def _parent_safe_child_progress_payload(value: Any, *, label: str) -> dict[str, Any] | None:
+    """Return size metadata for omitted child-origin callback payloads."""
+    if value is None:
+        return None
+    raw_text = str(value)
+    return {
+        "payload_omitted": True,
+        "payload_kind": label,
+        "payload_chars": len(raw_text),
+        "payload_bytes": len(raw_text.encode("utf-8")),
+    }
+
+
+_SAFE_CHILD_PROGRESS_STATUSES = frozenset({
+    "completed",
+    "failed",
+    "error",
+    "interrupted",
+    "running",
+    "started",
+})
+_SAFE_CHILD_PROGRESS_NUMERIC_KWARGS = frozenset({
+    "api_calls",
+    "duration",
+    "duration_seconds",
+})
+_RAW_CHILD_PROGRESS_KWARGS = frozenset({
+    "args",
+    "content",
+    "details",
+    "error",
+    "exception",
+    "message",
+    "output",
+    "preview",
+    "stderr",
+    "stdout",
+    "summary",
+    "traceback",
+})
+
+
+def _parent_safe_child_progress_kwargs(
+    kwargs: dict[str, Any],
+    *,
+    event_type: str,
+) -> dict[str, Any]:
+    """Return whitelisted parent-safe callback kwargs for child progress.
+
+    Child progress kwargs are child-origin data.  Forward only narrow
+    control-plane metadata and sanitized omission metadata so raw error,
+    message, traceback, stdout/stderr, args, or details payloads cannot ride
+    through arbitrary callback kwargs.
+    """
+    safe: dict[str, Any] = {}
+
+    status = kwargs.get("status")
+    if isinstance(status, str) and status in _SAFE_CHILD_PROGRESS_STATUSES:
+        safe["status"] = status
+    elif status is not None:
+        safe["status"] = "unknown"
+
+    for key in _SAFE_CHILD_PROGRESS_NUMERIC_KWARGS:
+        value = kwargs.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            safe[key] = value
+
+    if event_type == "subagent.complete" and "summary" in kwargs:
+        safe["summary"] = _parent_safe_child_progress_text(
+            kwargs.get("summary"),
+            label="child completion summary",
+        )
+
+    omitted_payloads: list[dict[str, Any]] = []
+    for key in sorted(_RAW_CHILD_PROGRESS_KWARGS):
+        if key == "summary" or key not in kwargs or kwargs.get(key) is None:
+            continue
+        raw_text = str(kwargs.get(key))
+        omitted_payloads.append({
+            "payload_key": key,
+            "payload_omitted": True,
+            "payload_chars": len(raw_text),
+            "payload_bytes": len(raw_text.encode("utf-8")),
+        })
+    if omitted_payloads:
+        safe["omitted_child_payloads"] = omitted_payloads
+
+    return safe
+
+
 def _safe_artifact_component(value: str | None, fallback: str) -> str:
     """Return a filesystem-safe artifact path component."""
     text = value if isinstance(value, str) and value.strip() else fallback
@@ -390,16 +499,44 @@ def _build_child_progress_callback(task_index: int, goal: str, parent_agent, tas
     def _relay(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
         if not parent_cb:
             return
+
+        safe_preview = preview
+        safe_args = args
+        safe_kwargs = _parent_safe_child_progress_kwargs(
+            kwargs,
+            event_type=event_type,
+        )
+
+        if event_type == "subagent.start":
+            safe_preview = _parent_safe_child_progress_text(
+                preview, label="child start preview"
+            )
+        elif event_type == "subagent.tool":
+            safe_preview = _parent_safe_child_progress_text(
+                preview, label="child tool preview"
+            )
+            safe_args = _parent_safe_child_progress_payload(
+                args, label="child tool args"
+            )
+        elif event_type == "subagent.thinking":
+            safe_preview = _parent_safe_child_progress_text(
+                preview, label="child reasoning"
+            )
+        elif event_type == "subagent.complete":
+            safe_preview = _parent_safe_child_progress_text(
+                preview, label="child completion preview"
+            )
+
         try:
             parent_cb(
                 event_type,
                 tool_name,
-                preview,
-                args,
+                safe_preview,
+                safe_args,
                 task_index=task_index,
                 task_count=task_count,
                 goal=goal_label,
-                **kwargs,
+                **safe_kwargs,
             )
         except Exception as e:
             logger.debug("Parent callback failed: %s", e)
@@ -425,8 +562,11 @@ def _build_child_progress_callback(task_index: int, goal: str, parent_agent, tas
         # "_thinking" / reasoning events
         if event_type in ("_thinking", "reasoning.available"):
             text = preview or tool_name or ""
-            if spinner:
-                short = (text[:55] + "...") if len(text) > 55 else text
+            safe_text = _parent_safe_child_progress_text(
+                text, label="child reasoning"
+            )
+            if spinner and safe_text:
+                short = (safe_text[:55] + "...") if len(safe_text) > 55 else safe_text
                 try:
                     spinner.print_above(f" {prefix}├─ 💭 \"{short}\"")
                 except Exception as e:
@@ -440,7 +580,14 @@ def _build_child_progress_callback(task_index: int, goal: str, parent_agent, tas
 
         # tool.started — display and batch for parent relay
         if spinner:
-            short = (preview[:35] + "...") if preview and len(preview) > 35 else (preview or "")
+            safe_preview = _parent_safe_child_progress_text(
+                preview, label="child tool preview"
+            )
+            short = (
+                (safe_preview[:35] + "...")
+                if safe_preview and len(safe_preview) > 35
+                else safe_preview
+            )
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name or "")
             line = f" {prefix}├─ {emoji} {tool_name}"
@@ -821,12 +968,13 @@ def _run_single_child(
 
         if child_progress_cb:
             try:
+                completion_text = summary if summary else entry.get("error", "")
                 child_progress_cb(
                     "subagent.complete",
-                    preview=summary[:160] if summary else entry.get("error", ""),
+                    preview=completion_text,
                     status=status,
                     duration_seconds=duration,
-                    summary=summary[:500] if summary else entry.get("error", ""),
+                    summary=completion_text,
                 )
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)

@@ -279,6 +279,85 @@ def test_delegate_failed_child_error_string_omits_raw_error_from_parent_context(
     assert "raw error details omitted" in entry["error"]
 
 
+def test_delegate_progress_display_surfaces_omit_raw_child_previews():
+    parent = _make_parent(session_db=MagicMock())
+    spinner = MagicMock()
+    parent._delegate_spinner = spinner
+    progress_events = []
+
+    def parent_progress(*args, **kwargs):
+        progress_events.append({"args": args, "kwargs": kwargs})
+
+    parent.tool_progress_callback = parent_progress
+    raw_preview = f"tool args stderr {RAW_CONTEXT_SENTINEL}"
+    raw_thinking = f"reasoning over raw output {RAW_CONTEXT_SENTINEL}"
+    raw_completion = f"completion preview {RAW_CONTEXT_SENTINEL}"
+
+    with patch("run_agent.AIAgent") as MockAgent:
+        def build_child(*args, **kwargs):
+            child = MagicMock()
+            child.model = "claude-sonnet-4-6"
+            child.session_id = "sid-child"
+            child.session_prompt_tokens = 0
+            child.session_completion_tokens = 0
+            child.tool_progress_callback = kwargs.get("tool_progress_callback")
+            child.thinking_callback = kwargs.get("thinking_callback")
+
+            def run_conversation(**_run_kwargs):
+                callback = child.tool_progress_callback
+                assert callback is not None
+                callback(
+                    "subagent.start",
+                    preview=raw_preview,
+                    message=raw_preview,
+                    args={"cmd": raw_preview},
+                )
+                callback(
+                    "tool.started",
+                    tool_name="terminal",
+                    preview=raw_preview,
+                    args={"cmd": raw_preview},
+                )
+                if child.thinking_callback:
+                    child.thinking_callback(raw_thinking)
+                callback(
+                    "subagent.complete",
+                    preview=raw_completion,
+                    summary=raw_completion,
+                    error=f"raw error {RAW_CONTEXT_SENTINEL}",
+                    message=f"raw message {RAW_CONTEXT_SENTINEL}",
+                    details={"stderr": f"raw stderr {RAW_CONTEXT_SENTINEL}"},
+                    status="completed",
+                )
+                return {
+                    "final_response": "safe child summary",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            child.run_conversation.side_effect = run_conversation
+            return child
+
+        MockAgent.side_effect = build_child
+
+        result = _decode(delegate_task(
+            goal="Trigger raw child progress preview",
+            parent_agent=parent,
+        ))
+
+    _assert_no_sentinel(result)
+    _assert_no_sentinel(progress_events)
+    _assert_no_sentinel([
+        {"args": call.args, "kwargs": call.kwargs}
+        for call in spinner.print_above.call_args_list
+    ])
+
+    assert result["results"][0]["status"] == "completed"
+    assert progress_events or spinner.print_above.call_args_list
+
+
 def test_retrieval_resolve_returns_metadata_only_for_delegate_only_artifact(session_db, tmp_path):
     artifact = tmp_path / "raw-child-response.txt"
     artifact.write_text(RAW_CONTEXT_SENTINEL, encoding="utf-8")
