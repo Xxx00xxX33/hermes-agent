@@ -109,6 +109,12 @@ bundle:
     verifies:
       - tests/cli/test_quick_tool_transcript.py
 
+  - id: tui-transcript-semantic-styling
+    patch: patches/hermes-tui-transcript-semantic-styling.patch
+    purpose: Preserve semantic transcript styling in the live TUI after ANSI content is normalized into the transcript buffer.
+    verifies:
+      - tests/cli/test_cprint_multiline.py
+
 
   - id: statusbar-second-line-progress
     patch: patches/hermes-statusbar-second-line-progress.patch

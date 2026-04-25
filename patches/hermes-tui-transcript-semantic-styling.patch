@@ -1,0 +1,172 @@
+diff --git a/cli.py b/cli.py
+index 52b5db65..ccc99206 100644
+--- a/cli.py
++++ b/cli.py
+@@ -51,6 +51,7 @@ from prompt_toolkit.document import Document
+ from prompt_toolkit.key_binding import KeyBindings
+ from prompt_toolkit import print_formatted_text as _pt_print
+ from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
++from prompt_toolkit.lexers import Lexer
+ try:
+     from prompt_toolkit.cursor_shapes import CursorShape
+     _STEADY_CURSOR = CursorShape.BLOCK  # Non-blinking block cursor
+@@ -1082,6 +1083,72 @@ def _sanitize_resumed_text(text: str) -> str:
+     return "".join(ch for ch in cleaned if ch in "\n\r\t" or ord(ch) >= 32)
+ 
+ 
++_TRANSCRIPT_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
++_TRANSCRIPT_SEPARATOR_CHARS = frozenset("─━═╭╮╰╯┌┐└┘├┤┬┴┼┊│┃┄┈╌╍╎╏ ")
++_TRANSCRIPT_META_PREFIXES = (
++    "provider:",
++    "context:",
++    "max output:",
++    "cost:",
++    "capabilities:",
++    "prompt caching:",
++    "saved to config.yaml",
++    "(session only",
++)
++
++
++def _style_tui_transcript_line(line: str):
++    """Return prompt_toolkit fragments for one transcript line.
++
++    The live TUI transcript stores plain text after ANSI/control sanitization, so
++    the TextArea needs semantic colors at render time instead of inheriting one
++    pale global foreground.  Keep this classifier deliberately narrow: only
++    Hermes-authored wrapper lines get accent colors; assistant/tool bodies stay
++    neutral for readability.
++    """
++    text = line or ""
++    stripped = text.strip()
++    if not stripped:
++        return [("class:transcript", text)]
++
++    # If a raw ANSI fragment ever reaches the TextArea, avoid adding a second
++    # semantic color on top of it.  The normal TUI path strips ANSI before this.
++    if _TRANSCRIPT_ANSI_RE.search(text):
++        return [("class:transcript", _TRANSCRIPT_ANSI_RE.sub("", text))]
++
++    lower = stripped.lower()
++    if len(stripped) >= 3 and all(ch in _TRANSCRIPT_SEPARATOR_CHARS for ch in stripped):
++        return [("class:transcript-separator", text)]
++    if stripped.startswith(("✗", "✖", "❌")) or lower.startswith(("error", "failed", "traceback")):
++        return [("class:transcript-error", text)]
++    if stripped.startswith("⚠") or "⚠" in stripped or lower.startswith(("warning:", "warn:")):
++        return [("class:transcript-warning", text)]
++    if stripped.startswith(("✓", "✔")):
++        return [("class:transcript-notice", text)]
++    if stripped.startswith("Initializing agent"):
++        return [("class:transcript-progress", text)]
++    if stripped.startswith("┊") or " ┊ " in text:
++        return [("class:transcript-progress", text)]
++    if lower.startswith(_TRANSCRIPT_META_PREFIXES):
++        return [("class:transcript-meta", text)]
++    if stripped.startswith(("●", "❯")):
++        return [("class:transcript-user", text)]
++    return [("class:transcript", text)]
++
++
++class _TranscriptSemanticLexer(Lexer):
++    """Semantic prompt_toolkit lexer for the TUI transcript TextArea."""
++
++    def lex_document(self, document):
++        def get_line(line_number: int):
++            try:
++                return _style_tui_transcript_line(document.lines[line_number])
++            except IndexError:
++                return []
++
++        return get_line
++
++
+ def _sanitize_resumed_content(content: Any) -> Any:
+     """Recursively clean resumed message payloads while preserving structure."""
+     if isinstance(content, str):
+@@ -6097,14 +6164,11 @@ class HermesCLI:
+         display = display_hermes_home()
+ 
+         profiles_parent = Path.home() / ".hermes" / "profiles"
+-        if home.parent.name == "profiles":
+-            profile_name = home.name
+-        else:
+-            try:
+-                rel = home.relative_to(profiles_parent)
+-                profile_name = str(rel).split("/")[0]
+-            except ValueError:
+-                profile_name = None
++        try:
++            rel = home.relative_to(profiles_parent)
++            profile_name = str(rel).split("/")[0]
++        except ValueError:
++            profile_name = None
+ 
+         print()
+         if profile_name:
+@@ -12045,6 +12109,7 @@ class HermesCLI:
+             wrap_lines=True,
+             scrollbar=False,
+             height=Dimension(weight=1),
++            lexer=_TranscriptSemanticLexer(),
+             style="class:transcript",
+         )
+         self._tui_transcript_area = transcript_area
+@@ -12077,7 +12142,15 @@ class HermesCLI:
+ 
+         # Style for the application
+         self._tui_style_base = {
+-            'transcript': '#FFF8DC',
++            # Message transcript: neutral body with semantic accents.
++            'transcript': '#EAF2FF',
++            'transcript-user': '#9CDCFE bold',
++            'transcript-notice': '#8EF0A4 bold',
++            'transcript-meta': '#C7D2E5',
++            'transcript-warning': '#FFD166 bold',
++            'transcript-error': '#FF7B93 bold',
++            'transcript-progress': '#8CCFFF bold',
++            'transcript-separator': '#7C8DA8',
+             'input-area': '#FFF8DC',
+             'placeholder': '#555555 italic',
+             'prompt': '#FFF8DC',
+diff --git a/tests/cli/test_cprint_multiline.py b/tests/cli/test_cprint_multiline.py
+index b0384c56..9a73cca7 100644
+--- a/tests/cli/test_cprint_multiline.py
++++ b/tests/cli/test_cprint_multiline.py
+@@ -111,3 +111,37 @@ def test_cprint_line_adds_one_newline_for_line_oriented_tui_notices():
+         call("already newline\n"),
+         call("\n"),
+     ]
++
++
++def test_tui_transcript_semantic_lexer_styles_line_oriented_notices():
++    from prompt_toolkit.document import Document
++
++    from cli import _TranscriptSemanticLexer
++
++    document = Document(
++        "  ✓ Model switched: gpt-5.5\n"
++        "    Provider: custom\n"
++        "    Context: 200,000 tokens\n"
++        "    ⚠ Auto-corrected `gpt5.5` → `gpt-5.5`\n"
++        "Initializing agent...\n"
++        "  ┊ 📋 planning 3 task(s)\n"
++        "────────────────────────────────────────\n"
++        "ordinary assistant text"
++    )
++
++    line = _TranscriptSemanticLexer().lex_document(document)
++
++    assert line(0) == [("class:transcript-notice", "  ✓ Model switched: gpt-5.5")]
++    assert line(1) == [("class:transcript-meta", "    Provider: custom")]
++    assert line(2) == [("class:transcript-meta", "    Context: 200,000 tokens")]
++    assert line(3) == [("class:transcript-warning", "    ⚠ Auto-corrected `gpt5.5` → `gpt-5.5`")]
++    assert line(4) == [("class:transcript-progress", "Initializing agent...")]
++    assert line(5) == [("class:transcript-progress", "  ┊ 📋 planning 3 task(s)")]
++    assert line(6) == [("class:transcript-separator", "────────────────────────────────────────")]
++    assert line(7) == [("class:transcript", "ordinary assistant text")]
++
++
++def test_tui_transcript_semantic_lexer_strips_raw_ansi_without_recoloring():
++    from cli import _style_tui_transcript_line
++
++    assert _style_tui_transcript_line("\x1b[31mraw red\x1b[0m") == [("class:transcript", "raw red")]
