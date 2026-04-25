@@ -156,6 +156,45 @@ def _parent_safe_child_summary(summary: Any) -> tuple[str, bool, int]:
     )
 
 
+def _parent_safe_child_error(
+    error: Any,
+    *,
+    default_message: str = "Subagent did not produce a response.",
+) -> dict[str, Any]:
+    """Return parent-safe child error metadata without raw error text.
+
+    Child failures can include raw stderr, tracebacks, tool output, or provider
+    bodies in exception strings.  Keep the parent informed about the failure
+    class and size while omitting the raw error details from parent-visible
+    JSON.
+    """
+    raw_text = "" if error is None else str(error)
+    raw_bytes = len(raw_text.encode("utf-8"))
+
+    if isinstance(error, BaseException):
+        error_type = type(error).__name__
+        message = (
+            f"Subagent raised {error_type}; raw error details omitted "
+            "from parent context."
+        )
+    elif raw_text.strip():
+        error_type = "child_error"
+        message = (
+            "Subagent reported an error; raw error details omitted "
+            "from parent context."
+        )
+    else:
+        error_type = "child_error"
+        message = default_message
+
+    return {
+        "error": message,
+        "error_type": error_type,
+        "error_chars": len(raw_text),
+        "error_bytes": raw_bytes,
+    }
+
+
 def _safe_artifact_component(value: str | None, fallback: str) -> str:
     """Return a filesystem-safe artifact path component."""
     text = value if isinstance(value, str) and value.strip() else fallback
@@ -778,7 +817,7 @@ def _run_single_child(
                 goal=goal,
             ))
         if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            entry.update(_parent_safe_child_error(result.get("error")))
 
         if child_progress_cb:
             try:
@@ -796,15 +835,21 @@ def _run_single_child(
 
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
-        logging.exception(f"[subagent-{task_index}] failed")
+        error_meta = _parent_safe_child_error(exc)
+        logger.warning(
+            "[subagent-%s] failed with %s; raw error details omitted",
+            task_index,
+            type(exc).__name__,
+        )
         if child_progress_cb:
             try:
                 child_progress_cb(
                     "subagent.complete",
-                    preview=str(exc),
+                    preview=error_meta["error"],
                     status="failed",
                     duration_seconds=duration,
-                    summary=str(exc),
+                    summary=error_meta["error"],
+                    error_type=error_meta["error_type"],
                 )
             except Exception as e:
                 logger.debug("Progress callback failure relay failed: %s", e)
@@ -812,7 +857,7 @@ def _run_single_child(
             "task_index": task_index,
             "status": "error",
             "summary": None,
-            "error": str(exc),
+            **error_meta,
             "api_calls": 0,
             "duration_seconds": duration,
         }
@@ -1011,7 +1056,7 @@ def delegate_task(
                                     "task_index": idx,
                                     "status": "error",
                                     "summary": None,
-                                    "error": str(exc),
+                                    **_parent_safe_child_error(exc),
                                     "api_calls": 0,
                                     "duration_seconds": 0,
                                 }
@@ -1039,7 +1084,7 @@ def delegate_task(
                             "task_index": idx,
                             "status": "error",
                             "summary": None,
-                            "error": str(exc),
+                            **_parent_safe_child_error(exc),
                             "api_calls": 0,
                             "duration_seconds": 0,
                         }

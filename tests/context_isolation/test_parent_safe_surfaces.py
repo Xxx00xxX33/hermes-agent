@@ -214,6 +214,71 @@ def test_delegate_oversized_child_response_is_parent_safe_artifact_only():
         })
 
 
+def test_delegate_child_exception_omits_raw_error_from_parent_context():
+    parent = _make_parent(session_db=MagicMock())
+    raw_error = f"raw stderr traceback {RAW_CONTEXT_SENTINEL}"
+
+    with patch("run_agent.AIAgent") as MockAgent:
+        child = MagicMock()
+        child.model = "claude-sonnet-4-6"
+        child.session_id = "sid-child"
+        child.run_conversation.side_effect = RuntimeError(raw_error)
+        MockAgent.return_value = child
+
+        result = _decode(delegate_task(
+            goal="Trigger child exception with raw stderr",
+            parent_agent=parent,
+        ))
+
+    _assert_no_sentinel(result)
+    _assert_no_banned_parent_keys(result)
+
+    entry = result["results"][0]
+    assert entry["status"] == "error"
+    assert entry["summary"] is None
+    assert entry["error_type"] == "RuntimeError"
+    assert entry["error_chars"] == len(raw_error)
+    assert entry["error_bytes"] == len(raw_error.encode("utf-8"))
+    assert "raw error details omitted" in entry["error"]
+
+
+def test_delegate_failed_child_error_string_omits_raw_error_from_parent_context():
+    parent = _make_parent(session_db=MagicMock())
+    raw_error = f"tool stderr body {RAW_CONTEXT_SENTINEL}"
+
+    with patch("run_agent.AIAgent") as MockAgent:
+        child = MagicMock()
+        child.model = "claude-sonnet-4-6"
+        child.session_id = "sid-child"
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.run_conversation.return_value = {
+            "final_response": "",
+            "completed": False,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+            "error": raw_error,
+        }
+        MockAgent.return_value = child
+
+        result = _decode(delegate_task(
+            goal="Trigger child failed result with raw tool output",
+            parent_agent=parent,
+        ))
+
+    _assert_no_sentinel(result)
+    _assert_no_banned_parent_keys(result)
+
+    entry = result["results"][0]
+    assert entry["status"] == "failed"
+    assert entry["summary"] == ""
+    assert entry["error_type"] == "child_error"
+    assert entry["error_chars"] == len(raw_error)
+    assert entry["error_bytes"] == len(raw_error.encode("utf-8"))
+    assert "raw error details omitted" in entry["error"]
+
+
 def test_retrieval_resolve_returns_metadata_only_for_delegate_only_artifact(session_db, tmp_path):
     artifact = tmp_path / "raw-child-response.txt"
     artifact.write_text(RAW_CONTEXT_SENTINEL, encoding="utf-8")
