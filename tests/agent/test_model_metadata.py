@@ -113,10 +113,8 @@ class TestDefaultContextLengths:
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
             if "claude" not in key:
                 continue
-            # Claude 4.6+ models (4.6 and 4.7) have 1M context at standard
-            # API pricing (no long-context premium).  Older Claude 4.x and
-            # 3.x models cap at 200k.
-            if any(tag in key for tag in ("4.6", "4-6", "4.7", "4-7")):
+            # Claude 4.6 models have 1M context
+            if "4.6" in key or "4-6" in key:
                 assert value == 1000000, f"{key} should be 1000000"
             else:
                 assert value == 200000, f"{key} should be 200000"
@@ -226,6 +224,12 @@ class TestGetModelContextLength:
     def test_partial_match_in_defaults(self, mock_fetch):
         mock_fetch.return_value = {}
         assert get_model_context_length("openai/gpt-4o") == 128000
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_gpt_5_5_context_length(self, mock_fetch):
+        """gpt-5.5 should not fall back to the generic gpt-5 128K default."""
+        mock_fetch.return_value = {}
+        assert get_model_context_length("gpt-5.5") == 200000
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_qwen3_coder_plus_context_length(self, mock_fetch):
@@ -402,6 +406,41 @@ class TestGetModelContextLength:
             result = get_model_context_length(
                 "openai-codex:gpt-5.4",
                 base_url="https://chatgpt.com/backend-api/codex",
+            )
+
+        assert result == 200000
+        mock_cached.assert_not_called()
+        mock_endpoint_fetch.assert_not_called()
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    @patch("agent.model_metadata.get_cached_context_length")
+    def test_main_config_context_length_used_for_matching_custom_endpoint_model_switch(
+        self,
+        mock_cached,
+        mock_endpoint_fetch,
+        mock_fetch,
+    ):
+        """Same configured custom endpoint should honour context_length after /model switches."""
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+        mock_cached.return_value = None
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "model": {
+                    "default": "gpt-5.4",
+                    "provider": "custom",
+                    "base_url": "https://gpt.lucienfc.eu.org/v1",
+                    "context_length": 200000,
+                }
+            },
+        ):
+            result = get_model_context_length(
+                "gpt-5.5",
+                base_url="https://gpt.lucienfc.eu.org/v1",
+                provider="custom",
             )
 
         assert result == 200000

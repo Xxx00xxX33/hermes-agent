@@ -5,6 +5,7 @@ and run_agent.py for pre-flight context checks.
 """
 
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -23,22 +24,17 @@ logger = logging.getLogger(__name__)
 # are preserved so the full model name reaches cache lookups and server queries.
 _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "openrouter", "nous", "openai-codex", "copilot", "copilot-acp",
-    "gemini", "ollama-cloud", "zai", "kimi-coding", "kimi-coding-cn", "minimax", "minimax-cn", "anthropic", "deepseek",
+    "gemini", "zai", "kimi-coding", "minimax", "minimax-cn", "anthropic", "deepseek",
     "opencode-zen", "opencode-go", "ai-gateway", "kilocode", "alibaba",
     "qwen-oauth",
     "xiaomi",
-    "arcee",
     "custom", "local",
     # Common aliases
     "google", "google-gemini", "google-ai-studio",
     "glm", "z-ai", "z.ai", "zhipu", "github", "github-copilot",
-    "github-models", "kimi", "moonshot", "kimi-cn", "moonshot-cn", "claude", "deep-seek",
-    "ollama",
+    "github-models", "kimi", "moonshot", "claude", "deep-seek",
     "opencode", "zen", "go", "vercel", "kilo", "dashscope", "aliyun", "qwen",
     "mimo", "xiaomi-mimo",
-    "arcee-ai", "arceeai",
-    "xai", "x-ai", "x.ai", "grok",
-    "nvidia", "nim", "nvidia-nim", "nemotron",
     "qwen-portal",
 })
 
@@ -103,28 +99,22 @@ DEFAULT_CONTEXT_LENGTHS = {
     # fuzzy-match collisions (e.g. "anthropic/claude-sonnet-4" is a
     # substring of "anthropic/claude-sonnet-4.6").
     # OpenRouter-prefixed models resolve via OpenRouter live API or models.dev.
-    "claude-opus-4-7": 1000000,
-    "claude-opus-4.7": 1000000,
     "claude-opus-4-6": 1000000,
     "claude-sonnet-4-6": 1000000,
     "claude-opus-4.6": 1000000,
     "claude-sonnet-4.6": 1000000,
     # Catch-all for older Claude models (must sort after specific entries)
     "claude": 200000,
-    # OpenAI — GPT-5 family (most have 400k; specific overrides first)
-    # Source: https://developers.openai.com/api/docs/models
-    "gpt-5.4-nano": 400000,           # 400k (not 1.05M like full 5.4)
-    "gpt-5.4-mini": 400000,           # 400k (not 1.05M like full 5.4)
-    "gpt-5.4": 1050000,               # GPT-5.4, GPT-5.4 Pro (1.05M context)
-    "gpt-5.3-codex-spark": 128000,    # Spark variant has reduced 128k context
-    "gpt-5.1-chat": 128000,           # Chat variant has 128k context
-    "gpt-5": 400000,                  # GPT-5.x base, mini, codex variants (400k)
+    # OpenAI
     "gpt-4.1": 1047576,
+    "gpt-5.5": 200000,
+    "gpt-5": 128000,
     "gpt-4": 128000,
     # Google
     "gemini": 1048576,
     # Gemma (open models served via AI Studio)
     "gemma-4-31b": 256000,
+    "gemma-4-26b": 256000,
     "gemma-3": 131072,
     "gemma": 8192,  # fallback for older gemma models
     # DeepSeek
@@ -158,12 +148,8 @@ DEFAULT_CONTEXT_LENGTHS = {
     "grok": 131072,             # catch-all (grok-beta, unknown grok-*)
     # Kimi
     "kimi": 262144,
-    # Nemotron — NVIDIA's open-weights series (128K context across all sizes)
-    "nemotron": 131072,
     # Arcee
     "trinity": 262144,
-    # OpenRouter
-    "elephant": 262144,
     # Hugging Face Inference Providers — model IDs use org/name format
     "Qwen/Qwen3.5-397B-A17B": 131072,
     "Qwen/Qwen3.5-35B-A3B": 131072,
@@ -226,9 +212,7 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "api.anthropic.com": "anthropic",
     "api.z.ai": "zai",
     "api.moonshot.ai": "kimi-coding",
-    "api.moonshot.cn": "kimi-coding-cn",
     "api.kimi.com": "kimi-coding",
-    "api.arcee.ai": "arcee",
     "api.minimax": "minimax",
     "dashscope.aliyuncs.com": "alibaba",
     "dashscope-intl.aliyuncs.com": "alibaba",
@@ -242,10 +226,8 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "api.fireworks.ai": "fireworks",
     "opencode.ai": "opencode-go",
     "api.x.ai": "xai",
-    "integrate.api.nvidia.com": "nvidia",
     "api.xiaomimimo.com": "xiaomi",
     "xiaomimimo.com": "xiaomi",
-    "ollama.com": "ollama-cloud",
 }
 
 
@@ -794,12 +776,12 @@ def _query_local_context_length(model: str, base_url: str) -> Optional[int]:
                 resp = client.post(f"{server_url}/api/show", json={"name": model})
                 if resp.status_code == 200:
                     data = resp.json()
-                    # Prefer explicit num_ctx from Modelfile parameters: this is
-                    # the *runtime* context Ollama will actually allocate KV cache
-                    # for. The GGUF model_info.context_length is the training max,
-                    # which can be larger than num_ctx — using it here would let
-                    # Hermes grow conversations past the runtime limit and Ollama
-                    # would silently truncate. Matches query_ollama_num_ctx().
+                    # Check model_info for context length
+                    model_info = data.get("model_info", {})
+                    for key, value in model_info.items():
+                        if "context_length" in key and isinstance(value, (int, float)):
+                            return int(value)
+                    # Check parameters string for num_ctx
                     params = data.get("parameters", "")
                     if "num_ctx" in params:
                         for line in params.split("\n"):
@@ -810,11 +792,6 @@ def _query_local_context_length(model: str, base_url: str) -> Optional[int]:
                                         return int(parts[-1])
                                     except ValueError:
                                         pass
-                    # Fall back to GGUF model_info context_length (training max)
-                    model_info = data.get("model_info", {})
-                    for key, value in model_info.items():
-                        if "context_length" in key and isinstance(value, (int, float)):
-                            return int(value)
 
             # LM Studio native API: /api/v1/models returns max_context_length.
             # This is more reliable than the OpenAI-compat /v1/models which
@@ -983,10 +960,26 @@ def get_model_context_length(
                 cfg_ctx = mcfg.get("context_length")
                 cfg_model = (mcfg.get("default") or mcfg.get("model") or "").strip()
                 cfg_base = str(mcfg.get("base_url") or "").strip()
-                if cfg_ctx and cfg_model and cfg_base:
-                    # Compare on normalized base_url and stripped model IDs.
+                cfg_provider = str(mcfg.get("provider") or "").strip().lower()
+                request_provider = str(provider or "").strip().lower()
+                if cfg_ctx and cfg_base:
+                    # Compare on normalized base_url and stripped model IDs.  For
+                    # custom/OpenAI-compatible endpoints, model.context_length is
+                    # an endpoint capability override: users can switch from the
+                    # configured default model to another model on the same
+                    # endpoint without falling back to the generic 128K probe tier.
                     if _normalize_base_url(base_url) == _normalize_base_url(cfg_base):
-                        if _strip_provider_prefix(model).strip().lower() == _strip_provider_prefix(cfg_model).strip().lower():
+                        model_matches = bool(cfg_model) and (
+                            _strip_provider_prefix(model).strip().lower()
+                            == _strip_provider_prefix(cfg_model).strip().lower()
+                        )
+                        custom_endpoint = (
+                            request_provider == "custom"
+                            or request_provider.startswith("custom:")
+                            or cfg_provider == "custom"
+                            or cfg_provider.startswith("custom:")
+                        )
+                        if model_matches or custom_endpoint:
                             try:
                                 cfg_ctx_int = int(cfg_ctx)
                             except (TypeError, ValueError):
@@ -1051,16 +1044,6 @@ def get_model_context_length(
         ctx = _query_anthropic_context_length(model, base_url or "https://api.anthropic.com", api_key)
         if ctx:
             return ctx
-
-    # 4b. AWS Bedrock — use static context length table.
-    # Bedrock's ListFoundationModels doesn't expose context window sizes,
-    # so we maintain a curated table in bedrock_adapter.py.
-    if provider == "bedrock" or (base_url and "bedrock-runtime" in base_url):
-        try:
-            from agent.bedrock_adapter import get_bedrock_context_length
-            return get_bedrock_context_length(model)
-        except ImportError:
-            pass  # boto3 not installed — fall through to generic resolution
 
     # 5. Provider-aware lookups (before generic OpenRouter cache)
     # These are provider-specific and take priority over the generic OR cache,
