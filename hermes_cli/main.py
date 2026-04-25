@@ -2282,11 +2282,13 @@ def _model_flow_nous(config, current_model="", args=None):
     )
     from hermes_cli.config import (
         get_env_value,
-        load_config,
         save_config,
         save_env_value,
     )
-    from hermes_cli.nous_subscription import prompt_enable_tool_gateway
+    from hermes_cli.nous_subscription import (
+        apply_nous_provider_defaults,
+        get_nous_subscription_explainer_lines,
+    )
     import argparse
 
     state = get_provider_auth_state("nous")
@@ -2305,12 +2307,9 @@ def _model_flow_nous(config, current_model="", args=None):
                 insecure=bool(getattr(args, "insecure", False)),
             )
             _login_nous(mock_args, PROVIDER_REGISTRY["nous"])
-            # Offer Tool Gateway enablement for paid subscribers
-            try:
-                _refreshed = load_config() or {}
-                prompt_enable_tool_gateway(_refreshed)
-            except Exception:
-                pass
+            print()
+            for line in get_nous_subscription_explainer_lines():
+                print(line)
         except SystemExit:
             print("Login cancelled or failed.")
             return
@@ -2435,10 +2434,18 @@ def _model_flow_nous(config, current_model="", args=None):
         if get_env_value("OPENAI_BASE_URL"):
             save_env_value("OPENAI_BASE_URL", "")
             save_env_value("OPENAI_API_KEY", "")
+        changed_defaults = apply_nous_provider_defaults(config)
         save_config(config)
         print(f"Default model set to: {selected} (via Nous Portal)")
-        # Offer Tool Gateway enablement for paid subscribers
-        prompt_enable_tool_gateway(config)
+        if "tts" in changed_defaults:
+            print("TTS provider set to: OpenAI TTS via your Nous subscription")
+        else:
+            current_tts = str(config.get("tts", {}).get("provider") or "edge")
+            if current_tts.lower() not in {"", "edge"}:
+                print(f"Keeping your existing TTS provider: {current_tts}")
+        print()
+        for line in get_nous_subscription_explainer_lines():
+            print(line)
     else:
         print("No change.")
 

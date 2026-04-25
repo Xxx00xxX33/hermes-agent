@@ -2050,8 +2050,8 @@ def validate_requested_model(
                 )
 
             return {
-                "accepted": False,
-                "persist": False,
+                "accepted": True,
+                "persist": True,
                 "recognized": False,
                 "message": message,
             }
@@ -2064,8 +2064,8 @@ def validate_requested_model(
             message += f"\n  If this server expects `/v1`, try base URL: `{probe.get('suggested_base_url')}`"
 
         return {
-            "accepted": False,
-            "persist": False,
+            "accepted": True,
+            "persist": True,
             "recognized": False,
             "message": message,
         }

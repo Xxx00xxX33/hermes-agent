@@ -464,7 +464,37 @@ def get_nous_subscription_features(
     )
 
 
+def get_nous_subscription_explainer_lines() -> list[str]:
+    if not managed_nous_tools_enabled():
+        return []
 
+    return [
+        "Nous subscription enables managed web tools, image generation, OpenAI TTS, and browser automation by default.",
+        "Those managed tools bill to your Nous subscription. Modal execution is optional and can bill to your subscription too.",
+        "Change these later with: hermes setup tools, hermes setup terminal, or hermes status.",
+    ]
+
+
+def apply_nous_provider_defaults(config: Dict[str, object]) -> set[str]:
+    """Apply provider-level Nous defaults shared by `hermes setup` and `hermes model`."""
+    if not managed_nous_tools_enabled():
+        return set()
+
+    features = get_nous_subscription_features(config)
+    if not features.provider_is_nous:
+        return set()
+
+    tts_cfg = config.get("tts")
+    if not isinstance(tts_cfg, dict):
+        tts_cfg = {}
+        config["tts"] = tts_cfg
+
+    current_tts = str(tts_cfg.get("provider") or "edge").strip().lower()
+    if current_tts not in {"", "edge"}:
+        return set()
+
+    tts_cfg["provider"] = "openai"
+    return {"tts"}
 
 
 def apply_nous_managed_defaults(
