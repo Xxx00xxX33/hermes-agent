@@ -80,6 +80,8 @@ _UNSAFE_EVENT_METADATA_KEYS = (
     "stdout",
     "stderr",
     "output",
+    "text",
+    "message",
     "transcript",
 )
 

@@ -216,6 +216,8 @@ Session event results are formatted with sanitized payloads and sanitized retrie
 - `stdout`
 - `stderr`
 - `output`
+- `text`
+- `message`
 - `transcript`
 
 Safe raw-size metadata keys are allowed:
