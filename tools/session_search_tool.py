@@ -53,6 +53,82 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
+
+def _truncate_safe_text(value: Any, max_chars: int = 500) -> Any:
+    """Return a bounded, JSON-safe value for parent-facing recall metadata."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= max_chars else value[:max_chars] + "…[truncated]"
+    if isinstance(value, list):
+        return [_truncate_safe_text(item, max_chars=max_chars) for item in value[:20]]
+    if isinstance(value, dict):
+        return _sanitize_event_mapping(value, max_chars=max_chars)
+    return str(value)[:max_chars]
+
+
+_SAFE_RAW_EVENT_METADATA_KEYS = {"raw_chars", "raw_bytes", "raw_size"}
+
+
+_UNSAFE_EVENT_METADATA_KEYS = (
+    "raw",
+    "body",
+    "content",
+    "searchable_text",
+    "snippet",
+    "preview",
+    "stdout",
+    "stderr",
+    "output",
+    "transcript",
+)
+
+
+def _sanitize_event_mapping(value: Dict[str, Any], max_chars: int = 500) -> Dict[str, Any]:
+    """Drop fields likely to carry raw payloads from parent-facing event metadata."""
+    sanitized: Dict[str, Any] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        lowered = key_text.lower()
+        if lowered not in _SAFE_RAW_EVENT_METADATA_KEYS and any(
+            token in lowered for token in _UNSAFE_EVENT_METADATA_KEYS
+        ):
+            continue
+        sanitized[key_text] = _truncate_safe_text(item, max_chars=max_chars)
+    return sanitized
+
+
+def _format_session_event_result(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize a session_event search hit without raw searchable text or snippets."""
+    handles = event.get("retrieval_handles") or []
+    safe_handles = []
+    for handle in handles:
+        if not isinstance(handle, dict):
+            continue
+        safe_handles.append({
+            "handle_id": handle.get("handle_id"),
+            "source_type": handle.get("source_type"),
+            "source_id": handle.get("source_id"),
+            "locator": _sanitize_event_mapping(handle.get("locator") or {}),
+            "metadata": _sanitize_event_mapping(handle.get("metadata") or {}),
+        })
+
+    payload = _sanitize_event_mapping(event.get("payload") or {})
+    result = {
+        "kind": "session_event",
+        "event_id": event.get("event_id"),
+        "session_id": event.get("session_id"),
+        "event_type": event.get("event_type"),
+        "source_type": event.get("source_type"),
+        "source_id": event.get("source_id"),
+        "when": _format_timestamp(event.get("created_at")),
+        "summary": _truncate_safe_text(event.get("summary")),
+        "payload": payload,
+        "retrieval_handles": safe_handles,
+    }
+    return {key: value for key, value in result.items() if value not in (None, [], {})}
+
+
 def _format_conversation(messages: List[Dict[str, Any]]) -> str:
     """Format session messages into a readable transcript for summarization."""
     parts = []
@@ -328,6 +404,22 @@ def session_search(
     query = query.strip()
 
     try:
+        event_results = []
+        search_events = getattr(db, "search_session_events", None)
+        if callable(search_events):
+            try:
+                event_results = [
+                    _format_session_event_result(event)
+                    for event in search_events(query=query, limit=limit)
+                ]
+            except Exception as e:
+                logging.warning(
+                    "Session event search failed; continuing with message search: %s",
+                    e,
+                    exc_info=True,
+                )
+                event_results = []
+
         # Parse role filter
         role_list = None
         if role_filter and role_filter.strip():
@@ -347,8 +439,14 @@ def session_search(
                 "success": True,
                 "query": query,
                 "results": [],
+                "event_results": event_results,
                 "count": 0,
-                "message": "No matching sessions found.",
+                "event_count": len(event_results),
+                "message": (
+                    "No matching sessions found."
+                    if not event_results
+                    else "No matching sessions found; returned matching session events."
+                ),
             }, ensure_ascii=False)
 
         # Resolve child sessions to their parent — delegation stores detailed
@@ -479,7 +577,9 @@ def session_search(
             "success": True,
             "query": query,
             "results": summaries,
+            "event_results": event_results,
             "count": len(summaries),
+            "event_count": len(event_results),
             "sessions_searched": len(seen_sessions),
         }, ensure_ascii=False)
 

@@ -375,3 +375,102 @@ class TestSessionSearch:
         assert result["count"] == 0
         assert result["results"] == []
         assert result["sessions_searched"] == 0
+
+
+class TestSessionSearchSessionEvents:
+    def test_keyword_search_returns_parent_safe_session_event_hits(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+        mock_db.search_session_events.return_value = [
+            {
+                "event_id": "evt-tool-1",
+                "session_id": "sid-current",
+                "event_type": "tool_result",
+                "source_type": "tool_call",
+                "source_id": "call-1",
+                "summary": "bounded public summary",
+                "created_at": 1710000000.0,
+                "payload": {
+                    "tool": "terminal",
+                    "raw_chars": 1024,
+                    "raw_output": "SESSION_EVENT_RAW_SENTINEL",
+                    "preview": "SESSION_EVENT_RAW_SENTINEL",
+                    "safe_note": "artifact available",
+                },
+                "retrieval_handles": [
+                    {
+                        "handle_id": "rh-tool-1",
+                        "source_type": "session_event",
+                        "source_id": "evt-tool-1",
+                        "locator": {"artifact_path": "/tmp/artifact.txt"},
+                        "metadata": {
+                            "tool": "terminal",
+                            "raw_chars": 1024,
+                            "raw_body": "SESSION_EVENT_RAW_SENTINEL",
+                        },
+                    }
+                ],
+            }
+        ]
+
+        result = json.loads(session_search(query="rawterm", db=mock_db, current_session_id="sid-current"))
+
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert result["event_count"] == 1
+        assert result["event_results"][0]["kind"] == "session_event"
+        assert result["event_results"][0]["event_id"] == "evt-tool-1"
+        assert result["event_results"][0]["retrieval_handles"][0]["handle_id"] == "rh-tool-1"
+        assert result["event_results"][0]["payload"]["raw_chars"] == 1024
+        assert result["event_results"][0]["retrieval_handles"][0]["metadata"]["raw_chars"] == 1024
+        flattened = json.dumps(result, ensure_ascii=False)
+        assert "SESSION_EVENT_RAW_SENTINEL" not in flattened
+        assert "searchable_text" not in flattened
+        assert "snippet" not in flattened
+        assert "raw_output" not in flattened
+        assert "raw_body" not in flattened
+        mock_db.search_session_events.assert_called_once_with(query="rawterm", limit=3)
+
+    def test_session_event_hits_are_included_with_session_summaries(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_session_events.return_value = [
+            {
+                "event_id": "evt-validation",
+                "session_id": "sid-event",
+                "event_type": "validation",
+                "summary": "pytest passed",
+                "payload": {"status": "passed"},
+                "retrieval_handles": [],
+                "created_at": 1710000001.0,
+            }
+        ]
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "sid-message",
+                "content": "phase six",
+                "source": "cli",
+                "session_started": 1709500000,
+                "model": "test",
+            }
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None}
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "phase six recall"},
+            {"role": "assistant", "content": "implemented safe recall"},
+        ]
+
+        with patch("tools.session_search_tool._summarize_session", new_callable=AsyncMock) as mock_summarize:
+            mock_summarize.return_value = "safe session summary"
+            result = json.loads(session_search(query="phase six", db=mock_db))
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["event_count"] == 1
+        assert result["results"][0]["summary"] == "safe session summary"
+        assert result["event_results"][0]["summary"] == "pytest passed"

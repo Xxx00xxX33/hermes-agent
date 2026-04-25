@@ -1070,7 +1070,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 8
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1126,12 +1126,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to current schema
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 8
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -1510,3 +1510,239 @@ class TestConcurrentWriteSafety:
         assert "30" in src, (
             "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
         )
+
+# =========================================================================
+# Session event storage
+# =========================================================================
+
+
+class TestSessionEvents:
+    def test_record_and_get_session_event_with_handle(self, db):
+        db.create_session(session_id="s1", source="cli")
+        event_id = db.record_session_event(
+            "s1",
+            "validation",
+            summary="pytest prompt builder passed",
+            payload={"status": "passed", "tool": "pytest"},
+            retrieval_handles=[{
+                "handle_id": "rh-validation",
+                "source_type": "tool_result",
+                "source_id": "pytest-1",
+                "metadata": {"title": "pytest output"},
+            }],
+            source_type="tool_result",
+            source_id="pytest-1",
+            created_at=100.0,
+        )
+
+        assert event_id.startswith("evt_")
+        events = db.get_session_events("s1")
+        assert len(events) == 1
+        assert events[0]["event_type"] == "validation"
+        assert events[0]["payload"] == {"status": "passed", "tool": "pytest"}
+        assert events[0]["retrieval_handles"][0]["handle_id"] == "rh-validation"
+        assert "searchable_text" not in events[0]
+
+    def test_search_session_events_returns_summary_and_handles(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.record_session_event(
+            "s1",
+            "decision",
+            summary="Use retrieval handles for compression guides",
+            payload={"decision": "use handles"},
+            retrieval_handles=[{
+                "handle_id": "rh-decision",
+                "source_type": "session_event",
+                "source_id": "evt-decision",
+            }],
+            event_id="evt-decision",
+            created_at=101.0,
+        )
+
+        results = db.search_session_events("retrieval handles")
+        assert len(results) == 1
+        assert results[0]["event_id"] == "evt-decision"
+        assert results[0]["retrieval_handles"][0]["handle_id"] == "rh-decision"
+        assert "searchable_text" not in results[0]
+        assert "snippet" not in results[0]
+
+    def test_search_session_events_filters_by_type(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.record_session_event("s1", "decision", summary="compression handle policy")
+        db.record_session_event("s1", "validation", summary="compression test passed")
+
+        results = db.search_session_events("compression", event_type="validation")
+        assert len(results) == 1
+        assert results[0]["event_type"] == "validation"
+
+    def test_search_session_events_does_not_leak_raw_searchable_text(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.record_session_event(
+            "s1",
+            "tool_result",
+            summary="bounded public summary",
+            searchable_text="SECRET_RAW_CONTENT only exists in indexed raw text",
+        )
+
+        results = db.search_session_events("SECRET_RAW_CONTENT")
+        assert len(results) == 1
+        flattened = str(results[0])
+        assert "SECRET_RAW_CONTENT" not in flattened
+        assert "searchable_text" not in results[0]
+        assert "snippet" not in results[0]
+
+    def test_get_session_event_by_id_returns_single_safe_event(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.record_session_event(
+            "s1",
+            "tool_result",
+            summary="bounded public summary",
+            payload={"tool": "terminal"},
+            retrieval_handles=[{"handle_id": "rh-one"}],
+            event_id="evt-one",
+            searchable_text="SECRET_RAW_CONTENT indexed only",
+        )
+
+        event = db.get_session_event_by_id("evt-one", session_id="s1")
+
+        assert event is not None
+        assert event["event_id"] == "evt-one"
+        assert event["retrieval_handles"][0]["handle_id"] == "rh-one"
+        assert "searchable_text" not in event
+        assert "SECRET_RAW_CONTENT" not in str(event)
+
+    def test_get_session_event_by_id_respects_session_scope(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        db.record_session_event("s2", "tool_result", event_id="evt-other")
+
+        assert db.get_session_event_by_id("evt-other", session_id="s1") is None
+
+    def test_get_session_event_by_handle_id_returns_single_safe_event(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.record_session_event(
+            "s1",
+            "tool_result",
+            retrieval_handles=[{"handle_id": "rh-one", "metadata": {"raw_chars": 10}}],
+            event_id="evt-one",
+            searchable_text="SECRET_RAW_CONTENT indexed only",
+        )
+
+        event = db.get_session_event_by_handle_id("rh-one", session_id="s1")
+
+        assert event is not None
+        assert event["event_id"] == "evt-one"
+        assert event["retrieval_handles"][0]["handle_id"] == "rh-one"
+        assert "searchable_text" not in event
+        assert "SECRET_RAW_CONTENT" not in str(event)
+
+    def test_get_session_event_by_handle_id_respects_session_scope(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        db.record_session_event(
+            "s2",
+            "tool_result",
+            retrieval_handles=[{"handle_id": "rh-other"}],
+            event_id="evt-other",
+        )
+
+        assert db.get_session_event_by_handle_id("rh-other", session_id="s1") is None
+
+    def test_get_session_event_by_handle_id_fails_closed_on_ambiguity(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.record_session_event(
+            "s1",
+            "tool_result",
+            retrieval_handles=[{"handle_id": "rh-duplicate"}],
+            event_id="evt-one",
+        )
+        db.record_session_event(
+            "s1",
+            "tool_result",
+            retrieval_handles=[{"handle_id": "rh-duplicate"}],
+            event_id="evt-two",
+        )
+
+        assert db.get_session_event_by_handle_id("rh-duplicate", session_id="s1") is None
+
+def test_migration_from_v7_adds_session_events_and_search(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "migrate_v7_state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (7);
+
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            user_id TEXT,
+            model TEXT,
+            model_config TEXT,
+            system_prompt TEXT,
+            parent_session_id TEXT,
+            started_at REAL NOT NULL,
+            ended_at REAL,
+            end_reason TEXT,
+            message_count INTEGER DEFAULT 0,
+            tool_call_count INTEGER DEFAULT 0,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cache_read_tokens INTEGER DEFAULT 0,
+            cache_write_tokens INTEGER DEFAULT 0,
+            reasoning_tokens INTEGER DEFAULT 0,
+            billing_provider TEXT,
+            billing_base_url TEXT,
+            billing_mode TEXT,
+            estimated_cost_usd REAL,
+            actual_cost_usd REAL,
+            cost_status TEXT,
+            cost_source TEXT,
+            pricing_version TEXT,
+            title TEXT
+        );
+
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_call_id TEXT,
+            tool_calls TEXT,
+            tool_name TEXT,
+            timestamp REAL NOT NULL,
+            token_count INTEGER,
+            finish_reason TEXT,
+            reasoning TEXT,
+            reasoning_details TEXT,
+            codex_reasoning_items TEXT
+        );
+
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+            content,
+            content=messages,
+            content_rowid=id
+        );
+    """)
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+        ("s1", "cli", 1000.0),
+    )
+    conn.commit()
+    conn.close()
+
+    migrated_db = SessionDB(db_path=db_path)
+    try:
+        assert migrated_db._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 8
+        migrated_db.record_session_event(
+            "s1",
+            "decision",
+            summary="migration event search works",
+            event_id="evt-migrated",
+        )
+        results = migrated_db.search_session_events("migration event")
+        assert len(results) == 1
+        assert results[0]["event_id"] == "evt-migrated"
+    finally:
+        migrated_db.close()

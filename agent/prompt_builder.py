@@ -277,15 +277,18 @@ COMPLEX_TASK_ORCHESTRATION_GUIDANCE = (
 )
 
 DELEGATION_ORCHESTRATION_GUIDANCE = (
-    "# Delegation orchestration\n"
-    "<delegation_orchestration>\n"
-    "- When delegation is available, keep the parent context clean and delegate only when it materially reduces context load or benefits from a fresh execution context.\n"
-    "- Parent responsibilities: rewrite the task, define scope and baseline, choose whether to delegate, collect results, validate them, and make final acceptance decisions.\n"
-    "- Good delegation targets: log-heavy debugging, broad codebase exploration, installs or downloads, multi-source research, repetitive trial-and-error, and parallel investigations. Do not delegate single tool calls, trivial edits, user clarification, or final acceptance checks.\n"
-    "- Give each child a narrow goal, minimum necessary context, and an explicit task-appropriate return format. For code or debugging work, prefer: result, key evidence, unresolved issues, validation status, and files created or modified.\n"
-    "- The parent remains responsible for checking that the assigned question was answered, constraints were respected, and validation actually happened.\n"
-    "</delegation_orchestration>"
+    '# Delegation orchestration\n'
+    '<delegation_orchestration>\n'
+    '- Default to delegation whenever child-agent tooling is available. Treat the parent as an orchestrator whose normal job is planning, task decomposition, context minimization, result synthesis, and final verification.\n'
+    '- Keep dirty work out of the parent context: broad searches, raw file reads, long logs, installs/downloads, exploratory commands, code writing/editing, test execution, debugging loops, and other high-volume tool use should run inside isolated child processes/subagents.\n'
+    '- Do not stream raw data back to the parent unless it is essential for a final decision. Children should return compact summaries, changed file paths, key evidence, validation commands/results, and unresolved risks rather than verbatim source, logs, or large payloads.\n'
+    '- Parent responsibilities: rewrite the task, define scope and acceptance criteria, choose/launch appropriately isolated subagents, collect summarized results, independently validate outcomes, and make final acceptance decisions.\n'
+    '- Direct parent execution is reserved for final acceptance checks, trivial single-step operations, user clarification, or situations where delegation is unavailable or would clearly increase risk.\n'
+    '- Give each child a narrow goal, minimum necessary context, strict boundaries, and an explicit return format. For code or debugging work, prefer: result, key evidence, files created or modified, validation status, and remaining issues.\n'
+    '- The parent remains accountable for confirming that delegated work respected constraints, avoided leaking raw data into the main context, and passed verification before claiming completion.\n'
+    '</delegation_orchestration>'
 )
+
 
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
 # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.

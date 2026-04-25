@@ -49,7 +49,7 @@ _HERMES_CORE_TOOLS = [
     # Planning & memory
     "todo", "memory",
     # Session history search
-    "session_search",
+    "session_search", "retrieval_resolve",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -170,7 +170,7 @@ TOOLSETS = {
     
     "session_search": {
         "description": "Search and recall past conversations with summarization",
-        "tools": ["session_search"],
+        "tools": ["session_search", "retrieval_resolve"],
         "includes": []
     },
     
@@ -251,7 +251,7 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console",
             "todo", "memory",
-            "session_search",
+            "session_search", "retrieval_resolve",
             "execute_code", "delegate_task",
         ],
         "includes": []
@@ -278,7 +278,7 @@ TOOLSETS = {
             # Planning & memory
             "todo", "memory",
             # Session history search
-            "session_search",
+            "session_search", "retrieval_resolve",
             # Code execution + delegation
             "execute_code", "delegate_task",
             # Cronjob management

@@ -308,3 +308,58 @@ async def test_blocks_sensitive_home_and_hermes_paths(tmp_path: Path, monkeypatc
     assert "API_KEY=super-secret" not in result.message
     assert "PRIVATE-KEY" not in result.message
     assert any("sensitive credential" in warning for warning in result.warnings)
+
+# =========================================================================
+# Retrieval handles and session events
+# =========================================================================
+
+
+def test_retrieval_handle_round_trips_without_raw_payload():
+    from agent.context_references import RetrievalHandle, make_retrieval_handle
+
+    handle = make_retrieval_handle(
+        "session_event",
+        "evt-1",
+        locator={"message_id": 7},
+        metadata={"title": "pytest validation", "status": "passed"},
+        created_at=123.0,
+    )
+
+    assert handle.handle_id.startswith("rh_")
+    assert "raw" not in handle.to_dict()
+    restored = RetrievalHandle.from_dict(handle.to_dict())
+    assert restored == handle
+
+
+def test_context_reference_result_accepts_retrieval_handles():
+    from agent.context_references import ContextReferenceResult, make_retrieval_handle
+
+    handle = make_retrieval_handle("tool_result", "tool-1")
+    result = ContextReferenceResult(
+        message="Summary only",
+        original_message="@file README.md",
+        retrieval_handles=[handle],
+    )
+
+    assert result.message == "Summary only"
+    assert result.retrieval_handles == [handle]
+
+
+def test_session_event_round_trips_handles_and_summary():
+    from agent.context_references import SessionEvent, make_retrieval_handle
+
+    handle = make_retrieval_handle("session_event", "evt-validation")
+    event = SessionEvent(
+        event_id="evt-validation",
+        event_type="validation",
+        session_id="s1",
+        summary="pytest passed",
+        payload={"status": "passed"},
+        retrieval_handles=[handle],
+        created_at=456.0,
+    )
+
+    data = event.to_dict()
+    assert data["summary"] == "pytest passed"
+    assert data["retrieval_handles"][0]["handle_id"] == handle.handle_id
+    assert SessionEvent.from_dict(data) == event

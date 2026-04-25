@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX, SESSION_GUIDE_HEADING
 
 
 @pytest.fixture()
@@ -103,9 +103,10 @@ class TestCompress:
         summary_messages = [m for m in result if SUMMARY_PREFIX in str(m.get("content", ""))]
         assert summary_messages
         summary_text = str(summary_messages[0]["content"])
-        assert "1. Objective" in summary_text
-        assert "3. Hard constraints" in summary_text
-        assert "6. Next actions" in summary_text
+        assert SESSION_GUIDE_HEADING in summary_text
+        assert "1. Summary" in summary_text
+        assert "5. Unresolved Tasks" in summary_text
+        assert "8. Retrieval Handles" in summary_text
 
     def test_protects_first_and_last(self, compressor):
         msgs = self._make_messages(10)
@@ -180,7 +181,7 @@ class TestNonStringContent:
         assert isinstance(summary, str)
         assert summary.startswith(SUMMARY_PREFIX)
 
-    def test_none_content_returns_none_to_trigger_local_fallback(self):
+    def test_none_content_returns_session_guide_fallback(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = None
@@ -196,7 +197,8 @@ class TestNonStringContent:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             summary = c._generate_summary(messages)
 
-        assert summary is None
+        assert summary.startswith(f"{SUMMARY_PREFIX}\n{SESSION_GUIDE_HEADING}")
+        assert "Remote summary generation failed: Summary LLM returned empty content" in summary
 
     def test_summary_call_does_not_force_temperature(self):
         mock_response = MagicMock()
@@ -248,7 +250,7 @@ class TestNonStringContent:
             "api_mode": "codex_responses",
         }
 
-    def test_summary_prompt_uses_opencode_style_numbered_sections(self):
+    def test_summary_prompt_uses_session_guide_sections(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "ok"
@@ -265,13 +267,18 @@ class TestNonStringContent:
             c._generate_summary(messages)
 
         prompt = mock_call.call_args.kwargs["messages"][0]["content"]
-        assert "1. Objective" in prompt
-        assert "8. Dropped details" in prompt
+        assert "Session Guide" in prompt
+        assert "1. Summary" in prompt
+        assert "5. Unresolved Tasks" in prompt
+        assert "7. Validations" in prompt
+        assert "8. Retrieval Handles" in prompt
+        assert "Do not include raw tool outputs" in prompt
+        assert "searchable_text" in prompt
         assert "## Active Task" not in prompt
 
 
 class TestSummaryFailureCooldown:
-    def test_summary_failure_enters_cooldown_and_skips_retry(self):
+    def test_summary_failure_returns_fallback_and_then_uses_cooldown_fallback(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
@@ -284,19 +291,73 @@ class TestSummaryFailureCooldown:
             first = c._generate_summary(messages)
             second = c._generate_summary(messages)
 
-        assert first is None
-        assert second is None
+        assert first.startswith(f"{SUMMARY_PREFIX}\n{SESSION_GUIDE_HEADING}")
+        assert second.startswith(f"{SUMMARY_PREFIX}\n{SESSION_GUIDE_HEADING}")
+        assert "Remote summary generation failed: boom" in first
+        assert "summary generation is in cooldown" in second
         assert mock_call.call_count == 1
+
+
+class TestSessionGuidePhase2:
+    def test_serialize_for_summary_omits_raw_tool_output(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        serialized = c._serialize_for_summary([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_secret",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": '{"command": "pytest"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_secret",
+                "content": "SECRET_RAW_TOOL_OUTPUT should not enter the parent summary",
+            },
+        ])
+
+        assert "SECRET_RAW_TOOL_OUTPUT" not in serialized
+        assert "raw output omitted" in serialized
+        assert "raw_chars=" in serialized
+        assert "terminal completed" in serialized
+
+    def test_fallback_session_guide_does_not_leak_tool_raw_content(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        summary = c._build_deterministic_fallback_summary([
+            {"role": "user", "content": "fix context compression"},
+            {"role": "assistant", "content": "running tests"},
+            {
+                "role": "tool",
+                "tool_call_id": "call_secret",
+                "content": "SECRET_RAW_TOOL_OUTPUT /tmp/secret-file.txt",
+            },
+        ], failure_reason="test failure")
+
+        assert summary.startswith("Session Guide")
+        assert "SECRET_RAW_TOOL_OUTPUT" not in summary
+        assert "/tmp/secret-file.txt" not in summary
+        assert "raw output omitted" in summary
+        assert "Remote summary generation failed: test failure" in summary
 
 
 class TestSummaryPrefixNormalization:
     def test_legacy_prefix_is_replaced(self):
         summary = ContextCompressor._with_summary_prefix("[CONTEXT SUMMARY]: did work")
-        assert summary == f"{SUMMARY_PREFIX}\ndid work"
+        assert summary.startswith(f"{SUMMARY_PREFIX}\n{SESSION_GUIDE_HEADING}")
+        assert "- did work" in summary
 
     def test_existing_new_prefix_is_not_duplicated(self):
         summary = ContextCompressor._with_summary_prefix(f"{SUMMARY_PREFIX}\ndid work")
-        assert summary == f"{SUMMARY_PREFIX}\ndid work"
+        assert summary.startswith(f"{SUMMARY_PREFIX}\n{SESSION_GUIDE_HEADING}")
+        assert "- did work" in summary
 
 
 class TestCompressWithClient:

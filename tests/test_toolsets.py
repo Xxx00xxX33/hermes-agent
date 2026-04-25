@@ -32,6 +32,12 @@ class TestGetToolset:
         assert ts is not None
         assert "web_search" in ts["tools"]
 
+    def test_session_search_toolset_includes_retrieval_resolve(self):
+        ts = get_toolset("session_search")
+        assert ts is not None
+        assert "session_search" in ts["tools"]
+        assert "retrieval_resolve" in ts["tools"]
+
     def test_unknown_returns_none(self):
         assert get_toolset("nonexistent") is None
 
@@ -204,6 +210,10 @@ class TestToolsetConsistency:
         # All platform toolsets should be identical
         for ts in tool_sets[1:]:
             assert ts == tool_sets[0]
+
+    def test_core_platforms_include_retrieval_resolve(self):
+        for name in ("hermes-cli", "hermes-acp", "hermes-api-server"):
+            assert "retrieval_resolve" in resolve_toolset(name)
 
 
 class TestPluginToolsets:

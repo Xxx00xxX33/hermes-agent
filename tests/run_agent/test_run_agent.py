@@ -1578,7 +1578,8 @@ class TestConcurrentToolExecution:
         assert len(messages) == 2
         for m in messages:
             assert len(m["content"]) < 150_000
-            assert ("Truncated" in m["content"] or "<persisted-output>" in m["content"])
+            assert "routed outside parent context" in m["content"]
+            assert "Raw output was omitted from parent context" in m["content"]
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
@@ -1635,6 +1636,53 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("todo", {"todos": []}, "task-1")
             mock_todo.assert_called_once()
         assert "ok" in result
+
+    def test_invoke_tool_handles_retrieval_resolve_with_session_db(self, agent):
+        agent._session_db = MagicMock()
+        with patch(
+            "tools.retrieval_resolve_tool.retrieval_resolve",
+            return_value='{"success": true}',
+        ) as mock_resolve:
+            result = agent._invoke_tool(
+                "retrieval_resolve",
+                {"event_id": "evt-one", "handle_id": "rh-one"},
+                "task-1",
+            )
+
+        assert result == '{"success": true}'
+        mock_resolve.assert_called_once_with(
+            event_id="evt-one",
+            handle_id="rh-one",
+            db=agent._session_db,
+            current_session_id=agent.session_id,
+        )
+
+    def test_sequential_tool_path_handles_retrieval_resolve_with_session_db(self, agent):
+        agent._session_db = MagicMock()
+        tool_call = _mock_tool_call(
+            name="retrieval_resolve",
+            arguments='{"event_id":"evt-one","handle_id":"rh-one"}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        with patch(
+            "tools.retrieval_resolve_tool.retrieval_resolve",
+            return_value='{"success": true}',
+        ) as mock_resolve:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        mock_resolve.assert_called_once_with(
+            event_id="evt-one",
+            handle_id="rh-one",
+            db=agent._session_db,
+            current_session_id=agent.session_id,
+        )
+        assert len(messages) == 1
+        assert messages[0]["role"] == "tool"
+        assert messages[0]["tool_call_id"] == "c1"
+        assert json.loads(messages[0]["content"])["success"] is True
 
     def test_invoke_tool_blocked_returns_error_and_skips_execution(self, agent, monkeypatch):
         """_invoke_tool should return error JSON when a plugin blocks the tool."""
@@ -4316,3 +4364,265 @@ class TestMemoryProviderTurnStart:
         import inspect
         src = inspect.getsource(AIAgent.run_conversation)
         assert "on_turn_start(self._user_turn_count" in src
+
+# ---------------------------------------------------------------------------
+# Parent-safe large tool result routing
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSessionEventDB:
+    def __init__(self):
+        self.calls = []
+
+    def record_session_event(self, session_id, event_type, **kwargs):
+        self.calls.append((session_id, event_type, kwargs))
+        return kwargs.get("event_id")
+
+
+def _minimal_agent_for_tool_result_routing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_PARENT_TOOL_RESULT_THRESHOLD", "32")
+    agent = AIAgent.__new__(AIAgent)
+    agent.session_id = "session_phase3"
+    agent._session_db = _RecordingSessionEventDB()
+    return agent
+
+
+def test_aiagent_defines_default_parent_tool_result_threshold():
+    assert AIAgent._PARENT_TOOL_RESULT_THRESHOLD == 20_000
+
+
+def test_route_large_tool_result_replaces_parent_content_with_handle(tmp_path, monkeypatch):
+    agent = _minimal_agent_for_tool_result_routing(tmp_path, monkeypatch)
+    raw = "SECRET_RAW_CONTENT\n" + ("large-line\n" * 10)
+    parent_preview = (
+        "<persisted-output>\n"
+        "This tool result was too large.\n"
+        "Full output saved to: /tmp/hermes-results/call_large.txt\n"
+        "Preview:\nSECRET_RAW_CONTENT\n"
+        "</persisted-output>"
+    )
+
+    routed = agent._route_tool_result_for_parent_context(
+        raw_content=raw,
+        parent_content=parent_preview,
+        tool_name="terminal",
+        tool_args={"command": "printf secret"},
+        tool_call_id="call_large",
+        effective_task_id="task_phase3",
+    )
+
+    assert "[Tool result routed outside parent context]" in routed
+    assert "Retrieval handle: rh_" in routed
+    assert "Session event: evt_tool_" in routed
+    assert "Sandbox artifact: /tmp/hermes-results/call_large.txt" in routed
+    assert "SECRET_RAW_CONTENT" not in routed
+    assert "Preview" not in routed
+
+    assert len(agent._session_db.calls) == 1
+    session_id, event_type, kwargs = agent._session_db.calls[0]
+    assert session_id == "session_phase3"
+    assert event_type == "tool_result"
+    assert kwargs["source_type"] == "tool_call"
+    assert kwargs["source_id"] == "call_large"
+    assert kwargs["searchable_text"] == raw
+    assert kwargs["payload"]["tool"] == "terminal"
+    assert kwargs["payload"]["raw_chars"] == len(raw)
+    assert kwargs["payload"]["arg_keys"] == ["command"]
+    assert "SECRET_RAW_CONTENT" not in json.dumps(kwargs["payload"])
+    assert kwargs["payload"]["sandbox_artifact_path"] == "/tmp/hermes-results/call_large.txt"
+
+    handle = kwargs["retrieval_handles"][0]
+    assert handle["source_type"] == "session_event"
+    assert handle["source_id"] == kwargs["event_id"]
+    assert handle["metadata"]["tool"] == "terminal"
+    assert handle["metadata"]["raw_chars"] == len(raw)
+    artifact_path = Path(handle["locator"]["artifact_path"])
+    assert artifact_path.read_text(encoding="utf-8") == raw
+
+
+def test_route_small_tool_result_keeps_parent_content(tmp_path, monkeypatch):
+    agent = _minimal_agent_for_tool_result_routing(tmp_path, monkeypatch)
+
+    routed = agent._route_tool_result_for_parent_context(
+        raw_content="small result",
+        parent_content="small result",
+        tool_name="terminal",
+        tool_args={},
+        tool_call_id="call_small",
+        effective_task_id="task_phase3",
+    )
+
+    assert routed == "small result"
+    assert agent._session_db.calls == []
+
+def test_sequential_tool_append_routes_large_result_out_of_parent_context(agent, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_PARENT_TOOL_RESULT_THRESHOLD", "32")
+    agent.session_id = "session_phase4_seq"
+    agent._session_db = _RecordingSessionEventDB()
+    raw = "SEQUENTIAL_RAW_SENTINEL\n" + ("large-line\n" * 10)
+    tc = _mock_tool_call(name="web_search", arguments='{"q":"secret"}', call_id="call_seq")
+    mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=raw):
+        agent._execute_tool_calls_sequential(mock_msg, messages, "task-phase4")
+
+    assert len(messages) == 1
+    tool_content = messages[0]["content"]
+    assert messages[0]["role"] == "tool"
+    assert messages[0]["tool_call_id"] == "call_seq"
+    assert "[Tool result routed outside parent context]" in tool_content
+    assert "Retrieval handle: rh_" in tool_content
+    assert "SEQUENTIAL_RAW_SENTINEL" not in tool_content
+    assert len(agent._session_db.calls) == 1
+    _session_id, event_type, kwargs = agent._session_db.calls[0]
+    assert event_type == "tool_result"
+    assert kwargs["searchable_text"] == raw
+    assert kwargs["source_id"] == "call_seq"
+
+
+def test_concurrent_tool_append_routes_large_results_out_of_parent_context(agent, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_PARENT_TOOL_RESULT_THRESHOLD", "32")
+    agent.session_id = "session_phase4_concurrent"
+    agent._session_db = _RecordingSessionEventDB()
+    tc1 = _mock_tool_call(name="web_search", arguments='{"q":"alpha"}', call_id="call_alpha")
+    tc2 = _mock_tool_call(name="web_search", arguments='{"q":"beta"}', call_id="call_beta")
+    mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+    messages = []
+
+    def fake_handle(_name, args, _task_id, **_kwargs):
+        return f"CONCURRENT_RAW_SENTINEL_{args['q']}\n" + (f"{args['q']}-line\n" * 10)
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        agent._execute_tool_calls_concurrent(mock_msg, messages, "task-phase4")
+
+    assert [message["tool_call_id"] for message in messages] == ["call_alpha", "call_beta"]
+    assert all(message["role"] == "tool" for message in messages)
+    assert all("[Tool result routed outside parent context]" in message["content"] for message in messages)
+    assert all("Retrieval handle: rh_" in message["content"] for message in messages)
+    assert "CONCURRENT_RAW_SENTINEL_alpha" not in messages[0]["content"]
+    assert "CONCURRENT_RAW_SENTINEL_beta" not in messages[1]["content"]
+    assert len(agent._session_db.calls) == 2
+    searchable_texts = [call[2]["searchable_text"] for call in agent._session_db.calls]
+    assert any("CONCURRENT_RAW_SENTINEL_alpha" in text for text in searchable_texts)
+    assert any("CONCURRENT_RAW_SENTINEL_beta" in text for text in searchable_texts)
+
+
+def test_sequential_tool_complete_callback_receives_routed_large_result(agent, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_PARENT_TOOL_RESULT_THRESHOLD", "32")
+    agent.session_id = "session_phase5_seq_callback"
+    agent._session_db = _RecordingSessionEventDB()
+    raw = "CALLBACK_SEQ_RAW_SENTINEL\n" + ("large-line\n" * 10)
+    completes = []
+    agent.tool_complete_callback = (
+        lambda tool_call_id, function_name, function_args, function_result:
+        completes.append((tool_call_id, function_name, function_args, function_result))
+    )
+    tc = _mock_tool_call(name="web_search", arguments='{"q":"secret"}', call_id="call_seq_callback")
+    mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=raw):
+        agent._execute_tool_calls_sequential(mock_msg, messages, "task-phase5")
+
+    assert len(completes) == 1
+    callback_result = completes[0][3]
+    assert "[Tool result routed outside parent context]" in callback_result
+    assert "Retrieval handle: rh_" in callback_result
+    assert "CALLBACK_SEQ_RAW_SENTINEL" not in callback_result
+    assert messages[0]["content"] == callback_result
+    assert agent._session_db.calls[0][2]["searchable_text"] == raw
+
+
+def test_concurrent_tool_complete_callback_receives_routed_large_results(agent, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_PARENT_TOOL_RESULT_THRESHOLD", "32")
+    agent.session_id = "session_phase5_concurrent_callback"
+    agent._session_db = _RecordingSessionEventDB()
+    completes = []
+    agent.tool_complete_callback = (
+        lambda tool_call_id, function_name, function_args, function_result:
+        completes.append((tool_call_id, function_name, function_args, function_result))
+    )
+    tc1 = _mock_tool_call(name="web_search", arguments='{"q":"alpha"}', call_id="call_alpha_cb")
+    tc2 = _mock_tool_call(name="web_search", arguments='{"q":"beta"}', call_id="call_beta_cb")
+    mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+    messages = []
+
+    def fake_handle(_name, args, _task_id, **_kwargs):
+        return f"CALLBACK_CONCURRENT_RAW_SENTINEL_{args['q']}\n" + (f"{args['q']}-line\n" * 10)
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        agent._execute_tool_calls_concurrent(mock_msg, messages, "task-phase5")
+
+    assert {entry[0] for entry in completes} == {"call_alpha_cb", "call_beta_cb"}
+    callback_results = {entry[0]: entry[3] for entry in completes}
+    assert all("[Tool result routed outside parent context]" in result for result in callback_results.values())
+    assert all("Retrieval handle: rh_" in result for result in callback_results.values())
+    assert "CALLBACK_CONCURRENT_RAW_SENTINEL_alpha" not in callback_results["call_alpha_cb"]
+    assert "CALLBACK_CONCURRENT_RAW_SENTINEL_beta" not in callback_results["call_beta_cb"]
+    assert {message["content"] for message in messages} == set(callback_results.values())
+    searchable_texts = [call[2]["searchable_text"] for call in agent._session_db.calls]
+    assert any("CALLBACK_CONCURRENT_RAW_SENTINEL_alpha" in text for text in searchable_texts)
+    assert any("CALLBACK_CONCURRENT_RAW_SENTINEL_beta" in text for text in searchable_texts)
+
+
+def test_verbose_display_uses_routed_large_result(agent, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_PARENT_TOOL_RESULT_THRESHOLD", "32")
+    agent.session_id = "session_phase5_verbose"
+    agent._session_db = _RecordingSessionEventDB()
+    agent.quiet_mode = False
+    agent.verbose_logging = True
+    raw = "VERBOSE_DISPLAY_RAW_SENTINEL\n" + ("large-line\n" * 10)
+    tc = _mock_tool_call(name="web_search", arguments='{"q":"secret"}', call_id="call_verbose")
+    mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=raw):
+        agent._execute_tool_calls_sequential(mock_msg, messages, "task-phase5")
+
+    stdout = capsys.readouterr().out
+    assert "[Tool result routed outside parent context]" in stdout
+    assert "Retrieval handle: rh_" in stdout
+    assert "VERBOSE_DISPLAY_RAW_SENTINEL" not in stdout
+    assert "VERBOSE_DISPLAY_RAW_SENTINEL" not in messages[0]["content"]
+    assert agent._session_db.calls[0][2]["searchable_text"] == raw
+
+
+def test_sequential_quiet_cute_display_uses_routed_large_result(agent, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_PARENT_TOOL_RESULT_THRESHOLD", "32")
+    agent.session_id = "session_phase5_quiet_cute"
+    agent._session_db = _RecordingSessionEventDB()
+    agent.quiet_mode = True
+    agent._should_start_quiet_spinner = lambda: False
+    raw = "QUIET_CUTE_RAW_SENTINEL\n" + ("large-line\n" * 10)
+    formatter_results = []
+
+    def fake_cute_tool_message(function_name, function_args, tool_duration, result=None):
+        formatter_results.append(result)
+        return "cute-safe-output"
+
+    tc = _mock_tool_call(name="web_search", arguments='{"q":"secret"}', call_id="call_quiet_cute")
+    mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch("run_agent.handle_function_call", return_value=raw),
+        patch("run_agent._get_cute_tool_message_impl", side_effect=fake_cute_tool_message),
+    ):
+        agent._execute_tool_calls_sequential(mock_msg, messages, "task-phase5")
+
+    assert len(formatter_results) == 1
+    cute_result = formatter_results[0]
+    assert "[Tool result routed outside parent context]" in cute_result
+    assert "Retrieval handle: rh_" in cute_result
+    assert "QUIET_CUTE_RAW_SENTINEL" not in cute_result
+    assert "QUIET_CUTE_RAW_SENTINEL" not in capsys.readouterr().out
+    assert "QUIET_CUTE_RAW_SENTINEL" not in messages[0]["content"]
+    assert agent._session_db.calls[0][2]["searchable_text"] == raw

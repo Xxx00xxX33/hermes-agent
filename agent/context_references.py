@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import mimetypes
@@ -9,7 +10,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from agent.model_metadata import estimate_tokens_rough
 
@@ -48,11 +49,125 @@ class ContextReference:
     line_end: int | None = None
 
 
+def _stable_handle_id(source_type: str, source_id: str, locator: dict[str, Any] | None = None) -> str:
+    """Build a deterministic retrieval handle id without hashing raw payloads."""
+    basis = json.dumps(
+        {
+            "source_type": source_type,
+            "source_id": source_id,
+            "locator": locator or {},
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return f"rh_{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:20]}"
+
+
+@dataclass(frozen=True)
+class RetrievalHandle:
+    """Compact pointer to retrievable context that keeps raw data out of prompts."""
+
+    handle_id: str
+    source_type: str
+    source_id: str
+    locator: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "handle_id": self.handle_id,
+            "source_type": self.source_type,
+            "source_id": self.source_id,
+            "locator": dict(self.locator),
+            "metadata": dict(self.metadata),
+        }
+        if self.created_at is not None:
+            data["created_at"] = self.created_at
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RetrievalHandle":
+        return cls(
+            handle_id=str(data["handle_id"]),
+            source_type=str(data["source_type"]),
+            source_id=str(data["source_id"]),
+            locator=dict(data.get("locator") or {}),
+            metadata=dict(data.get("metadata") or {}),
+            created_at=data.get("created_at"),
+        )
+
+
+@dataclass(frozen=True)
+class SessionEvent:
+    """Summary-level session event that references raw details by handle."""
+
+    event_id: str
+    event_type: str
+    session_id: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    retrieval_handles: list[RetrievalHandle] = field(default_factory=list)
+    summary: str | None = None
+    created_at: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "event_id": self.event_id,
+            "event_type": self.event_type,
+            "session_id": self.session_id,
+            "payload": dict(self.payload),
+            "retrieval_handles": [handle.to_dict() for handle in self.retrieval_handles],
+        }
+        if self.summary is not None:
+            data["summary"] = self.summary
+        if self.created_at is not None:
+            data["created_at"] = self.created_at
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SessionEvent":
+        return cls(
+            event_id=str(data["event_id"]),
+            event_type=str(data["event_type"]),
+            session_id=str(data["session_id"]),
+            payload=dict(data.get("payload") or {}),
+            retrieval_handles=[
+                RetrievalHandle.from_dict(handle)
+                for handle in data.get("retrieval_handles") or []
+            ],
+            summary=data.get("summary"),
+            created_at=data.get("created_at"),
+        )
+
+
+def make_retrieval_handle(
+    source_type: str,
+    source_id: str,
+    *,
+    locator: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+    handle_id: str | None = None,
+    created_at: float | None = None,
+) -> RetrievalHandle:
+    """Create a stable retrieval handle from identifiers, never raw content."""
+    return RetrievalHandle(
+        handle_id=handle_id or _stable_handle_id(source_type, source_id, locator),
+        source_type=source_type,
+        source_id=source_id,
+        locator=dict(locator or {}),
+        metadata=dict(metadata or {}),
+        created_at=created_at,
+    )
+
+
 @dataclass
 class ContextReferenceResult:
     message: str
     original_message: str
     references: list[ContextReference] = field(default_factory=list)
+    retrieval_handles: list[RetrievalHandle] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     injected_tokens: int = 0
     expanded: bool = False

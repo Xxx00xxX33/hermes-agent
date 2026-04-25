@@ -84,6 +84,7 @@ class TestAgentLoopTools:
         assert "todo" in _AGENT_LOOP_TOOLS
         assert "memory" in _AGENT_LOOP_TOOLS
         assert "session_search" in _AGENT_LOOP_TOOLS
+        assert "retrieval_resolve" in _AGENT_LOOP_TOOLS
         assert "delegate_task" in _AGENT_LOOP_TOOLS
 
     def test_no_regular_tools_in_set(self):
@@ -222,3 +223,8 @@ class TestBackwardCompat:
     def test_tool_to_toolset_map(self):
         assert isinstance(TOOL_TO_TOOLSET_MAP, dict)
         assert len(TOOL_TO_TOOLSET_MAP) > 0
+
+    def test_retrieval_resolve_is_registered_with_session_search_toolset(self):
+        names = get_all_tool_names()
+        assert "retrieval_resolve" in names
+        assert get_toolset_for_tool("retrieval_resolve") == "session_search"

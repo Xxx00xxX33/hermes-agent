@@ -92,6 +92,7 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.context_compressor import ContextCompressor
+from agent.context_references import make_retrieval_handle
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE, COMPLEX_TASK_ORCHESTRATION_GUIDANCE, DELEGATION_ORCHESTRATION_GUIDANCE
@@ -223,6 +224,7 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "read_file",
     "search_files",
     "session_search",
+    "retrieval_resolve",
     "skill_view",
     "skills_list",
     "vision_analyze",
@@ -592,6 +594,8 @@ class AIAgent:
     This class manages the conversation flow, tool execution, and response handling
     for AI models that support function calling.
     """
+
+    _PARENT_TOOL_RESULT_THRESHOLD = 20_000
 
     @property
     def base_url(self) -> str:
@@ -7758,6 +7762,16 @@ class AIAgent:
                 db=self._session_db,
                 current_session_id=self.session_id,
             )
+        elif function_name == "retrieval_resolve":
+            if not self._session_db:
+                return json.dumps({"success": False, "error": "Session database not available."})
+            from tools.retrieval_resolve_tool import retrieval_resolve as _retrieval_resolve
+            return _retrieval_resolve(
+                event_id=function_args.get("event_id"),
+                handle_id=function_args.get("handle_id"),
+                db=self._session_db,
+                current_session_id=self.session_id,
+            )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
@@ -7831,6 +7845,157 @@ class AIAgent:
                 out_lines.extend(wrapped or [raw_line])
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
+
+
+    def _parent_tool_result_threshold(self) -> int:
+        """Maximum raw tool-result chars allowed directly in parent context."""
+        configured = os.getenv("HERMES_PARENT_TOOL_RESULT_THRESHOLD")
+        if configured:
+            try:
+                threshold = int(configured)
+            except ValueError:
+                logger.warning(
+                    "Invalid HERMES_PARENT_TOOL_RESULT_THRESHOLD=%r; using default %d",
+                    configured,
+                    self._PARENT_TOOL_RESULT_THRESHOLD,
+                )
+            else:
+                if threshold >= 0:
+                    return threshold
+                logger.warning(
+                    "Negative HERMES_PARENT_TOOL_RESULT_THRESHOLD=%r; using default %d",
+                    configured,
+                    self._PARENT_TOOL_RESULT_THRESHOLD,
+                )
+        return self._PARENT_TOOL_RESULT_THRESHOLD
+
+    def _write_parent_routed_tool_result_artifact(
+        self,
+        *,
+        content: str,
+        tool_call_id: str,
+        event_id: str,
+    ) -> str | None:
+        """Persist raw routed output outside the parent prompt for recovery."""
+        try:
+            safe_session_id = re.sub(r"[^A-Za-z0-9_.-]", "_", self.session_id or "session")
+            safe_tool_call_id = re.sub(r"[^A-Za-z0-9_.-]", "_", tool_call_id or "tool_call")
+            safe_event_id = re.sub(r"[^A-Za-z0-9_.-]", "_", event_id)
+            artifact_dir = get_hermes_home() / "session_events" / "tool_results" / safe_session_id
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            artifact_path = artifact_dir / f"{safe_tool_call_id}_{safe_event_id}.txt"
+            artifact_path.write_text(content, encoding="utf-8")
+            return str(artifact_path)
+        except OSError as exc:
+            logger.warning("Could not persist routed tool output artifact for %s: %s", tool_call_id, exc)
+            return None
+
+    @staticmethod
+    def _extract_persisted_tool_output_path(parent_content: str) -> str | None:
+        """Return sandbox path from a <persisted-output> block, if present."""
+        match = re.search(r"^Full output saved to:\s*(.+)$", parent_content, re.MULTILINE)
+        if not match:
+            return None
+        path = match.group(1).strip()
+        return path or None
+
+    def _route_tool_result_for_parent_context(
+        self,
+        *,
+        raw_content: str,
+        parent_content: str,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        tool_call_id: str,
+        effective_task_id: str,
+    ) -> str:
+        """Replace large raw tool output with a parent-safe summary + handle.
+
+        Raw content is stored as searchable session-event text and, when possible,
+        as a local artifact. The message appended to the model context contains no
+        raw preview, preserving the parent-context boundary.
+        """
+        raw_content = raw_content if isinstance(raw_content, str) else str(raw_content)
+        parent_content = parent_content if isinstance(parent_content, str) else str(parent_content)
+        if len(raw_content) <= self._parent_tool_result_threshold():
+            return parent_content
+
+        event_id = f"evt_tool_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+        artifact_path = self._write_parent_routed_tool_result_artifact(
+            content=raw_content,
+            tool_call_id=tool_call_id,
+            event_id=event_id,
+        )
+        sandbox_artifact_path = self._extract_persisted_tool_output_path(parent_content)
+        summary = (
+            f"Large {tool_name} tool result ({len(raw_content):,} characters) "
+            "stored outside parent context."
+        )
+        locator = {
+            "session_id": self.session_id,
+            "event_type": "tool_result",
+            "tool_call_id": tool_call_id,
+        }
+        if artifact_path:
+            locator["artifact_path"] = artifact_path
+        if sandbox_artifact_path:
+            locator["sandbox_artifact_path"] = sandbox_artifact_path
+        handle = make_retrieval_handle(
+            "session_event",
+            event_id,
+            locator=locator,
+            metadata={
+                "tool": tool_name,
+                "raw_chars": len(raw_content),
+                "task_id": effective_task_id,
+            },
+        )
+
+        session_event_status = "unavailable"
+        session_db = getattr(self, "_session_db", None)
+        if session_db is not None and self.session_id:
+            try:
+                session_db.record_session_event(
+                    self.session_id,
+                    "tool_result",
+                    summary=summary,
+                    payload={
+                        "tool": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "task_id": effective_task_id,
+                        "raw_chars": len(raw_content),
+                        "parent_replacement_chars": len(parent_content),
+                        "artifact_path": artifact_path,
+                        "sandbox_artifact_path": sandbox_artifact_path,
+                        "arg_keys": sorted(str(key) for key in tool_args.keys()),
+                    },
+                    retrieval_handles=[handle.to_dict()],
+                    source_type="tool_call",
+                    source_id=tool_call_id,
+                    event_id=event_id,
+                    searchable_text=raw_content,
+                )
+                session_event_status = event_id
+            except Exception as exc:
+                logger.warning("Could not record routed tool result event for %s: %s", tool_call_id, exc)
+
+        recovery_lines = [
+            "[Tool result routed outside parent context]",
+            f"Tool: {tool_name}",
+            f"Tool call id: {tool_call_id}",
+            f"Summary: {summary}",
+            f"Raw size: {len(raw_content):,} characters",
+            f"Session event: {session_event_status}",
+            f"Retrieval handle: {handle.handle_id}",
+        ]
+        if artifact_path:
+            recovery_lines.append(f"Artifact: {artifact_path}")
+        if sandbox_artifact_path:
+            recovery_lines.append(f"Sandbox artifact: {sandbox_artifact_path}")
+        recovery_lines.append(
+            "Raw output was omitted from parent context; use the retrieval handle or session event search if details are needed."
+        )
+        return "\n".join(recovery_lines)
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute multiple tool calls concurrently using a thread pool.
@@ -7967,7 +8132,7 @@ class AIAgent:
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
-                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
+                logger.info("tool %s failed (%.2fs, %d chars)", function_name, duration, len(result))
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (function_name, function_args, result, duration, is_error)
@@ -8063,6 +8228,22 @@ class AIAgent:
             else:
                 function_name, function_args, function_result, tool_duration, is_error = r
 
+                raw_function_result = function_result
+                function_result = maybe_persist_tool_result(
+                    content=raw_function_result,
+                    tool_name=name,
+                    tool_use_id=tc.id,
+                    env=get_active_env(effective_task_id),
+                )
+                function_result = self._route_tool_result_for_parent_context(
+                    raw_content=raw_function_result,
+                    parent_content=function_result,
+                    tool_name=name,
+                    tool_args=args,
+                    tool_call_id=tc.id,
+                    effective_task_id=effective_task_id,
+                )
+
                 if is_error:
                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
@@ -8078,7 +8259,12 @@ class AIAgent:
 
                 if self.verbose_logging:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-                    logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+                    logging.debug(
+                        "Tool result routed for parent/user surfaces (%d raw chars, %d parent chars): %s",
+                        len(raw_function_result),
+                        len(function_result),
+                        function_result,
+                    )
 
             # Print cute message per tool
             if self._should_emit_quiet_tool_messages():
@@ -8100,13 +8286,6 @@ class AIAgent:
                     self.tool_complete_callback(tc.id, name, args, function_result)
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
-
-            function_result = maybe_persist_tool_result(
-                content=function_result,
-                tool_name=name,
-                tool_use_id=tc.id,
-                env=get_active_env(effective_task_id),
-            )
 
             subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
             if subdir_hints:
@@ -8244,6 +8423,7 @@ class AIAgent:
                     pass  # never block tool execution
 
             tool_start_time = time.time()
+            spinner = None
 
             if _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
@@ -8257,8 +8437,6 @@ class AIAgent:
                     store=self._todo_store,
                 )
                 tool_duration = time.time() - tool_start_time
-                if self._should_emit_quiet_tool_messages():
-                    self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
             elif function_name == "session_search":
                 if not self._session_db:
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
@@ -8272,8 +8450,18 @@ class AIAgent:
                         current_session_id=self.session_id,
                     )
                 tool_duration = time.time() - tool_start_time
-                if self._should_emit_quiet_tool_messages():
-                    self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
+            elif function_name == "retrieval_resolve":
+                if not self._session_db:
+                    function_result = json.dumps({"success": False, "error": "Session database not available."})
+                else:
+                    from tools.retrieval_resolve_tool import retrieval_resolve as _retrieval_resolve
+                    function_result = _retrieval_resolve(
+                        event_id=function_args.get("event_id"),
+                        handle_id=function_args.get("handle_id"),
+                        db=self._session_db,
+                        current_session_id=self.session_id,
+                    )
+                tool_duration = time.time() - tool_start_time
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
                 from tools.memory_tool import memory_tool as _memory_tool
@@ -8295,8 +8483,6 @@ class AIAgent:
                     except Exception:
                         pass
                 tool_duration = time.time() - tool_start_time
-                if self._should_emit_quiet_tool_messages():
-                    self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
             elif function_name == "clarify":
                 from tools.clarify_tool import clarify_tool as _clarify_tool
                 function_result = _clarify_tool(
@@ -8305,8 +8491,6 @@ class AIAgent:
                     callback=self.clarify_callback,
                 )
                 tool_duration = time.time() - tool_start_time
-                if self._should_emit_quiet_tool_messages():
-                    self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
                 from tools.delegate_tool import delegate_task as _delegate_task
                 tasks_arg = function_args.get("tasks")
@@ -8335,11 +8519,6 @@ class AIAgent:
                 finally:
                     self._delegate_spinner = None
                     tool_duration = time.time() - tool_start_time
-                    cute_msg = _get_cute_tool_message_impl('delegate_task', function_args, tool_duration, result=_delegate_result)
-                    if spinner:
-                        spinner.stop(cute_msg)
-                    elif self._should_emit_quiet_tool_messages():
-                        self._vprint(f"  {cute_msg}")
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
@@ -8358,11 +8537,6 @@ class AIAgent:
                     logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 finally:
                     tool_duration = time.time() - tool_start_time
-                    cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_ce_result)
-                    if spinner:
-                        spinner.stop(cute_msg)
-                    elif self.quiet_mode:
-                        self._vprint(f"  {cute_msg}")
             elif self._memory_manager and self._memory_manager.has_tool(function_name):
                 # Memory provider tools (hindsight_retain, honcho_search, etc.)
                 # These are not in the tool registry — route through MemoryManager.
@@ -8382,11 +8556,6 @@ class AIAgent:
                     logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 finally:
                     tool_duration = time.time() - tool_start_time
-                    cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
-                    if spinner:
-                        spinner.stop(cute_msg)
-                    elif self._should_emit_quiet_tool_messages():
-                        self._vprint(f"  {cute_msg}")
             elif self.quiet_mode:
                 spinner = None
                 if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
@@ -8410,11 +8579,6 @@ class AIAgent:
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 finally:
                     tool_duration = time.time() - tool_start_time
-                    cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
-                    if spinner:
-                        spinner.stop(cute_msg)
-                    elif self._should_emit_quiet_tool_messages():
-                        self._vprint(f"  {cute_msg}")
             else:
                 try:
                     function_result = handle_function_call(
@@ -8429,17 +8593,42 @@ class AIAgent:
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
 
+            raw_function_result = function_result
+            _is_error_result, _ = _detect_tool_failure(function_name, raw_function_result)
+            function_result = maybe_persist_tool_result(
+                content=raw_function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=get_active_env(effective_task_id),
+            )
+            function_result = self._route_tool_result_for_parent_context(
+                raw_content=raw_function_result,
+                parent_content=function_result,
+                tool_name=function_name,
+                tool_args=function_args,
+                tool_call_id=tool_call.id,
+                effective_task_id=effective_task_id,
+            )
+
+            if spinner is not None or self._should_emit_quiet_tool_messages():
+                cute_msg = _get_cute_tool_message_impl(
+                    function_name, function_args, tool_duration, result=function_result
+                )
+                if spinner is not None:
+                    spinner.stop(cute_msg)
+                else:
+                    self._vprint(f"  {cute_msg}")
+
             result_preview = function_result if self.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
 
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
-            _is_error_result, _ = _detect_tool_failure(function_name, function_result)
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
             else:
-                logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(function_result))
+                logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(raw_function_result))
 
             if self.tool_progress_callback:
                 try:
@@ -8455,20 +8644,18 @@ class AIAgent:
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-                logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+                logging.debug(
+                    "Tool result routed for parent/user surfaces (%d raw chars, %d parent chars): %s",
+                    len(raw_function_result),
+                    len(function_result),
+                    function_result,
+                )
 
             if self.tool_complete_callback:
                 try:
                     self.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
-
-            function_result = maybe_persist_tool_result(
-                content=function_result,
-                tool_name=function_name,
-                tool_use_id=tool_call.id,
-                env=get_active_env(effective_task_id),
-            )
 
             # Discover subdirectory context files from tool arguments
             subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
@@ -11190,7 +11377,7 @@ class AIAgent:
                         # (search_files, read_file, write_file, terminal, ...),
                         # keep output visible so the user sees progress.
                         _HOUSEKEEPING_TOOLS = frozenset({
-                            "memory", "todo", "skill_manage", "session_search",
+                            "memory", "todo", "skill_manage", "session_search", "retrieval_resolve",
                         })
                         _all_housekeeping = all(
                             tc.function.name in _HOUSEKEEPING_TOOLS

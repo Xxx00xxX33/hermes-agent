@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -88,6 +88,27 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    event_type TEXT NOT NULL,
+    source_type TEXT,
+    source_id TEXT,
+    summary TEXT,
+    payload_json TEXT NOT NULL,
+    retrieval_handles_json TEXT,
+    searchable_text TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_events_session_created
+ON session_events(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_session_events_type
+ON session_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_session_events_source
+ON session_events(source_type, source_id);
+
 """
 
 FTS_SQL = """
@@ -108,6 +129,25 @@ END;
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
+    searchable_text,
+    content=session_events,
+    content_rowid=id
+);
+
+CREATE TRIGGER IF NOT EXISTS session_events_fts_insert AFTER INSERT ON session_events BEGIN
+    INSERT INTO session_events_fts(rowid, searchable_text) VALUES (new.id, new.searchable_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_events_fts_delete AFTER DELETE ON session_events BEGIN
+    INSERT INTO session_events_fts(session_events_fts, rowid, searchable_text) VALUES('delete', old.id, old.searchable_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_events_fts_update AFTER UPDATE ON session_events BEGIN
+    INSERT INTO session_events_fts(session_events_fts, rowid, searchable_text) VALUES('delete', old.id, old.searchable_text);
+    INSERT INTO session_events_fts(rowid, searchable_text) VALUES (new.id, new.searchable_text);
 END;
 """
 
@@ -329,6 +369,56 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                cursor.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS session_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT NOT NULL UNIQUE,
+                        session_id TEXT NOT NULL REFERENCES sessions(id),
+                        event_type TEXT NOT NULL,
+                        source_type TEXT,
+                        source_id TEXT,
+                        summary TEXT,
+                        payload_json TEXT NOT NULL,
+                        retrieval_handles_json TEXT,
+                        searchable_text TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_session_events_session_created
+                    ON session_events(session_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_session_events_type
+                    ON session_events(event_type);
+                    CREATE INDEX IF NOT EXISTS idx_session_events_source
+                    ON session_events(source_type, source_id);
+                    """
+                )
+                cursor.execute("UPDATE schema_version SET version = 7")
+            if current_version < 8:
+                cursor.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS session_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT NOT NULL UNIQUE,
+                        session_id TEXT NOT NULL REFERENCES sessions(id),
+                        event_type TEXT NOT NULL,
+                        source_type TEXT,
+                        source_id TEXT,
+                        summary TEXT,
+                        payload_json TEXT NOT NULL,
+                        retrieval_handles_json TEXT,
+                        searchable_text TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_session_events_session_created
+                    ON session_events(session_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_session_events_type
+                    ON session_events(event_type);
+                    CREATE INDEX IF NOT EXISTS idx_session_events_source
+                    ON session_events(source_type, source_id);
+                    """
+                )
+                cursor.execute("UPDATE schema_version SET version = 8")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -341,10 +431,12 @@ class SessionDB:
             pass  # Index already exists
 
         # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
-        try:
-            cursor.execute("SELECT * FROM messages_fts LIMIT 0")
-        except sqlite3.OperationalError:
-            cursor.executescript(FTS_SQL)
+        for fts_table in ("messages_fts", "session_events_fts"):
+            try:
+                cursor.execute(f"SELECT * FROM {fts_table} LIMIT 0")
+            except sqlite3.OperationalError:
+                cursor.executescript(FTS_SQL)
+                break
 
         self._conn.commit()
 
@@ -942,6 +1034,247 @@ class SessionDB:
             return msg_id
 
         return self._execute_write(_do)
+
+    @staticmethod
+    def _loads_json_object(value: str | None) -> Dict[str, Any]:
+        if not value:
+            return {}
+        try:
+            loaded = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    @staticmethod
+    def _loads_json_list(value: str | None) -> List[Dict[str, Any]]:
+        if not value:
+            return []
+        try:
+            loaded = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return loaded if isinstance(loaded, list) else []
+
+    @staticmethod
+    def _build_session_event_search_text(
+        event_type: str,
+        summary: str | None,
+        payload: Dict[str, Any],
+        retrieval_handles: List[Dict[str, Any]],
+    ) -> str:
+        parts = [event_type]
+        if summary:
+            parts.append(summary)
+        for handle in retrieval_handles:
+            parts.extend(
+                str(handle.get(key, ""))
+                for key in ("handle_id", "source_type", "source_id")
+            )
+            metadata = handle.get("metadata")
+            if isinstance(metadata, dict):
+                parts.extend(str(value) for value in metadata.values() if value is not None)
+        for key in ("title", "summary", "status", "file", "path", "tool", "decision"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+        return "\n".join(part for part in parts if part)
+
+    def record_session_event(
+        self,
+        session_id: str,
+        event_type: str,
+        *,
+        summary: str | None = None,
+        payload: Dict[str, Any] | None = None,
+        retrieval_handles: List[Dict[str, Any]] | None = None,
+        source_type: str | None = None,
+        source_id: str | None = None,
+        event_id: str | None = None,
+        created_at: float | None = None,
+        searchable_text: str | None = None,
+    ) -> str:
+        """Append a summary-level session event with retrieval handles."""
+        payload = dict(payload or {})
+        retrieval_handles = [dict(handle) for handle in (retrieval_handles or [])]
+        created_at = time.time() if created_at is None else created_at
+        event_id = event_id or f"evt_{int(created_at * 1000)}_{random.randrange(1_000_000):06d}"
+        searchable_text = searchable_text or self._build_session_event_search_text(
+            event_type,
+            summary,
+            payload,
+            retrieval_handles,
+        )
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        handles_json = json.dumps(retrieval_handles, ensure_ascii=False, sort_keys=True)
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO session_events (
+                   event_id, session_id, event_type, source_type, source_id,
+                   summary, payload_json, retrieval_handles_json,
+                   searchable_text, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_id,
+                    session_id,
+                    event_type,
+                    source_type,
+                    source_id,
+                    summary,
+                    payload_json,
+                    handles_json,
+                    searchable_text,
+                    created_at,
+                ),
+            )
+            return event_id
+
+        return self._execute_write(_do)
+
+    @classmethod
+    def _session_event_from_row(cls, row: sqlite3.Row) -> Dict[str, Any]:
+        """Deserialize a session_events row without exposing searchable_text."""
+        event = dict(row)
+        event["payload"] = cls._loads_json_object(event.pop("payload_json", None))
+        event["retrieval_handles"] = cls._loads_json_list(
+            event.pop("retrieval_handles_json", None)
+        )
+        event.pop("searchable_text", None)
+        return event
+
+    def get_session_events(
+        self,
+        session_id: str,
+        event_type: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Return session events without exposing raw searchable text."""
+        where = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if event_type:
+            where.append("event_type = ?")
+            params.append(event_type)
+        params.extend([limit, offset])
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""SELECT id, event_id, session_id, event_type, source_type, source_id,
+                          summary, payload_json, retrieval_handles_json, created_at
+                   FROM session_events
+                   WHERE {' AND '.join(where)}
+                   ORDER BY created_at, id
+                   LIMIT ? OFFSET ?""",
+                params,
+            )
+            rows = cursor.fetchall()
+        return [self._session_event_from_row(row) for row in rows]
+
+    def get_session_event_by_id(
+        self,
+        event_id: str,
+        session_id: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one session event by ID without exposing raw searchable text."""
+        if not event_id:
+            return None
+        where = ["event_id = ?"]
+        params: list[Any] = [event_id]
+        if session_id:
+            where.append("session_id = ?")
+            params.append(session_id)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""SELECT id, event_id, session_id, event_type, source_type, source_id,
+                          summary, payload_json, retrieval_handles_json, created_at
+                   FROM session_events
+                   WHERE {' AND '.join(where)}
+                   LIMIT 1""",
+                params,
+            )
+            row = cursor.fetchone()
+        return self._session_event_from_row(row) if row else None
+
+    def get_session_event_by_handle_id(
+        self,
+        handle_id: str,
+        session_id: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the event containing a retrieval handle, failing closed on ambiguity."""
+        if not handle_id:
+            return None
+        where = ["retrieval_handles_json LIKE ?"]
+        params: list[Any] = [f'%{handle_id}%']
+        if session_id:
+            where.append("session_id = ?")
+            params.append(session_id)
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""SELECT id, event_id, session_id, event_type, source_type, source_id,
+                          summary, payload_json, retrieval_handles_json, created_at
+                   FROM session_events
+                   WHERE {' AND '.join(where)}
+                   ORDER BY created_at DESC, id DESC""",
+                params,
+            )
+            rows = cursor.fetchall()
+        matches = []
+        for row in rows:
+            event = self._session_event_from_row(row)
+            if any(
+                isinstance(handle, dict) and handle.get("handle_id") == handle_id
+                for handle in event.get("retrieval_handles", [])
+            ):
+                matches.append(event)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.warning("Ambiguous retrieval handle lookup for handle_id=%s", handle_id)
+        return None
+
+    def search_session_events(
+        self,
+        query: str,
+        session_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Search summary-level session events and return handles, not raw payloads."""
+        if not query or not query.strip():
+            return []
+        query = self._sanitize_fts5_query(query)
+        if not query:
+            return []
+
+        where = ["session_events_fts MATCH ?"]
+        params: list[Any] = [query]
+        if session_id:
+            where.append("e.session_id = ?")
+            params.append(session_id)
+        if event_type:
+            where.append("e.event_type = ?")
+            params.append(event_type)
+        params.extend([limit, offset])
+        cursor = self._conn.execute(
+            f"""SELECT e.id, e.event_id, e.session_id, e.event_type,
+                      e.source_type, e.source_id, e.summary,
+                      e.payload_json, e.retrieval_handles_json, e.created_at
+               FROM session_events_fts
+               JOIN session_events e ON e.id = session_events_fts.rowid
+               WHERE {' AND '.join(where)}
+               ORDER BY rank
+               LIMIT ? OFFSET ?""",
+            params,
+        )
+        results = []
+        for row in cursor.fetchall():
+            event = dict(row)
+            event["payload"] = self._loads_json_object(event.pop("payload_json", None))
+            event["retrieval_handles"] = self._loads_json_list(
+                event.pop("retrieval_handles_json", None)
+            )
+            results.append(event)
+        return results
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""

@@ -47,6 +47,18 @@ SUMMARY_PREFIX = (
     "config, etc.) may reflect work described here — avoid repeating it:"
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
+SESSION_GUIDE_HEADING = "Session Guide"
+SESSION_GUIDE_SECTIONS = (
+    "1. Summary",
+    "2. Decisions",
+    "3. Active Files",
+    "4. Active Entities",
+    "5. Unresolved Tasks",
+    "6. Risks",
+    "7. Validations",
+    "8. Retrieval Handles",
+)
+_SESSION_GUIDE_EMPTY_ITEM = "None recorded in compacted turns."
 
 # Minimum tokens for the summary output
 _MIN_SUMMARY_TOKENS = 2000
@@ -503,26 +515,76 @@ class ContextCompressor(ContextEngine):
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
 
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
-        """Serialize conversation turns into labeled text for the summarizer.
+        """Serialize conversation turns into parent-safe text for the summarizer.
 
-        Includes tool call arguments and result content (up to
-        ``_CONTENT_MAX`` chars per message) so the summarizer can preserve
-        specific details like file paths, commands, and outputs.
+        Tool result contents are deliberately not copied into this serialized
+        handoff input.  The compressor's job is to produce a recoverable guide,
+        not to preserve raw command output/logs/source dumps in the active
+        parent context.  Tool calls keep names/arguments and tool results keep
+        metadata so the summary model can describe what happened without seeing
+        or re-emitting bulky raw output.
         """
         parts = []
+        tool_call_index: Dict[str, tuple[str, str]] = {}
+
+        def _parse_json_maybe(value: str) -> Optional[dict]:
+            if not isinstance(value, str):
+                return None
+            stripped = value.strip()
+            if not (stripped.startswith("{") and stripped.endswith("}")):
+                return None
+            try:
+                parsed = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+
+        for msg in turns:
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    cid = tc.get("id") or ""
+                    fn = (tc.get("function") or {}).get("name") or ""
+                    args = (tc.get("function") or {}).get("arguments") or ""
+                else:
+                    cid = getattr(tc, "id", "") or ""
+                    fn_obj = getattr(tc, "function", None)
+                    fn = getattr(fn_obj, "name", "") if fn_obj else ""
+                    args = getattr(fn_obj, "arguments", "") if fn_obj else ""
+                if cid:
+                    tool_call_index[str(cid)] = (str(fn or ""), str(args or ""))
+
         for msg in turns:
             role = msg.get("role", "unknown")
             content = msg.get("content") or ""
 
-            # Tool results: keep enough content for the summarizer
             if role == "tool":
-                tool_id = msg.get("tool_call_id", "")
-                if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
-                parts.append(f"[TOOL RESULT {tool_id}]: {content}")
+                tool_id = str(msg.get("tool_call_id") or "")
+                tool_name, _tool_args = tool_call_index.get(tool_id, ("", ""))
+                content_text = str(content or "")
+                metadata: list[str] = []
+                parsed = _parse_json_maybe(content_text)
+                if isinstance(parsed, dict):
+                    exit_code = parsed.get("exit_code")
+                    if isinstance(exit_code, int):
+                        metadata.append(f"exit_code={exit_code}")
+                    total_count = parsed.get("total_count")
+                    if isinstance(total_count, int):
+                        metadata.append(f"total_count={total_count}")
+                    truncated = parsed.get("truncated")
+                    if isinstance(truncated, bool):
+                        metadata.append(f"truncated={truncated}")
+                if content_text:
+                    metadata.append(f"raw_chars={len(content_text)}")
+                metadata_text = ("; " + "; ".join(metadata)) if metadata else ""
+                label = f" {tool_id}" if tool_id else ""
+                name = tool_name or "tool"
+                parts.append(
+                    f"[TOOL RESULT{label}]: {name} completed; raw output omitted from compaction input{metadata_text}."
+                )
                 continue
 
-            # Assistant messages: include tool call names AND arguments
             if role == "assistant":
                 if len(content) > self._CONTENT_MAX:
                     content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
@@ -534,7 +596,6 @@ class ContextCompressor(ContextEngine):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
                             args = fn.get("arguments", "")
-                            # Truncate long arguments but keep enough for context
                             if len(args) > self._TOOL_ARGS_MAX:
                                 args = args[:self._TOOL_ARGS_HEAD] + "..."
                             tc_parts.append(f"  {name}({args})")
@@ -546,12 +607,58 @@ class ContextCompressor(ContextEngine):
                 parts.append(f"[ASSISTANT]: {content}")
                 continue
 
-            # User and other roles
             if len(content) > self._CONTENT_MAX:
                 content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
             parts.append(f"[{role.upper()}]: {content}")
 
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        """Remove ANSI escape sequences so fallback summaries stay readable."""
+        return re.sub(r"\[[0-9;?]*[ -/]*[@-~]", "", text or "")
+
+    @staticmethod
+    def _looks_like_session_guide(text: str) -> bool:
+        """Return True when text already uses the recoverable guide schema."""
+        stripped = (text or "").strip()
+        if stripped.startswith(SESSION_GUIDE_HEADING):
+            return True
+        return all(section in stripped for section in SESSION_GUIDE_SECTIONS[:4])
+
+    @staticmethod
+    def _plain_summary_bullets(text: str) -> str:
+        """Convert plain legacy summary text into safe bullets."""
+        lines = [line.strip(" -") for line in (text or "").splitlines() if line.strip()]
+        if not lines:
+            return f"- {_SESSION_GUIDE_EMPTY_ITEM}"
+        return "\n".join(f"- {line}" for line in lines)
+
+    @classmethod
+    def _to_session_guide_body(cls, summary: str) -> str:
+        """Normalize LLM/fallback output into the Phase 2 Session Guide shape."""
+        text = (summary or "").strip()
+        for prefix in (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip()
+                break
+        if not text:
+            text = _SESSION_GUIDE_EMPTY_ITEM
+        if cls._looks_like_session_guide(text):
+            if text.startswith(SESSION_GUIDE_HEADING):
+                return text
+            return f"{SESSION_GUIDE_HEADING}\n\n{text}"
+        return "\n\n".join([
+            SESSION_GUIDE_HEADING,
+            "1. Summary\n" + cls._plain_summary_bullets(text),
+            f"2. Decisions\n- {_SESSION_GUIDE_EMPTY_ITEM}",
+            f"3. Active Files\n- {_SESSION_GUIDE_EMPTY_ITEM}",
+            f"4. Active Entities\n- {_SESSION_GUIDE_EMPTY_ITEM}",
+            f"5. Unresolved Tasks\n- {_SESSION_GUIDE_EMPTY_ITEM}",
+            f"6. Risks\n- {_SESSION_GUIDE_EMPTY_ITEM}",
+            f"7. Validations\n- {_SESSION_GUIDE_EMPTY_ITEM}",
+            "8. Retrieval Handles\n- None recorded in this compacted summary. Use session search/live state for detail recovery.",
+        ])
 
     def _build_deterministic_fallback_summary(
         self,
@@ -559,10 +666,10 @@ class ContextCompressor(ContextEngine):
         focus_topic: str = None,
         failure_reason: str = "summary generation failed",
     ) -> str:
-        """Build a structured local handoff when remote summarization fails."""
+        """Build a local recoverable Session Guide when remote summarization fails."""
 
         def _clip(value: Any, limit: int = 220) -> str:
-            text = " ".join(str(value or "").split())
+            text = " ".join(self._strip_ansi(str(value or "")).split())
             if len(text) <= limit:
                 return text
             return text[: limit - 3] + "..."
@@ -571,22 +678,52 @@ class ContextCompressor(ContextEngine):
         assistant_points: List[str] = []
         tool_points: List[str] = []
         references: List[str] = []
-        ref_pattern = re.compile(r"(?:~?/[^^\s\]\[)(]+|https?://\S+|\b\d{2,5}\b)")
+        active_files: List[str] = []
+        active_entities: List[str] = []
+        ref_pattern = re.compile(r"(?:~?/[^\s\]\[)(]+|https?://\S+|\d{2,5})")
+
+        def _remember_ref(value: str) -> None:
+            cleaned = self._strip_ansi(value).strip().rstrip('.,:;')
+            if not cleaned or cleaned in references:
+                return
+            references.append(cleaned)
+            if cleaned.startswith("/") or cleaned.startswith("~/"):
+                if cleaned not in active_files:
+                    active_files.append(cleaned)
+            elif cleaned not in active_entities:
+                active_entities.append(cleaned)
 
         for msg in turns_to_summarize:
             role = str(msg.get("role") or "")
-            content = _clip(msg.get("content"))
+            raw_content = str(msg.get("content") or "")
+            content = _clip(raw_content)
             if role == "user" and content:
                 user_points.append(content)
             elif role == "assistant" and content:
                 assistant_points.append(content)
-            elif role == "tool" and content:
-                tool_points.append(f"tool result: {content}")
+            elif role == "tool":
+                tool_id = str(msg.get("tool_call_id") or "").strip()
+                label = f"tool result {tool_id}" if tool_id else "tool result"
+                tool_points.append(
+                    f"{label} observed; raw output omitted from compacted parent context (raw_chars={len(raw_content)})."
+                )
 
-            for match in ref_pattern.findall(str(msg.get("content") or "")):
-                cleaned = match.strip().rstrip('.,:;')
-                if cleaned and cleaned not in references:
-                    references.append(cleaned)
+            if role != "tool":
+                for match in ref_pattern.findall(raw_content):
+                    _remember_ref(match)
+                    if len(references) >= 8:
+                        break
+
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    args = (tc.get("function") or {}).get("arguments") or ""
+                else:
+                    fn = getattr(tc, "function", None)
+                    args = getattr(fn, "arguments", "") if fn else ""
+                for match in ref_pattern.findall(str(args)):
+                    _remember_ref(match)
+                    if len(references) >= 8:
+                        break
                 if len(references) >= 8:
                     break
 
@@ -594,150 +731,130 @@ class ContextCompressor(ContextEngine):
         current_state: List[str] = []
         if assistant_points:
             current_state.append(f"Latest assistant state: {assistant_points[-1]}")
-        if tool_points:
-            current_state.append(f"Latest tool state: {tool_points[-1]}")
         if not current_state:
-            current_state.append("Recent turns were compacted after remote summary generation failed.")
+            current_state.append("Recent turns were compacted with a deterministic local fallback guide.")
 
-        hard_constraints = [
-            "This summary was generated locally to preserve continuity after compression.",
-            "Use the preserved recent turns and current workspace state as ground truth.",
+        decisions = ["Continue from current repo/tool state rather than replaying dropped turns."]
+        unresolved_tasks = ["Resume from the preserved recent turns and current file/tool state."]
+        if focus_topic:
+            unresolved_tasks.insert(0, f"Prioritize the focus topic during continuation: {focus_topic}")
+        if tool_points:
+            unresolved_tasks.append("Re-check important tool-derived facts through live state, session search, or retrieval handles before relying on omitted raw details.")
+
+        risks = [
+            "Older raw tool outputs were intentionally omitted from the compacted parent context.",
         ]
         if failure_reason:
-            hard_constraints.insert(0, f"Remote summary generation failed: {failure_reason}")
+            risks.insert(0, f"Remote summary generation failed: {failure_reason}")
 
-        next_actions = [
-            "Resume from the preserved recent turns and current file/tool state.",
+        validations = [
+            "Fallback guide generated locally to preserve continuity during compaction.",
         ]
-        if focus_topic:
-            next_actions.insert(0, f"Prioritize the focus topic during continuation: {focus_topic}")
         if tool_points:
-            next_actions.append("Re-check important tool-derived facts against live state before acting on them.")
+            validations.extend(tool_points[:3])
 
-        critical_refs = references[:8] or ["Use the preserved tail messages and current workspace state as ground truth."]
-        dropped_details = [
-            "Verbose middle-turn history was compressed mechanically after remote summary failure.",
-            "Older raw tool outputs may have been truncated or replaced by shorter notes.",
-        ]
+        active_files = active_files[:8] or ["Use the preserved tail messages and current workspace state as ground truth."]
+        active_entities = active_entities[:8] or references[:8] or [_SESSION_GUIDE_EMPTY_ITEM]
 
         sections = [
-            "1. Objective\n- " + objective,
-            "2. Current state\n" + "\n".join(f"- {item}" for item in current_state),
-            "3. Hard constraints\n" + "\n".join(f"- {item}" for item in hard_constraints),
-            "4. Key decisions made\n- Continue from current repo/tool state rather than replaying dropped turns.",
-            "5. Open issues / uncertainties\n- Some missing detail had to be reconstructed locally because the remote summarizer was unavailable.",
-            "6. Next actions\n" + "\n".join(f"- {item}" for item in next_actions),
-            "7. Critical references\n" + "\n".join(f"- {item}" for item in critical_refs),
-            "8. Dropped details\n" + "\n".join(f"- {item}" for item in dropped_details),
+            SESSION_GUIDE_HEADING,
+            "1. Summary\n- Objective: " + objective + "\n" + "\n".join(f"- Current state: {item}" for item in current_state),
+            "2. Decisions\n" + "\n".join(f"- {item}" for item in decisions),
+            "3. Active Files\n" + "\n".join(f"- {item}" for item in active_files),
+            "4. Active Entities\n" + "\n".join(f"- {item}" for item in active_entities),
+            "5. Unresolved Tasks\n" + "\n".join(f"- {item}" for item in unresolved_tasks),
+            "6. Risks\n" + "\n".join(f"- {item}" for item in risks),
+            "7. Validations\n" + "\n".join(f"- {item}" for item in validations),
+            "8. Retrieval Handles\n- None recorded in this fallback guide. Recover details through session events, session search, or live state instead of relying on raw parent-context payloads.",
         ]
         return "\n\n".join(sections)
 
     def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
-        """Generate a structured summary of conversation turns.
-
-        Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
-        Questions, Files, Remaining Work) with explicit preamble telling the
-        summarizer not to answer questions.  When a previous summary exists,
-        generates an iterative update instead of summarizing from scratch.
-
-        Args:
-            focus_topic: Optional focus string for guided compression.  When
-                provided, the summariser prioritises preserving information
-                related to this topic and is more aggressive about compressing
-                everything else.  Inspired by Claude Code's ``/compact``.
-
-        Returns None if all attempts fail — the caller should drop
-        the middle turns without a summary rather than inject a useless
-        placeholder.
-        """
+        """Generate a parent-safe, recoverable Session Guide."""
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
-            logger.debug(
-                "Skipping context summary during cooldown (%.0fs remaining)",
-                self._summary_failure_cooldown_until - now,
+            fallback = self._build_deterministic_fallback_summary(
+                turns_to_summarize,
+                focus_topic=focus_topic,
+                failure_reason="summary generation is in cooldown",
             )
-            return None
+            guide_body = self._to_session_guide_body(fallback)
+            self._previous_summary = guide_body
+            return self._with_summary_prefix(guide_body)
 
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
 
-        # Preamble shared by both first-compaction and iterative-update prompts.
-        # Inspired by OpenCode's "do not respond to any questions" instruction
-        # and Codex's "another language model" framing.
-        _summarizer_preamble = (
-            "You are a summarization agent creating a context checkpoint. "
-            "Your output will be injected as reference material for a DIFFERENT "
-            "assistant that continues the conversation. "
-            "Do NOT respond to any questions or requests in the conversation — "
-            "only output the structured summary. "
+        summarizer_preamble = (
+            "You are a summarization agent creating a context checkpoint for a DIFFERENT assistant. "
+            "Do NOT respond to any questions or requests in the conversation — only output the structured Session Guide. "
             "Do NOT include any preamble, greeting, or prefix."
         )
+        template_sections = f"""Use this exact recoverable Session Guide structure:
 
-        # Shared structured template (used by both paths).
-        _template_sections = f"""1. Objective
-- What the user ultimately wants right now. Use the most recent unfulfilled user request verbatim when possible.
+{SESSION_GUIDE_HEADING}
 
-2. Current state
-- What has already been completed
-- What is currently true in the workspace or runtime
+1. Summary
+- Compactly state the user's goal and current state.
 
-3. Hard constraints
-- Non-negotiable rules, preferences, boundaries, and environment constraints
+2. Decisions
+- Decisions already made that future steps must respect.
 
-4. Key decisions made
-- Technical decisions and why they were made
+3. Active Files
+- File paths currently relevant to continuation.
 
-5. Open issues / uncertainties
-- What is unresolved and why it matters
+4. Active Entities
+- Commands, services, issue IDs, URLs, schemas, handles, or other named entities needed for recovery.
 
-6. Next actions
-- Ordered list of immediate next steps for the next assistant
+5. Unresolved Tasks
+- Concrete next work that remains; include validation gaps.
 
-7. Critical references
-- File paths, commands, URLs, identifiers, APIs, services, ports, schemas, or entities that must remain available
+6. Risks
+- Known blockers, uncertainties, leakage risks, compatibility risks, or recovery risks.
 
-8. Dropped details
-- Briefly note what categories were intentionally omitted or aggressively compressed
+7. Validations
+- Tests/checks already run and their outcomes, or checks still pending.
 
-Target ~{summary_budget} tokens. Preserve continuity and concrete facts. Include file paths, command outputs, error messages, line numbers, and exact values when they matter.
+8. Retrieval Handles
+- Handle IDs and minimal metadata for recoverable detail. If none are present, say none are recorded and point to session search/live state.
 
-Write only the summary body. Do not include any preamble or prefix."""
+Rules:
+- Do not include raw tool outputs, long logs, large code snippets, or values from searchable_text.
+- Do not quote bulky command output; summarize outcome and recovery route instead.
+- Prefer handle IDs, file paths, commands, and concise evidence over transcript narrative.
+- Each decision/task/risk should be grounded in the supplied turns or previous guide.
+- Target ~{summary_budget} tokens. Preserve continuity and concrete facts.
+- Write only the Session Guide body. Do not include any preamble or prefix."""
 
         if self._previous_summary:
-            # Iterative update: preserve existing info, add new progress
-            prompt = f"""{_summarizer_preamble}
+            prompt = f"""{summarizer_preamble}
 
-You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
+You are updating a context compaction Session Guide. A previous compaction produced the guide below. New conversation turns have occurred since then and need to be incorporated.
 
-PREVIOUS SUMMARY:
+PREVIOUS SESSION GUIDE:
 {self._previous_summary}
 
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}
 
-Update the summary using this exact structure. Preserve what is still relevant, add new progress, and remove only what is clearly obsolete. CRITICAL: keep section "1. Objective" aligned to the user's most recent unfulfilled request so the next assistant resumes at the correct point.
+Update the guide. Preserve what is still relevant, add new progress, and remove only what is clearly obsolete.
 
-{_template_sections}"""
+{template_sections}"""
         else:
-            # First compaction: summarize from scratch
-            prompt = f"""{_summarizer_preamble}
+            prompt = f"""{summarizer_preamble}
 
-Create a structured handoff summary for a different assistant that will continue this conversation after earlier turns are compacted. The next assistant should be able to understand what happened without re-reading the original turns.
+Create a structured handoff Session Guide for a different assistant that will continue this conversation after earlier turns are compacted.
 
 TURNS TO SUMMARIZE:
 {content_to_summarize}
 
-Use this exact structure:
+{template_sections}"""
 
-{_template_sections}"""
-
-        # Inject focus topic guidance when the user provides one via /compress <focus>.
-        # This goes at the end of the prompt so it takes precedence.
         if focus_topic:
             prompt += f"""
 
 FOCUS TOPIC: "{focus_topic}"
-The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget."""
+The user has requested that this compaction PRIORITISE preserving recoverable information related to the focus topic above. Include exact file paths, commands, identifiers, decisions, validation outcomes, and retrieval handles. Do not include raw tool output or long snippets; route details through handles/search/live state."""
 
         try:
             call_kwargs = {
@@ -751,83 +868,41 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 },
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(summary_budget * 1.3),
-                # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
             response = call_llm(**call_kwargs)
             content = response.choices[0].message.content
-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
                 content = str(content) if content else ""
             summary = content.strip()
             if not summary:
-                self._previous_summary = None
-                self._summary_failure_cooldown_until = 0.0
-                self._summary_model_fallen_back = False
-                return None
-            # Store for iterative updates on next compaction
-            self._previous_summary = summary
+                raise ValueError("Summary LLM returned empty content")
+            guide_body = self._to_session_guide_body(summary)
+            self._previous_summary = guide_body
             self._summary_failure_cooldown_until = 0.0
             self._summary_model_fallen_back = False
-            return self._with_summary_prefix(summary)
-        except RuntimeError:
-            # No provider configured — long cooldown, unlikely to self-resolve
-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
-            logging.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary "
-                            "for %d seconds.",
-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
-            return None
+            return self._with_summary_prefix(guide_body)
         except Exception as e:
-            # If the summary model is different from the main model and the
-            # error looks permanent (model not found, 503, 404), fall back to
-            # using the main model instead of entering cooldown that leaves
-            # context growing unbounded.  (#8620 sub-issue 4)
-            _status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
-            _err_str = str(e).lower()
-            _is_model_not_found = (
-                _status in (404, 503)
-                or "model_not_found" in _err_str
-                or "does not exist" in _err_str
-                or "no available channel" in _err_str
-            )
-            if (
-                _is_model_not_found
-                and self.summary_model
-                and self.summary_model != self.model
-                and not getattr(self, "_summary_model_fallen_back", False)
-            ):
-                self._summary_model_fallen_back = True
-                logging.warning(
-                    "Summary model '%s' not available (%s). "
-                    "Falling back to main model '%s' for compression.",
-                    self.summary_model, e, self.model,
-                )
-                self.summary_model = ""  # empty = use main model
-                self._summary_failure_cooldown_until = 0.0  # no cooldown
-                return self._generate_summary(messages, summary_budget)  # retry immediately
-
-            # Transient errors (timeout, rate limit, network) — shorter cooldown
-            _transient_cooldown = 60
-            self._summary_failure_cooldown_until = time.monotonic() + _transient_cooldown
+            self._summary_failure_cooldown_until = time.monotonic() + 60
             logging.warning(
-                "Failed to generate context summary: %s. "
-                "Further summary attempts paused for %d seconds.",
+                "Failed to generate context summary: %s. Using deterministic local Session Guide fallback.",
                 e,
-                _transient_cooldown,
             )
-            return None
+            fallback = self._build_deterministic_fallback_summary(
+                turns_to_summarize,
+                focus_topic=focus_topic,
+                failure_reason=str(e),
+            )
+            guide_body = self._to_session_guide_body(fallback)
+            self._previous_summary = guide_body
+            return self._with_summary_prefix(guide_body)
 
     @staticmethod
     def _with_summary_prefix(summary: str) -> str:
         """Normalize summary text to the current compaction handoff format."""
-        text = (summary or "").strip()
-        for prefix in (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX):
-            if text.startswith(prefix):
-                text = text[len(prefix):].lstrip()
-                break
-        return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+        body = ContextCompressor._to_session_guide_body(summary)
+        return f"{SUMMARY_PREFIX}\n{body}" if body else SUMMARY_PREFIX
 
     # ------------------------------------------------------------------
     # Tool-call / tool-result pair integrity helpers

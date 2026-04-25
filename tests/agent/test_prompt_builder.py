@@ -26,6 +26,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
+    DELEGATION_ORCHESTRATION_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
@@ -48,6 +49,14 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_delegation_guidance_keeps_parent_as_orchestrator(self):
+        text = DELEGATION_ORCHESTRATION_GUIDANCE.lower()
+        assert "default to delegation" in text
+        assert "dirty work" in text
+        assert "isolated child processes" in text
+        assert "do not stream raw data" in text
+        assert "final acceptance checks" in text
 
 
 # =========================================================================
