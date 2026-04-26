@@ -91,6 +91,18 @@ from agent.model_metadata import (
     save_context_length, is_local_endpoint,
     query_ollama_num_ctx,
 )
+from agent.acceptance import (
+    AcceptanceResult,
+    CheckResult,
+    CriterionEvaluation,
+    CriterionSpec,
+    TaskContract,
+    VerificationCheck,
+    acceptance_result_to_dict,
+    evaluate_claim_evidence_consistency,
+    infer_minimal_task_contract,
+    task_contract_to_dict,
+)
 from agent.context_compressor import ContextCompressor
 from agent.context_references import make_retrieval_handle
 from agent.subdirectory_hints import SubdirectoryHintTracker
@@ -721,6 +733,11 @@ class AIAgent:
         self.verbose_logging = verbose_logging
         self.quiet_mode = quiet_mode
         self.ephemeral_system_prompt = ephemeral_system_prompt
+        self._base_ephemeral_system_prompt = ephemeral_system_prompt
+        self._acceptance_enabled = True
+        self._acceptance_mode = "advisory"
+        self._current_task_contract: TaskContract | None = None
+        self._latest_acceptance_result: AcceptanceResult | None = None
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
@@ -8702,6 +8719,426 @@ class AIAgent:
 
 
 
+    @staticmethod
+    def _has_task_signal(text: str) -> bool:
+        """Return whether text appears to request concrete work, not just chat."""
+        lowered = (text or "").lower()
+        if not lowered.strip():
+            return False
+        task_markers = (
+            "fix", "修复", "修好", "implement", "实现", "add", "添加",
+            "update", "修改", "change", "改", "refactor", "重构", "verify",
+            "验证", "test", "测试", "commit", "patch", "provider", "label",
+            "debug", "diagnose", "investigate", "处理", "完成",
+        )
+        question_only_markers = ("什么意思", "是什么", "why", "怎么理解", "天气")
+        if any(marker in lowered for marker in task_markers):
+            return True
+        if any(marker in lowered for marker in question_only_markers):
+            return False
+        return False
+
+    @staticmethod
+    def _is_continue_turn(text: str) -> bool:
+        normalized = (text or "").strip().lower()
+        return normalized in {"continue", "继续", "go on", "keep going", "carry on"}
+
+    def _rebuild_acceptance_contract_from_persisted_report(self, contract_json: Any) -> TaskContract | None:
+        """Rehydrate a stored acceptance contract defensively.
+
+        Persisted rows may come from older schema versions or partially-written
+        reports, so every nested shape is validated and strict completion modes
+        are downgraded to advisory for a continuation turn.
+        """
+        if not isinstance(contract_json, dict):
+            return None
+        task_summary = str(contract_json.get("task_summary") or "").strip()
+        if not task_summary:
+            return None
+
+        def _string_list(value: Any) -> list[str]:
+            if not isinstance(value, list):
+                return []
+            return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+        criteria: list[CriterionSpec] = []
+        for item in contract_json.get("criteria") or []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            if not label:
+                continue
+            criterion_id = str(item.get("criterion_id") or f"criterion_{len(criteria) + 1}").strip()
+            evidence_mode = str(item.get("evidence_mode") or "transcript_ok").strip() or "transcript_ok"
+            criteria.append(
+                CriterionSpec(
+                    criterion_id=criterion_id,
+                    label=label,
+                    evidence_mode=evidence_mode,
+                )
+            )
+
+        verification_checks: list[VerificationCheck] = []
+        for idx, item in enumerate(contract_json.get("verification_checks") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            check_id = str(item.get("id") or f"check_{idx}").strip() or f"check_{idx}"
+            description = str(item.get("description") or check_id).strip() or check_id
+            kind = str(item.get("kind") or "manual").strip() or "manual"
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            verification_checks.append(
+                VerificationCheck(
+                    id=check_id,
+                    description=description,
+                    kind=kind,
+                    required=bool(item.get("required", True)),
+                    payload=payload,
+                )
+            )
+
+        return TaskContract(
+            task_summary=task_summary,
+            deliverable=str(contract_json.get("deliverable") or task_summary).strip() or task_summary,
+            success_criteria=_string_list(contract_json.get("success_criteria")),
+            criteria=criteria,
+            constraints=_string_list(contract_json.get("constraints")),
+            prohibited_actions=_string_list(contract_json.get("prohibited_actions")),
+            must_requirements=_string_list(contract_json.get("must_requirements")),
+            should_requirements=_string_list(contract_json.get("should_requirements")),
+            invariants=_string_list(contract_json.get("invariants")),
+            scope_boundaries=_string_list(contract_json.get("scope_boundaries")),
+            non_goals=_string_list(contract_json.get("non_goals")),
+            verification_checks=verification_checks,
+            completion_mode="advisory",
+            source=str(contract_json.get("source") or "persisted_acceptance_report"),
+            inference_quality=str(contract_json.get("inference_quality") or "medium"),
+            inference_warnings=_string_list(contract_json.get("inference_warnings")),
+        )
+
+    def _latest_persisted_acceptance_contract(self) -> TaskContract | None:
+        if not self._session_db or not self.session_id:
+            return None
+        getter = getattr(self._session_db, "get_latest_acceptance_report", None)
+        if getter is None:
+            return None
+        try:
+            report = getter(self.session_id)
+        except Exception as exc:
+            logger.debug("Failed to load latest acceptance report: %s", exc)
+            return None
+        if not isinstance(report, dict):
+            return None
+        return self._rebuild_acceptance_contract_from_persisted_report(report.get("contract_json"))
+
+    def _recover_acceptance_user_message(
+        self,
+        user_message: str,
+        conversation_history: list[dict[str, Any]] | None,
+        messages: list[dict[str, Any]] | None,
+    ) -> str:
+        """Recover the actionable task for terse continuation turns."""
+        persisted = self._latest_persisted_acceptance_contract()
+        if persisted is not None:
+            self._current_task_contract = persisted
+            return persisted.task_summary
+
+        history = list(conversation_history or messages or [])
+        recent_has_tool = any(
+            isinstance(message, dict) and message.get("role") == "tool"
+            for message in history[-8:]
+        )
+        if not recent_has_tool:
+            self._current_task_contract = None
+            return user_message
+
+        for message in reversed(history):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = str(message.get("content") or "").strip()
+            if self._has_task_signal(content):
+                return content
+        self._current_task_contract = None
+        return user_message
+
+    def _should_enable_acceptance_for_turn(
+        self,
+        user_message: str,
+        conversation_history: list[dict[str, Any]] | None,
+    ) -> bool:
+        if not self._acceptance_enabled:
+            return False
+        if self._has_task_signal(user_message):
+            return True
+        if not self._is_continue_turn(user_message):
+            return False
+        history = list(conversation_history or [])
+        recent_has_tool = any(
+            isinstance(message, dict) and message.get("role") == "tool"
+            for message in history[-8:]
+        )
+        if not recent_has_tool:
+            return False
+        return any(
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and self._has_task_signal(str(message.get("content") or ""))
+            for message in history[-12:]
+        )
+
+    def _build_acceptance_ephemeral_prompt(self, contract: TaskContract) -> str:
+        lines = [
+            "Current task contract:",
+            f"- Goal: {contract.task_summary}",
+            f"- Deliverable: {contract.deliverable}",
+        ]
+
+        def add_section(title: str, items: list[str]) -> None:
+            if not items:
+                return
+            lines.append(f"- {title}:")
+            lines.extend(f"  - {item}" for item in items)
+
+        add_section("Success criteria", contract.success_criteria)
+        add_section("Constraints", contract.constraints)
+        add_section("Prohibited actions", contract.prohibited_actions)
+        add_section("Must requirements", contract.must_requirements)
+        add_section("Should requirements", contract.should_requirements)
+        add_section("Invariants", contract.invariants)
+        add_section("Scope boundaries", contract.scope_boundaries)
+        add_section("Non-goals", contract.non_goals)
+        lines.append(f"- Inference quality: {contract.inference_quality}")
+        add_section("Inference warnings", contract.inference_warnings)
+        lines.extend([
+            "Do not treat constraints as completed deliverables.",
+            "Do not violate prohibited actions even if the success criteria look satisfied.",
+            "Invariants must remain true after completion.",
+            "Do not treat non-goals as required deliverables.",
+            "Do not exceed scope boundaries unless explicitly justified.",
+            "Before claiming completion, explicitly note if evidence is missing.",
+        ])
+        if contract.inference_quality == "low":
+            lines.append(
+                "This inferred contract is low confidence; be conservative about completion claims and call out ambiguity."
+            )
+        return "\n".join(lines)
+
+    def _apply_acceptance_contract_for_turn(
+        self,
+        user_message: str,
+        conversation_history: list[dict[str, Any]] | None,
+        messages: list[dict[str, Any]] | None,
+    ) -> None:
+        self._current_task_contract = None
+        self._latest_acceptance_result = None
+        self.ephemeral_system_prompt = self._base_ephemeral_system_prompt
+        acceptance_user_message = user_message
+        if self._is_continue_turn(user_message):
+            acceptance_user_message = self._recover_acceptance_user_message(
+                user_message, conversation_history, messages
+            )
+            if self._current_task_contract is not None:
+                contract_prompt = self._build_acceptance_ephemeral_prompt(self._current_task_contract)
+                self.ephemeral_system_prompt = (
+                    f"{self._base_ephemeral_system_prompt}\n\n{contract_prompt}"
+                    if self._base_ephemeral_system_prompt
+                    else contract_prompt
+                )
+                return
+            if acceptance_user_message == user_message:
+                return
+        elif not self._should_enable_acceptance_for_turn(user_message, conversation_history):
+            return
+        self._current_task_contract = infer_minimal_task_contract(
+            acceptance_user_message,
+            conversation_history=conversation_history,
+        )
+        contract_prompt = self._build_acceptance_ephemeral_prompt(self._current_task_contract)
+        self.ephemeral_system_prompt = (
+            f"{self._base_ephemeral_system_prompt}\n\n{contract_prompt}"
+            if self._base_ephemeral_system_prompt
+            else contract_prompt
+        )
+
+    def _persist_acceptance_report(self, contract: TaskContract, result: AcceptanceResult) -> None:
+        if not self.persist_session or not self._session_db or not self.session_id:
+            return
+        create_report = getattr(self._session_db, "create_acceptance_report", None)
+        if create_report is None:
+            return
+        try:
+            create_report(
+                session_id=self.session_id,
+                result_status=result.status,
+                completion_mode=contract.completion_mode,
+                contract=task_contract_to_dict(contract),
+                result=acceptance_result_to_dict(result),
+            )
+        except Exception as exc:
+            logger.debug("Failed to persist acceptance report: %s", exc)
+
+    def _acceptance_check_summary(self, result: AcceptanceResult) -> str:
+        return "; ".join(
+            f"{check.check_id}={check.status}"
+            for check in result.check_results
+        )
+
+    def _acceptance_effective_risk(
+        self,
+        result: AcceptanceResult,
+        final_response: str,
+    ) -> tuple[str, list[str], str]:
+        risk_level = str(result.risk_level or "weak").strip().lower() or "weak"
+        risk_signals = [
+            str(signal).strip()
+            for signal in result.risk_signals
+            if str(signal).strip()
+        ]
+        gate_reason = str(result.gate_reason or "").strip()
+        status = str(result.status or "").strip().lower()
+        confidence = str(result.confidence or "").strip().lower()
+        contract = self._current_task_contract
+
+        if status in {"fail", "inconclusive"}:
+            signal = f"acceptance status is {status}"
+            if signal not in risk_signals:
+                risk_signals.append(signal)
+            return "blocked", risk_signals, gate_reason
+
+        if contract is None:
+            return risk_level, risk_signals, gate_reason
+
+        final_corpus = " ".join(str(final_response or "").lower().split())
+        uncovered_must_requirements = [
+            requirement
+            for requirement in contract.must_requirements
+            if " ".join(str(requirement).lower().split()) not in final_corpus
+        ]
+        if uncovered_must_requirements:
+            if "uncovered must requirements" not in risk_signals:
+                risk_signals.append("uncovered must requirements")
+            if not gate_reason or gate_reason == "all acceptance checks passed":
+                gate_reason = "must requirements not clearly covered"
+            return "risky", risk_signals, gate_reason
+
+        executable_backed = bool(result.executable_evidence_checks)
+        tool_backed = any(
+            check.check_id == "tool_evidence" and check.status == "pass"
+            for check in result.check_results
+        )
+        inference_quality = str(contract.inference_quality or "").strip().lower()
+        inference_warnings = [
+            str(warning).strip().lower()
+            for warning in contract.inference_warnings
+            if str(warning).strip()
+        ]
+
+        if gate_reason == "transcript-only acceptance" and "transcript-only acceptance" not in risk_signals:
+            risk_signals.append("transcript-only acceptance")
+
+        if inference_quality == "low" and not executable_backed:
+            if gate_reason != "transcript-only acceptance":
+                gate_reason = "low-quality inferred contract"
+            if "low-quality inferred contract" not in risk_signals:
+                risk_signals.append("low-quality inferred contract")
+            return "risky", risk_signals, gate_reason
+
+        if (
+            "no explicit executable verification inferred" in inference_warnings
+            and not executable_backed
+            and gate_reason != "transcript-only acceptance"
+        ):
+            gate_reason = "inference warning: no explicit executable verification inferred"
+            if "no explicit executable verification inferred" not in risk_signals:
+                risk_signals.append("no explicit executable verification inferred")
+            return "risky", risk_signals, gate_reason
+
+        if executable_backed:
+            if "executable evidence present" not in risk_signals:
+                risk_signals.append("executable evidence present")
+            if inference_quality == "high" or confidence == "high":
+                return "verified", risk_signals, gate_reason
+            return "supported", risk_signals, gate_reason
+
+        if tool_backed:
+            if "tool-backed acceptance" not in risk_signals:
+                risk_signals.append("tool-backed acceptance")
+            if not gate_reason or gate_reason == "all acceptance checks passed":
+                gate_reason = "tool-backed acceptance"
+            return "supported", risk_signals, gate_reason
+
+        return risk_level, risk_signals, gate_reason
+
+    def _acceptance_gate_decision(self, mode: str, result: AcceptanceResult) -> str:
+        normalized_mode = str(mode or "advisory").strip().lower()
+        status = str(result.status or "").strip().lower()
+        confidence = str(result.confidence or "").strip().lower()
+        risk_level = str(result.risk_level or "").strip().lower()
+        risky = (
+            status in {"fail", "inconclusive"}
+            or risk_level in {"blocked", "risky"}
+            or (confidence == "low" and risk_level not in {"supported", "verified"})
+        )
+        if not risky:
+            return "allow"
+        if normalized_mode == "strict":
+            return "block"
+        if normalized_mode == "warn":
+            return "warn"
+        return "soften"
+
+    def _format_acceptance_gate_report(
+        self,
+        *,
+        decision: str,
+        result: AcceptanceResult,
+        final_response: str,
+    ) -> str:
+        lines: list[str]
+        if decision == "block":
+            lines = ["Acceptance gate blocked completion."]
+        elif decision == "warn":
+            lines = ["Warning: risky completion."]
+        else:
+            lines = [
+                f"Acceptance is {result.status}, "
+                "but completion evidence is not strong enough to stay silent."
+            ]
+
+        lines.append(f"Status: {result.status}")
+        if result.confidence:
+            lines.append(f"Confidence: {result.confidence}")
+        if result.risk_level:
+            lines.append(f"Risk level: {result.risk_level}")
+        if result.gate_reason:
+            lines.append(f"Gate reason: {result.gate_reason}")
+        check_summary = self._acceptance_check_summary(result)
+        if check_summary:
+            lines.append(f"Checks: {check_summary}")
+        if result.risk_signals:
+            lines.append(f"Risk signals: {'; '.join(result.risk_signals)}")
+        if decision != "block":
+            lines.extend(["", "Current answer:", final_response])
+        return "\n".join(lines)
+
+    def _parent_finalize_turn_with_acceptance(self, final_response: str, messages: list[dict[str, Any]]) -> str:
+        if not self._acceptance_enabled or self._current_task_contract is None:
+            return final_response
+        result = evaluate_claim_evidence_consistency(self._current_task_contract, messages)
+        risk_level, risk_signals, gate_reason = self._acceptance_effective_risk(result, final_response)
+        result.risk_level = risk_level
+        result.risk_signals = risk_signals
+        result.gate_reason = gate_reason
+        self._latest_acceptance_result = result
+        self._persist_acceptance_report(self._current_task_contract, result)
+        decision = self._acceptance_gate_decision(self._acceptance_mode, result)
+        if decision == "allow":
+            return final_response
+        return self._format_acceptance_gate_report(
+            decision=decision,
+            result=result,
+            final_response=final_response,
+        )
+
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
         print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
@@ -8864,6 +9301,9 @@ class AIAgent:
             logging.warning(f"Failed to get summary response: {e}")
             final_response = f"I reached the maximum iterations ({self.max_iterations}) but couldn't summarize. Error: {str(e)}"
 
+        if final_response:
+            final_response = self._parent_finalize_turn_with_acceptance(final_response, messages)
+
         return final_response
 
     def run_conversation(
@@ -9012,6 +9452,8 @@ class AIAgent:
             if self._turns_since_memory >= self._memory_nudge_interval:
                 _should_review_memory = True
                 self._turns_since_memory = 0
+
+        self._apply_acceptance_contract_for_turn(user_message, conversation_history, messages)
 
         # Add user message
         user_msg = {"role": "user", "content": user_message}
@@ -11647,14 +12089,11 @@ class AIAgent:
                             continue
 
                         # ── Empty response retry ──────────────────────
-                        # Model returned nothing usable.  Retry up to 3
-                        # times before attempting fallback.  This covers
-                        # both truly empty responses (no content, no
-                        # reasoning) AND reasoning-only responses after
-                        # prefill exhaustion — models like mimo-v2-pro
-                        # always populate reasoning fields via OpenRouter,
-                        # so the old `not _has_structured` guard blocked
-                        # retries for every reasoning model after prefill.
+                        # Model returned no visible content.  Inline
+                        # <think>-only responses and structured reasoning
+                        # after the prefill budget are accepted as terminal
+                        # empty answers below; truly empty non-reasoning
+                        # responses still get the generic retry path.
                         _truly_empty = not self._strip_think_blocks(
                             final_response
                         ).strip()
@@ -11662,7 +12101,31 @@ class AIAgent:
                             _has_structured
                             and self._thinking_prefill_retries >= 2
                         )
-                        if _truly_empty and (not _has_structured or _prefill_exhausted) and self._empty_content_retries < 3:
+                        _inline_think_only = bool(
+                            re.search(
+                                r"<think>.*?</think>",
+                                str(final_response or ""),
+                                flags=re.DOTALL,
+                            )
+                            and _truly_empty
+                        )
+                        if _truly_empty and (_inline_think_only or _prefill_exhausted):
+                            _turn_exit_reason = (
+                                "inline_think_only_empty"
+                                if _inline_think_only
+                                else "thinking_prefill_exhausted_empty"
+                            )
+                            assistant_msg = self._build_assistant_message(
+                                assistant_message, finish_reason
+                            )
+                            assistant_msg["content"] = "(empty)"
+                            messages.append(assistant_msg)
+                            self._empty_content_retries = 0
+                            self._thinking_prefill_retries = 0
+                            final_response = "(empty)"
+                            break
+
+                        if _truly_empty and not _has_structured and self._empty_content_retries < 3:
                             self._empty_content_retries += 1
                             logger.warning(
                                 "Empty response (no content or reasoning) — "
@@ -11872,6 +12335,9 @@ class AIAgent:
                 )
             final_response = self._handle_max_iterations(messages, api_call_count)
         
+        if final_response:
+            final_response = self._parent_finalize_turn_with_acceptance(final_response, messages)
+
         # Determine if conversation completed successfully
         completed = final_response is not None and api_call_count < self.max_iterations
 
