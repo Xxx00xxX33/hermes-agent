@@ -1,9 +1,40 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 8bd979b0..ba030442 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -2,6 +2,26 @@
+ 
+ Instructions for AI coding assistants and developers working on the hermes-agent codebase.
+ 
++## Naranja Live Runtime Verification Gate
++
++For any task that changes Hermes itself on Naranja — source files, patch files, wrapper scripts, runtime behavior, CLI/status-bar/TUI/gateway behavior, themes/skins, scripts, or other customizations expected to affect `hermes chat` — do not stop at repository tests or patch application. Verify the actual live command path before claiming completion.
++
++The live command is `/root/.local/bin/hermes`. The current live runtime source is `/root/.hermes/releases/hermes-agent-custom-20260418_115717-rebuild`. The main maintenance checkout `/root/.hermes/hermes-agent` may not be the code imported by the live command, so passing tests or changing files only in that checkout is not sufficient proof that the user-visible runtime changed.
++
++Before declaring any Hermes modification/customization complete, run the full Naranja live verifier:
++
++```bash
++/root/.local/bin/hermes-verify-live-runtime --full
++```
++
++Equivalent direct invocation:
++
++```bash
++/root/.hermes/scripts/verify-live-hermes-runtime.sh --full
++```
++
++No-argument invocation also defaults to full mode. `--quick` is a fast investigation preflight only and is **not** a completion gate. If the full verifier fails, fix the root cause and re-run it, or explicitly report the failure; do not claim the Hermes change is live or complete.
++
+ ## Development Environment
+ 
+ ```bash
 diff --git a/patches/README.md b/patches/README.md
 new file mode 100644
-index 00000000..c1f83657
+index 00000000..f389bbc9
 --- /dev/null
 +++ b/patches/README.md
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,92 @@
 +# Local Hermes customization maintenance
 +
 +This directory contains the canonical local customization bundle for the local Hermes maintenance branch.
@@ -76,6 +107,21 @@ index 00000000..c1f83657
 +The helper scripts resolve this automatically when possible, but future maintainers should still interpret results with that distinction in mind.
 +
 +## Governance notes
++
++## Hotspot note: fast tool completion and delegated subtask progress on the primary status bar
++
++`cli.py` is a hotspot file with several local customizations layered onto the tool-progress path.
++Keep the `statusbar-fast-tool-refresh` patch separate from transcript-persistence and tmux-title patches.
++Its scope is intentionally narrow but two-part:
++
++1. on `tool.completed`, force `_invalidate(min_interval=0.0)` so very fast final tools (especially `todo`) cannot leave the footer stuck on stale progress like `(3/4)` or `4/5`;
++2. when delegated child work exists, show `delegate_task` subtask progress at the end of status-bar line 1 without replacing the parent todo progress slot.
++
++That second rule matters: parent todo progress and delegated subtask progress are not the same signal.
++The parent `(x/y)` progress must remain intact, while delegated subtask progress such as `子任务：2/5` is appended at the far right of line 1.
++Do not repurpose the parent todo-progress slot for delegated subtasks.
++
++When refreshing this patch, validate both the focused regressions (`TestToolProgressRefresh`, delegated subtask lifecycle/placement coverage) and the surrounding `tests/cli/test_cli_status_bar.py` suite before folding it into any broader CLI artifact.
 +
 +- `patches/manifest.yaml` is the single source of truth for active patch membership and order.
 +- `patches/archive/` is historical only.
@@ -418,10 +464,10 @@ index 00000000..5e07239a
 +echo "Ensured tmux scroll/history keys and task-title status-right in $TMUX_CONF"
 diff --git a/patches/local_customization_manifest.py b/patches/local_customization_manifest.py
 new file mode 100644
-index 00000000..bd0c8909
+index 00000000..8b4521e2
 --- /dev/null
 +++ b/patches/local_customization_manifest.py
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,388 @@
 +from __future__ import annotations
 +
 +import argparse
@@ -540,6 +586,30 @@ index 00000000..bd0c8909
 +    for files in patch_coverage_index(repo_root).values():
 +        covered.update(files)
 +    return covered
++
++
++def generated_patch_artifact_pathspecs() -> list[str]:
++    return [
++        ":(exclude)patches/*.patch",
++        ":(exclude)patches/manifest.yaml",
++        ":(exclude)patches/archive/**",
++    ]
++
++
++def git_diff_check_repo(
++    repo_root: Path, *, include_patch_artifacts: bool = False
++) -> tuple[int, str, str]:
++    args = ["git", "diff", "--check", "--", "."]
++    if not include_patch_artifacts:
++        args.extend(generated_patch_artifact_pathspecs())
++    proc = subprocess.run(
++        args,
++        cwd=repo_root,
++        check=False,
++        capture_output=True,
++        text=True,
++    )
++    return proc.returncode, proc.stdout, proc.stderr
 +
 +
 +def _git_lines(repo_root: Path, *args: str) -> list[str]:
@@ -701,6 +771,22 @@ index 00000000..bd0c8909
 +        default="upstream/main",
 +        help="Preferred git base ref (default: upstream/main)",
 +    )
++    diff_check_parser = subparsers.add_parser(
++        "diff-check",
++        help=(
++            "Run git diff --check for source/governance files while excluding generated "
++            "patch artifacts by default"
++        ),
++    )
++    diff_check_parser.add_argument(
++        "--include-patch-artifacts",
++        action="store_true",
++        help=(
++            "Include generated patch artifacts in the raw whitespace check. By default, "
++            "patch artifacts are validated by manifest coverage and apply/reverse-apply semantics."
++        ),
++    )
++
 +    verify_parser = subparsers.add_parser("verify", help="Validate manifest and coverage")
 +    verify_parser.add_argument(
 +        "--strict",
@@ -731,6 +817,16 @@ index 00000000..bd0c8909
 +            print(str(exc), file=sys.stderr)
 +            return 1
 +        return 0
++
++    if args.command == "diff-check":
++        returncode, stdout, stderr = git_diff_check_repo(
++            repo_root, include_patch_artifacts=args.include_patch_artifacts
++        )
++        if stdout:
++            print(stdout, end="")
++        if stderr:
++            print(stderr, end="", file=sys.stderr)
++        return returncode
 +
 +    if args.command == "verify":
 +        errors, warnings = verify_repo(repo_root)
@@ -979,10 +1075,10 @@ index 00000000..2e8176f1
 +fi
 diff --git a/tests/patches/test_local_customization_manifest.py b/tests/patches/test_local_customization_manifest.py
 new file mode 100644
-index 00000000..8c8f1a9d
+index 00000000..68051f0c
 --- /dev/null
 +++ b/tests/patches/test_local_customization_manifest.py
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,511 @@
 +from __future__ import annotations
 +
 +import subprocess
@@ -1349,34 +1445,148 @@ index 00000000..8c8f1a9d
 +
 +    assert result.returncode == 1
 +    assert "uncovered.py" in result.stderr
-diff --git a/AGENTS.md b/AGENTS.md
-index 8bd979b0..ba030442 100644
---- a/AGENTS.md
-+++ b/AGENTS.md
-@@ -2,6 +2,26 @@
-
- Instructions for AI coding assistants and developers working on the hermes-agent codebase.
-
-+## Naranja Live Runtime Verification Gate
 +
-+For any task that changes Hermes itself on Naranja — source files, patch files, wrapper scripts, runtime behavior, CLI/status-bar/TUI/gateway behavior, themes/skins, scripts, or other customizations expected to affect `hermes chat` — do not stop at repository tests or patch application. Verify the actual live command path before claiming completion.
 +
-+The live command is `/root/.local/bin/hermes`. The current live runtime source is `/root/.hermes/releases/hermes-agent-custom-20260418_115717-rebuild`. The main maintenance checkout `/root/.hermes/hermes-agent` may not be the code imported by the live command, so passing tests or changing files only in that checkout is not sufficient proof that the user-visible runtime changed.
++def test_diff_check_cli_excludes_generated_patch_artifacts_by_default(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
 +
-+Before declaring any Hermes modification/customization complete, run the full Naranja live verifier:
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (tmp_path / "source.py").write_text("print('ok')\n", encoding="utf-8")
++    (patches_dir / "artifact.patch").write_text(
++        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n",
++        encoding="utf-8",
++    )
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: artifact
++    patch: patches/artifact.patch
++    purpose: covers source.py
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++    _commit_all(tmp_path, "initial")
 +
-+```bash
-+/root/.local/bin/hermes-verify-live-runtime --full
-+```
++    (patches_dir / "artifact.patch").write_text(
++        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n@@ -1 +1 @@\n-print('ok')\n+print('ok') \n",
++        encoding="utf-8",
++    )
 +
-+Equivalent direct invocation:
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-m",
++            "patches.local_customization_manifest",
++            "--repo-root",
++            str(tmp_path),
++            "diff-check",
++        ],
++        cwd=Path(__file__).resolve().parents[2],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
 +
-+```bash
-+/root/.hermes/scripts/verify-live-hermes-runtime.sh --full
-+```
++    assert result.returncode == 0
++    assert result.stdout == ""
++    assert result.stderr == ""
 +
-+No-argument invocation also defaults to full mode. `--quick` is a fast investigation preflight only and is **not** a completion gate. If the full verifier fails, fix the root cause and re-run it, or explicitly report the failure; do not claim the Hermes change is live or complete.
 +
- ## Development Environment
-
- ```bash
++def test_diff_check_cli_still_reports_source_whitespace(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (tmp_path / "source.py").write_text("print('ok')\n", encoding="utf-8")
++    (patches_dir / "artifact.patch").write_text(
++        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n",
++        encoding="utf-8",
++    )
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: artifact
++    patch: patches/artifact.patch
++    purpose: covers source.py
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++    _commit_all(tmp_path, "initial")
++
++    (tmp_path / "source.py").write_text("print('bad') \n", encoding="utf-8")
++    (patches_dir / "artifact.patch").write_text(
++        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n@@ -1 +1 @@\n-print('ok')\n+print('ok') \n",
++        encoding="utf-8",
++    )
++
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-m",
++            "patches.local_customization_manifest",
++            "--repo-root",
++            str(tmp_path),
++            "diff-check",
++        ],
++        cwd=Path(__file__).resolve().parents[2],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++
++    assert result.returncode == 2
++    assert "source.py" in result.stdout
++    assert "artifact.patch" not in result.stdout
++
++
++def test_diff_check_cli_can_include_generated_patch_artifacts(tmp_path: Path) -> None:
++    _init_git_repo(tmp_path)
++
++    patches_dir = tmp_path / "patches"
++    patches_dir.mkdir()
++    (tmp_path / "source.py").write_text("print('ok')\n", encoding="utf-8")
++    (patches_dir / "artifact.patch").write_text(
++        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n",
++        encoding="utf-8",
++    )
++    (patches_dir / "manifest.yaml").write_text(
++        """
++version: 1
++bundle:
++  - id: artifact
++    patch: patches/artifact.patch
++    purpose: covers source.py
++""".strip()
++        + "\n",
++        encoding="utf-8",
++    )
++    _commit_all(tmp_path, "initial")
++
++    (patches_dir / "artifact.patch").write_text(
++        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n@@ -1 +1 @@\n-print('ok')\n+print('ok') \n",
++        encoding="utf-8",
++    )
++
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-m",
++            "patches.local_customization_manifest",
++            "--repo-root",
++            str(tmp_path),
++            "diff-check",
++            "--include-patch-artifacts",
++        ],
++        cwd=Path(__file__).resolve().parents[2],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++
++    assert result.returncode == 2
++    assert "patches/artifact.patch" in result.stdout

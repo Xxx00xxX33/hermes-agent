@@ -118,6 +118,30 @@ def covered_files(repo_root: Path) -> set[str]:
     return covered
 
 
+def generated_patch_artifact_pathspecs() -> list[str]:
+    return [
+        ":(exclude)patches/*.patch",
+        ":(exclude)patches/manifest.yaml",
+        ":(exclude)patches/archive/**",
+    ]
+
+
+def git_diff_check_repo(
+    repo_root: Path, *, include_patch_artifacts: bool = False
+) -> tuple[int, str, str]:
+    args = ["git", "diff", "--check", "--", "."]
+    if not include_patch_artifacts:
+        args.extend(generated_patch_artifact_pathspecs())
+    proc = subprocess.run(
+        args,
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 def _git_lines(repo_root: Path, *args: str) -> list[str]:
     proc = subprocess.run(
         ["git", *args],
@@ -277,6 +301,22 @@ def main(argv: list[str] | None = None) -> int:
         default="upstream/main",
         help="Preferred git base ref (default: upstream/main)",
     )
+    diff_check_parser = subparsers.add_parser(
+        "diff-check",
+        help=(
+            "Run git diff --check for source/governance files while excluding generated "
+            "patch artifacts by default"
+        ),
+    )
+    diff_check_parser.add_argument(
+        "--include-patch-artifacts",
+        action="store_true",
+        help=(
+            "Include generated patch artifacts in the raw whitespace check. By default, "
+            "patch artifacts are validated by manifest coverage and apply/reverse-apply semantics."
+        ),
+    )
+
     verify_parser = subparsers.add_parser("verify", help="Validate manifest and coverage")
     verify_parser.add_argument(
         "--strict",
@@ -307,6 +347,16 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 1
         return 0
+
+    if args.command == "diff-check":
+        returncode, stdout, stderr = git_diff_check_repo(
+            repo_root, include_patch_artifacts=args.include_patch_artifacts
+        )
+        if stdout:
+            print(stdout, end="")
+        if stderr:
+            print(stderr, end="", file=sys.stderr)
+        return returncode
 
     if args.command == "verify":
         errors, warnings = verify_repo(repo_root)

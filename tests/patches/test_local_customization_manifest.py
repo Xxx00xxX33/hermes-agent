@@ -364,3 +364,148 @@ bundle:
 
     assert result.returncode == 1
     assert "uncovered.py" in result.stderr
+
+
+def test_diff_check_cli_excludes_generated_patch_artifacts_by_default(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    (tmp_path / "source.py").write_text("print('ok')\n", encoding="utf-8")
+    (patches_dir / "artifact.patch").write_text(
+        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n",
+        encoding="utf-8",
+    )
+    (patches_dir / "manifest.yaml").write_text(
+        """
+version: 1
+bundle:
+  - id: artifact
+    patch: patches/artifact.patch
+    purpose: covers source.py
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "initial")
+
+    (patches_dir / "artifact.patch").write_text(
+        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n@@ -1 +1 @@\n-print('ok')\n+print('ok') \n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "patches.local_customization_manifest",
+            "--repo-root",
+            str(tmp_path),
+            "diff-check",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_diff_check_cli_still_reports_source_whitespace(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    (tmp_path / "source.py").write_text("print('ok')\n", encoding="utf-8")
+    (patches_dir / "artifact.patch").write_text(
+        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n",
+        encoding="utf-8",
+    )
+    (patches_dir / "manifest.yaml").write_text(
+        """
+version: 1
+bundle:
+  - id: artifact
+    patch: patches/artifact.patch
+    purpose: covers source.py
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "initial")
+
+    (tmp_path / "source.py").write_text("print('bad') \n", encoding="utf-8")
+    (patches_dir / "artifact.patch").write_text(
+        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n@@ -1 +1 @@\n-print('ok')\n+print('ok') \n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "patches.local_customization_manifest",
+            "--repo-root",
+            str(tmp_path),
+            "diff-check",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "source.py" in result.stdout
+    assert "artifact.patch" not in result.stdout
+
+
+def test_diff_check_cli_can_include_generated_patch_artifacts(tmp_path: Path) -> None:
+    _init_git_repo(tmp_path)
+
+    patches_dir = tmp_path / "patches"
+    patches_dir.mkdir()
+    (tmp_path / "source.py").write_text("print('ok')\n", encoding="utf-8")
+    (patches_dir / "artifact.patch").write_text(
+        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n",
+        encoding="utf-8",
+    )
+    (patches_dir / "manifest.yaml").write_text(
+        """
+version: 1
+bundle:
+  - id: artifact
+    patch: patches/artifact.patch
+    purpose: covers source.py
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    _commit_all(tmp_path, "initial")
+
+    (patches_dir / "artifact.patch").write_text(
+        "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n@@ -1 +1 @@\n-print('ok')\n+print('ok') \n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "patches.local_customization_manifest",
+            "--repo-root",
+            str(tmp_path),
+            "diff-check",
+            "--include-patch-artifacts",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "patches/artifact.patch" in result.stdout
